@@ -526,8 +526,7 @@ func TestAMalformedOperatorPrincipalRendersNoEntryAndFailsNothing(t *testing.T) 
 	}
 }
 
-// With them, its entry is the directory, the profile durables it makes for
-// the dispatcher, and its inbox, nothing else.
+// With them, its entry is the directory and its inbox, nothing else.
 func TestTheOperatorsBusIdentityIsTheDirectoryAndNothingElse(t *testing.T) {
 	withOperatorBusPrincipal(t)
 	agent := a2aTestAgent()
@@ -538,10 +537,7 @@ func TestTheOperatorsBusIdentityIsTheDirectoryAndNothingElse(t *testing.T) {
 	if e.ServiceAccount != "system:serviceaccount:"+testOperatorNamespace+":"+testOperatorSA {
 		t.Errorf("serviceAccount = %q", e.ServiceAccount)
 	}
-	// The directory, and the profiles' durables it makes for the
-	// dispatcher, which every next install renders.
-	wantPub := []string{"a2a.agents.*", "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
-		"$JS.API.CONSUMER.CREATE.TASKS.*.a2a.tasks.*.*.*.*.submit", "$JS.API.CONSUMER.INFO.TASKS.*", "$JS.API.CONSUMER.DELETE.TASKS.*"}
+	wantPub := []string{"a2a.agents.*", "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*"}
 	wantSub := []string{"_INBOX.operator.>"}
 	if !slices.Equal(e.Grants.Publish, wantPub) || !slices.Equal(e.Grants.Subscribe, wantSub) {
 		t.Errorf("grants = %+v, want publish %v subscribe %v", e.Grants, wantPub, wantSub)

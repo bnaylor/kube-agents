@@ -412,13 +412,9 @@ class FlagSetIsNextTest(unittest.TestCase):
             "--set-string",
             "operator.extraEnv[8].value=true",
         ]
-        # The AgentProfile dispatcher, rendered on every next install.
-        expected += [
-            "--set-string",
-            f"operator.extraEnv[9].name={go_constant(_A2A_DISPATCHER, 'a2aDispatcherImageEnvVar')}",
-            "--set-string",
-            f"operator.extraEnv[9].value={_AR_REPO}/a2a-dispatcher:{_TAG}",
-        ]
+        # Nothing turns the AgentProfile dispatcher on: it is off by default,
+        # and the lane installs what a default install does.
+        self.assertNotIn(go_constant(_A2A_DISPATCHER, "a2aDispatcherImageEnvVar"), " ".join(args))
         self.assertEqual(args, expected)
         # Nothing names the executor setting, under any index: set to anything,
         # the operator renders BRIDGE_EXECUTOR and the lane stops measuring the
@@ -553,7 +549,7 @@ class FlagSetIsNextTest(unittest.TestCase):
     def test_the_release_candidate_path_names_the_candidates_published_images(self) -> None:
         """The release-candidate eval grades next (#2007): section 4 under the
         flag with RC_COMMIT_SHA set submits no build and hands the operator the
-        same ten values, with the six A2A references and the bridge's under
+        same nine values, with the five A2A references and the bridge's under
         the published registry at the candidate's commit, the image names
         REQUIRED_RELEASE_IMAGES publishes."""
         result = run_build_section(
@@ -571,7 +567,7 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(values[6], f"operator.extraEnv[6].value={_RC_REGISTRY_PREFIX}/hermes-bridge:{_RC_COMMIT_SHA}")
         self.assertEqual(values[7], f"operator.extraEnv[7].value={_BRIDGE_CONCURRENCY}")
         self.assertEqual(values[8], "operator.extraEnv[8].value=true")
-        self.assertEqual(values[9], f"operator.extraEnv[9].value={_RC_REGISTRY_PREFIX}/a2a-dispatcher:{_RC_COMMIT_SHA}")
+        self.assertEqual(len(values), 9, values)
         self.assertNotIn(_AR_REPO, result.stdout)
         # The names are the ones the release publishes.
         common = text(_REPO_ROOT / "scripts" / "release" / "common.sh")

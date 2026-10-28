@@ -799,14 +799,6 @@ const (
 	// install's own choice of concurrency made explicit. The ceiling still
 	// exists, and it still converts to a refused create rather than to silent
 	// disk growth.
-	//
-	// The AgentProfile dispatcher moved the default once more, for new
-	// streams only. It is on every next install, so a stream created now
-	// also carries a2aProfileDurablesAllowed (64) for the profiles'
-	// durables: a default install's TASKS is created at 126, and web's
-	// unreapable-durable ceiling with it. That is the same trade, made for
-	// the profiles' capacity. A stream that already exists keeps its width
-	// and is held to the sessions' budget alone (a2aProfileDurableAllowance).
 
 	// a2aSessionConsumersPerSession mirrors lib.SessionConsumerRoles in the
 	// a2a module - origin, in, events - which worker-adapter creates on
@@ -1028,14 +1020,11 @@ const (
 	// spec.deployment.replicas is not read here.
 	//
 	// Where the floor hides all this. The budget is maxSessions*3 + the
-	// reserve, 32 at the default concurrency, so a default install
-	// (maxSessions=10, budget 62) still fits a stream created at the 64
-	// floor. The first maxSessions whose budget clears the floor is 11 (65);
-	// it was 13 when the reserve was 28 and 17 when it was 16. A new stream
-	// is created at max(64, budget + a2aProfileDurablesAllowed), 126 at the
-	// default, since every next install renders the dispatcher; the floor
-	// is what the budget meets on a stream created before it. Above the
-	// floor the stream is 16 wider than it would have been, and so is the
+	// reserve, 32 at the default concurrency, and a stream is created at
+	// max(64, budget), so a default install (maxSessions=10, budget 62)
+	// still renders 64. The first maxSessions whose budget clears the floor
+	// is 11 (65); it was 13 when the reserve was 28 and 17 when it was 16.
+	// Above it the stream is 16 wider than it would have been, and so is the
 	// web user's unreapable-durable ceiling, which is the trade the block
 	// above already states.
 	//
@@ -4090,8 +4079,8 @@ func a2aTasksConsumerBudget(agent *agentv1alpha1.PlatformAgent) int {
 const a2aProfileDurablesAllowed = 16 * 2 * 2
 
 // a2aProfileDurableAllowance is a2aProfileDurablesAllowed when this operator
-// renders a dispatcher, which is every next install now that its image is
-// in the release set, and nothing otherwise.
+// renders a dispatcher, and nothing otherwise, so an install without one
+// sizes TASKS exactly as before.
 func a2aProfileDurableAllowance() int {
 	if a2aDispatcherEnabled() {
 		return a2aProfileDurablesAllowed

@@ -15,14 +15,17 @@ The A2A `next` stack pulls NATS, nats-box, the gateway, the session worker, the 
 the capability verifier, the AgentProfile dispatcher, the console server and the Hermes bridge
 sidecar, and each is in the tables below. The first-party ones (`a2a-gateway`, `a2a-worker`,
 `a2a-authcallout`, `a2a-verifier`, `a2a-dispatcher`, `a2a-console`, `hermes-bridge`) are built and
-tagged with the rest of the release. The operator derives the six it renders from its own image (`OPERATOR_IMAGE`, which
+tagged with the rest of the release. The operator derives the five it renders by default from its own image (`OPERATOR_IMAGE`, which
 the chart sets beside `PLATFORM_AGENT_IMAGE`) when it carries a tag, else from the agent image it
 resolves for itself:
 the same registry and tag, so an install at a release pulls them at that release and a mirrored
 install pulls them from the mirror. A `PlatformAgent`'s own `spec.deployment.image` does not move
 them;
-`A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE`, `A2A_CALLOUT_IMAGE`, `A2A_VERIFIER_IMAGE`,
-`A2A_DISPATCHER_IMAGE` and `A2A_CONSOLE_IMAGE` on the operator override one at a time. The Hermes bridge sidecar the
+`A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE`, `A2A_CALLOUT_IMAGE`, `A2A_VERIFIER_IMAGE` and
+`A2A_CONSOLE_IMAGE` on the operator override one at a time. The AgentProfile dispatcher is
+off by default until profiles dispatch end to end: its image is in the release set, but the
+operator derives nothing for it, and renders it (its Deployment, its bus identity and the
+`TASKS` slots for the profile durables) only when `A2A_DISPATCHER_IMAGE` names an image. The Hermes bridge sidecar the
 operator renders into the agent pod under `next` is built from the `platform-agent` image of the
 same commit, so the operator takes its registry and tag from the agent image instead, and
 `A2A_BRIDGE_IMAGE` on the operator overrides it. A `PlatformAgent` that declares its own
@@ -65,7 +68,7 @@ Tagged with the release version; `:latest` on every push to `main`.
 | `a2a-authcallout` | `ghcr.io/gke-labs/kube-agents/a2a-authcallout` | release tag | `A2A_CALLOUT_IMAGE` | The auth callout Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. |
 | `a2a-console` | `ghcr.io/gke-labs/kube-agents/a2a-console` | release tag | `A2A_CONSOLE_IMAGE` | The console server Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. |
 | `a2a-verifier` | `ghcr.io/gke-labs/kube-agents/a2a-verifier` | release tag | `A2A_VERIFIER_IMAGE` | The capability verifier Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. It resolves the same way the gateway, the worker and the callout do. |
-| `a2a-dispatcher` | `ghcr.io/gke-labs/kube-agents/a2a-dispatcher` | release tag | `A2A_DISPATCHER_IMAGE` | The AgentProfile dispatcher Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. It resolves the same way the gateway, the worker and the callout do. |
+| `a2a-dispatcher` | `ghcr.io/gke-labs/kube-agents/a2a-dispatcher` | release tag | `A2A_DISPATCHER_IMAGE` | The AgentProfile dispatcher Deployment the operator renders under spec.mode: next when A2A_DISPATCHER_IMAGE is set, and nothing otherwise: it is off by default until profiles dispatch end to end, so the operator derives nothing for it. Nothing under spec.mode: today. |
 | `hermes-bridge` | `ghcr.io/gke-labs/kube-agents/hermes-bridge` | release tag | `A2A_BRIDGE_IMAGE` | The hermes-bridge sidecar the operator renders beside the agent container under spec.mode: next, and nothing under spec.mode: today. The operator derives it from the agent image (registry and tag) unless the override is set; a CR that declares its own hermes-bridge sidecar on spec.deployment.sidecars keeps it, and that sidecar's image is the CR's. |
 | `web-console` | `ghcr.io/gke-labs/kube-agents/web-console` | release tag | — | The web console Deployment the chart renders when webConsole.enabled is true, and nothing on a default install. The chart takes the tag from webConsole.image.tag, else the agent image's tag, else the chart's appVersion. |
 
@@ -273,8 +276,9 @@ when a prefix is in effect:
 `CREDENTIAL_PROXY_IMAGE` needs nothing: the operator derives the broker image from the agent image
 by swapping the trailing name (`platform-agent` to `credential-proxy`), which lands on the mirror
 on its own. The A2A `next` images the operator renders (`a2a-gateway`, `a2a-worker`,
-`a2a-authcallout`, `a2a-verifier`, `a2a-dispatcher`, `a2a-console`) follow `OPERATOR_IMAGE`, else `PLATFORM_AGENT_IMAGE`, the same way, so they need
-no env of their own on a mirror. The sandbox is a separate repository, so it gets no such derivation. Setting it explicitly still wins, which is why `install.sh` leaves it unset — one
+`a2a-authcallout`, `a2a-verifier`, `a2a-console`) follow `OPERATOR_IMAGE`, else `PLATFORM_AGENT_IMAGE`, the same way, so they need
+no env of their own on a mirror; an install that turns the dispatcher on names the mirror's
+`a2a-dispatcher` in `A2A_DISPATCHER_IMAGE` itself. The sandbox is a separate repository, so it gets no such derivation. Setting it explicitly still wins, which is why `install.sh` leaves it unset — one
 explicit value pins the sidecar for every agent in the cluster, and the per-CR derivation is what
 otherwise keeps each sidecar in step with its own agent's image.
 

@@ -284,7 +284,8 @@ Status (amended 9/4, the callout armed; amended 9/8, sessions moved; amended 9/1
 `auth_callout` block, and a principal authenticates one of two ways. **Through the
 callout**, by presenting a projected ServiceAccount token: the bus provisioning Job,
 every spawned session pod, the platform agent container, the capability verifier, and
-(amended 10/28, #3655) the AgentProfile dispatcher, on every next install.
+(amended 10/28, #3655) the AgentProfile dispatcher, when the operator has its image
+(`A2A_DISPATCHER_IMAGE`; off by default until profiles dispatch end to end).
 The dispatcher's grants name each profile durable it reads and each profile it
 dispatches for, because a NATS wildcard matches a whole token and `TASKS.*` would reach
 every session's consumers; it reconnects when its config adds one, and tasks it holds keep
@@ -500,11 +501,11 @@ Layout:
   The trade is stated where it is made: an install that raises `maxSessions` raises
   `web`'s unreapable-durable ceiling in the same proportion. Deriving downward on a small
   install would silently tighten a working one, so the render takes the larger of 64 and
-  the derived budget. Amended 10/28 (#3655): a stream created now also carries 64 slots
-  for the AgentProfile durables, one per (profile, tier, kind), the dispatcher being on
-  every next install, so a default install's `TASKS` starts at 126 and `web`'s ceiling with
-  it; a stream that already exists is held to the sessions' budget alone and is never
-  refused for those slots. Because creates never edit, an install whose `maxSessions` already
+  the derived budget. Amended 10/28 (#3655): with the AgentProfile dispatcher rendered, a
+  stream created then also carries 64 slots for its durables, one per (profile, tier,
+  kind); a stream that already exists is held to the sessions' budget alone and is never
+  refused for those slots. The dispatcher is off by default, so a default install's
+  `TASKS` is still created at 64. Because creates never edit, an install whose `maxSessions` already
   exceeds what its stream holds is under-provisioned today, and the check is reached on
   an operator upgrade alone with no CR edit involved - it runs last, after every other
   stream and bucket, so the refusal leaves a fully provisioned bus short one limit rather
@@ -559,8 +560,8 @@ Layout:
   Amended 8/31: the pod network is fenced too. The operator renders an ingress
   NetworkPolicy on the NATS pod granting **4222 to exactly the enumerated bus clients**
   (the auth callout, the agent pod - whose sidecars, the Hermes bridge included, share
-  its labels - the A2A gateway, the capability verifier, the AgentProfile dispatcher,
-  session pods by the spawner's
+  its labels - the A2A gateway, the capability verifier, the AgentProfile dispatcher (when
+  rendered), session pods by the spawner's
   labels, the provision Job,
   and the hand-applied seed Job; **amended 10/6:** and the operator's own pod, by the
   `kubeagents.x-k8s.io/a2a-bus-client: operator` label from the operator's namespace,

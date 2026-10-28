@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"time"
@@ -44,10 +45,15 @@ import (
 // only reader of the profiles' shared durables and the only writer of
 // PROFILE_LEASES. This file renders what it runs on. The binary is PR 3's.
 const (
-	// Release surface, on the same terms as the verifier's
-	// (a2aVerifierImageName): a bare name resolved through a2aReleaseImage,
-	// with A2A_DISPATCHER_IMAGE the override for an install that pins it
-	// apart.
+	// a2aDispatcherImageEnvVar names the dispatcher's image, and setting it
+	// is the only way to turn the dispatcher on. Unset, the operator renders
+	// no dispatcher at all, not its identity, its grants, its TASKS
+	// allowance nor its Deployment: until profiles dispatch end to end (the
+	// worker's side is #3655's PR 5) it would be an idle component that
+	// costs every next install 64 TASKS consumer slots and a principal.
+	// a2aDispatcherImageName is its name in the release set, which it is
+	// built and published under already; a2aDispatcherReleaseImage resolves
+	// it, so turning the default on is one line in a2aDispatcherImage.
 	a2aDispatcherImageName   = "a2a-dispatcher"
 	a2aDispatcherImageEnvVar = "A2A_DISPATCHER_IMAGE"
 
@@ -74,14 +80,21 @@ const (
 	agentProfileWorkerComponent = "agentprofile-worker"
 )
 
-func a2aDispatcherImage() string {
+// a2aDispatcherImage is the dispatcher's image: A2A_DISPATCHER_IMAGE, or
+// nothing. It is off by default until profiles dispatch end to end.
+func a2aDispatcherImage() string { return strings.TrimSpace(os.Getenv(a2aDispatcherImageEnvVar)) }
+
+// a2aDispatcherReleaseImage is the dispatcher's image as the release set
+// resolves it, the way the verifier's is (a2aReleaseImage), with
+// A2A_DISPATCHER_IMAGE still the override. Nothing calls it yet: rendering
+// the dispatcher by default is a2aDispatcherImage returning this.
+func a2aDispatcherReleaseImage() string {
 	return strings.TrimSpace(a2aReleaseImage(a2aDispatcherImageEnvVar, a2aDispatcherImageName))
 }
 
-// a2aDispatcherEnabled reports whether this operator renders the dispatcher.
-// The image is in the release set and resolves like the verifier's, so this
-// is true on every next install; it stays a function so a resolution that
-// comes back empty renders nothing rather than a Deployment with no image.
+// a2aDispatcherEnabled reports whether this operator renders the dispatcher:
+// only when A2A_DISPATCHER_IMAGE is set, so an empty image never renders a
+// Deployment with nothing to pull.
 func a2aDispatcherEnabled() bool { return a2aDispatcherImage() != "" }
 
 func a2aDispatcherName(agent *agentv1alpha1.PlatformAgent) string {

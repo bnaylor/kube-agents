@@ -1,5 +1,5 @@
 {
-  "version": "5b07f039d2a50ef2",
+  "version": "9f96003abff82b03",
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
@@ -101,10 +101,7 @@
       "grants": {
         "publish": [
           "a2a.agents.*",
-          "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
-          "$JS.API.CONSUMER.CREATE.TASKS.*.a2a.tasks.*.*.*.*.submit",
-          "$JS.API.CONSUMER.INFO.TASKS.*",
-          "$JS.API.CONSUMER.DELETE.TASKS.*"
+          "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*"
         ],
         "subscribe": [
           "_INBOX.operator.>"
@@ -142,44 +139,6 @@
       "narrowing": "profile",
       "profile": "cluster-a",
       "tier": "read"
-    },
-    {
-      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-dispatcher",
-      "user": "dispatcher",
-      "account": "APP",
-      "grants": {
-        "publish": [
-          "$JS.API.CONSUMER.INFO.TASKS.profile-auditor-read-top",
-          "$JS.API.CONSUMER.MSG.NEXT.TASKS.profile-auditor-read-top",
-          "$JS.ACK.TASKS.profile-auditor-read-top.>",
-          "$JS.API.CONSUMER.INFO.TASKS.profile-auditor-read-child",
-          "$JS.API.CONSUMER.MSG.NEXT.TASKS.profile-auditor-read-child",
-          "$JS.ACK.TASKS.profile-auditor-read-child.>",
-          "$JS.API.CONSUMER.INFO.TASKS.profile-cluster-a-read-top",
-          "$JS.API.CONSUMER.MSG.NEXT.TASKS.profile-cluster-a-read-top",
-          "$JS.ACK.TASKS.profile-cluster-a-read-top.>",
-          "$JS.API.CONSUMER.INFO.TASKS.profile-cluster-a-read-child",
-          "$JS.API.CONSUMER.MSG.NEXT.TASKS.profile-cluster-a-read-child",
-          "$JS.ACK.TASKS.profile-cluster-a-read-child.>",
-          "a2a.tasks.auditor.*.events",
-          "a2a.tasks.cluster-a.*.events",
-          "$KV.PROFILE_LEASES.>",
-          "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
-          "$JS.API.DIRECT.GET.KV_PROFILE_LEASES.>",
-          "$JS.API.CONSUMER.CREATE.KV_PROFILE_LEASES.>",
-          "$JS.API.CONSUMER.DELETE.KV_PROFILE_LEASES.*",
-          "$JS.FC.KV_PROFILE_LEASES.>",
-          "a2a.dispatch.*.*.*",
-          "a2a.cap.verify.dispatcher",
-          "_INBOX.dispatcher.>"
-        ],
-        "subscribe": [
-          "a2a.dispatch.*.*.*.accept",
-          "a2a.dispatch.*.*.*.lease",
-          "a2a.cap.reply.dispatcher.>",
-          "_INBOX.dispatcher.>"
-        ]
-      }
     }
   ]
 }

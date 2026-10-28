@@ -529,15 +529,15 @@ readonly MODE_NEXT_ENTRYPOINT_MATCH_LINES=40
 # The operator's override variables (a2aGatewayImage and a2aWorkerImage in
 # platformagent_a2a_manifests.go, a2aCalloutImage in platformagent_a2a_callout.go,
 # a2aVerifierImage in platformagent_a2a_verifier.go, a2aConsoleImage in
-# platformagent_a2a_console.go, a2aDispatcherImage in
-# platformagent_a2a_dispatcher.go) and the repository names
-# step 4 pushes the builds under.
+# platformagent_a2a_console.go) and the repository names step 4 pushes the
+# builds under. The AgentProfile dispatcher's image is built and pushed too
+# (A2A_DISPATCHER_IMAGE_NAME), but its override, A2A_DISPATCHER_IMAGE, is not
+# set: the dispatcher is off by default until profiles dispatch end to end.
 readonly A2A_GATEWAY_IMAGE_ENV_VAR="A2A_GATEWAY_IMAGE"
 readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
 readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
 readonly A2A_CONSOLE_IMAGE_ENV_VAR="A2A_CONSOLE_IMAGE"
-readonly A2A_DISPATCHER_IMAGE_ENV_VAR="A2A_DISPATCHER_IMAGE"
 # Two of the rendered bridge's four operator settings (a2aBridgeImageEnvVar
 # and a2aBridgeConcurrencyOperatorEnvVar in platformagent_a2a_bridge.go): its
 # image and its BRIDGE_CONCURRENCY. The operator reads them from its own
@@ -1611,11 +1611,10 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     --set-string "operator.extraEnv[7].value=${MODE_NEXT_BRIDGE_CONCURRENCY}"
     --set-string "operator.extraEnv[8].name=${A2A_CARD_STOP_ENV_VAR}"
     --set-string "operator.extraEnv[8].value=${A2A_CARD_STOP_ON}"
-    # The AgentProfile dispatcher, which the operator renders on every next
-    # install: unoverridden it derives the same reference, so this keeps the
-    # input explicit like the five above.
-    --set-string "operator.extraEnv[9].name=${A2A_DISPATCHER_IMAGE_ENV_VAR}"
-    --set-string "operator.extraEnv[9].value=${A2A_DISPATCHER_URI}"
+    # No A2A_DISPATCHER_IMAGE: the AgentProfile dispatcher is off by default
+    # until profiles dispatch end to end, and the lane installs what a
+    # default install does. Its image is still built (step 4) so the build
+    # stays green; setting the override here is how the lane would turn it on.
   )
 fi
 
