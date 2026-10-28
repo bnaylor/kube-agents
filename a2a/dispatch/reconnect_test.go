@@ -201,3 +201,47 @@ func TestAnAddedProfileWithALateDurableReconnectsOnce(t *testing.T) {
 		t.Errorf("%d reconnects, want 1", n)
 	}
 }
+
+// A durable the grants never cover costs a bounded round of reconnects,
+// then a loud log and a cooldown: never a reconnect loop.
+func TestANeverGrantedDurableStopsReconnecting(t *testing.T) {
+	b := newBusWith(t, dispatcherUsers())
+	b.ensure("tse", 2, 0, "read")
+	b.ensure("tse2", 2, 0, "read")
+	var g grantSwitch
+	g.set("disp-old")
+	cfg := fastRegrant()
+	cfg.RegrantAttempts = 3
+	ti := oneProfile("tse", 2)
+	d, _ := b.runDispatcherOn(b.connectAs(&g), cfg, ti, &fakeVerifier{})
+	time.Sleep(500 * time.Millisecond)
+	ti.update(func(c *lib.DispatchConfig) { c.Version = "v2"; c.Profiles = append(c.Profiles, testProfile("tse2", 2)) })
+	waitFor(t, 20*time.Second, "the bounded round", func() bool { return d.Reconnects() == 3 })
+	time.Sleep(4 * time.Second) // many refreshes
+	if n := d.Reconnects(); n != 3 {
+		t.Errorf("%d reconnects, want the round of 3 and then the cooldown", n)
+	}
+}
+
+// A tier added to a profile already granted is a new durable: one
+// reconnect. Removed, none; added back, one more, since its grant went
+// with it.
+func TestAnAddedTierReconnects(t *testing.T) {
+	b := newBus(t)
+	b.ensure("tse", 2, 0, "read", "unattended")
+	ti := oneProfile("tse", 2)
+	d, _ := b.runDispatcher(fastRegrant(), ti, &fakeVerifier{})
+	time.Sleep(500 * time.Millisecond)
+	withTiers := func(version string, tiers ...string) {
+		ti.update(func(c *lib.DispatchConfig) { c.Version = version; c.Profiles[0] = testProfile("tse", 2, tiers...) })
+	}
+	withTiers("v2", "read", "unattended")
+	waitFor(t, 15*time.Second, "the reconnect", func() bool { return d.Reconnects() == 1 })
+	withTiers("v3", "read")
+	time.Sleep(time.Second)
+	if n := d.Reconnects(); n != 1 {
+		t.Fatalf("%d reconnects after dropping a tier, want 1", n)
+	}
+	withTiers("v4", "read", "unattended")
+	waitFor(t, 15*time.Second, "the second reconnect", func() bool { return d.Reconnects() == 2 })
+}
