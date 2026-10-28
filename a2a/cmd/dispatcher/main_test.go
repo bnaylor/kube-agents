@@ -5,31 +5,45 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/dispatch"
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 func env(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
 
-// The process refuses to start on intervals that would fail live work.
-func TestParseConfigEnforcesTheIntervalBounds(t *testing.T) {
-	cfg, path, err := parseConfig(nil, env(nil))
-	if err != nil || cfg.Lease != dispatch.DefaultLease || path != defaultProfilesFile {
-		t.Fatalf("defaults: %+v %q %v", cfg, path, err)
+func TestReadSettingsNeedsTheBusTheNamespaceAndTheConfigMap(t *testing.T) {
+	full := map[string]string{"NATS_URL": "nats://x", envNamespace: "ka", envConfigMap: "agent-a2a-dispatch",
+		"NATS_USER": "dispatcher", "NATS_PASSWORD": "pw"}
+	if _, err := readSettings(env(full)); err != nil {
+		t.Fatal(err)
 	}
-	if _, _, err := parseConfig([]string{"-restart-grace=30s"}, env(nil)); err == nil || !strings.Contains(err.Error(), "restart grace") {
-		t.Errorf("grace 30s under two renewals of 20s: %v", err)
+	for _, k := range []string{"NATS_URL", envNamespace, envConfigMap} {
+		m := map[string]string{}
+		for kk, v := range full {
+			m[kk] = v
+		}
+		delete(m, k)
+		if _, err := readSettings(env(m)); err == nil {
+			t.Errorf("accepted without %s", k)
+		}
 	}
-	if _, _, err := parseConfig(nil, env(map[string]string{dispatch.EnvLeaseSeconds: "40"})); err == nil {
-		t.Error("a lease of two renewals was accepted")
+	// The deployment's path: a projected token that must exist.
+	noUser := map[string]string{"NATS_URL": "nats://x", envNamespace: "ka", envConfigMap: "m",
+		lib.EnvBusTokenFile: filepath.Join(t.TempDir(), "missing")}
+	if _, err := readSettings(env(noUser)); err == nil {
+		t.Error("accepted a missing bus token")
 	}
-	cfg, _, err = parseConfig([]string{"-renew=10s", "-restart-grace=20s", "-profiles=/x.json"}, env(nil))
-	if err != nil || cfg.Renew != 10*time.Second {
-		t.Errorf("flags: %+v %v", cfg, err)
+	tok := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tok, []byte("t"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	noUser[lib.EnvBusTokenFile] = tok
+	if _, err := readSettings(env(noUser)); err != nil {
+		t.Errorf("with a token: %v", err)
 	}
 }
 
@@ -41,47 +55,18 @@ func TestTheVerifierFailsClosedUntilProfileRunLands(t *testing.T) {
 	}
 }
 
-func TestTheProfileFileIsReadAndReloaded(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "profiles.json")
-	write := func(body string) {
-		t.Helper()
-		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-			t.Fatal(err)
+func TestAMovedProfileNamespaceEndsTheProcess(t *testing.T) {
+	src := dispatch.NewStaticSource(lib.DispatchConfig{ProfileNamespace: "a"})
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	go watchProfileNamespace(ctx, cancel, src, "a")
+	src.Set(lib.DispatchConfig{ProfileNamespace: "b"})
+	select {
+	case <-ctx.Done():
+		if !errors.Is(context.Cause(ctx), errProfileNamespaceMoved) {
+			t.Errorf("cause %v", context.Cause(ctx))
 		}
-	}
-	write(`{"namespace":"ka","ceiling":6,"profiles":[{"name":"tse","concurrency":2,"activeDeadlineSeconds":600,
-		"parameters":[{"name":"project","required":true}],"pods":{"read":["tse-read-0"]}}]}`)
-	src, err := newFileSource(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p, ok := src.Snapshot().Profile("tse"); !ok || p.Pods["read"][0] != "tse-read-0" || !p.Parameters[0].Required {
-		t.Fatalf("snapshot %+v", src.Snapshot())
-	}
-	time.Sleep(10 * time.Millisecond)
-	write(`{"namespace":"ka","ceiling":9,"profiles":[]}`)
-	future := time.Now().Add(time.Hour)
-	if err := os.Chtimes(path, future, future); err != nil {
-		t.Fatal(err)
-	}
-	if err := src.reload(); err != nil || src.Snapshot().Ceiling != 9 {
-		t.Fatalf("reload: %v, ceiling %d", err, src.Snapshot().Ceiling)
-	}
-	write(`{"ceiling":`)
-	past := future.Add(time.Hour)
-	_ = os.Chtimes(path, past, past)
-	if err := src.reload(); err == nil || src.Snapshot().Ceiling != 9 {
-		t.Errorf("a broken file replaced the last good snapshot (%v)", err)
-	}
-	for name, body := range map[string]string{
-		"unknown field":    `{"profiles":[],"cieling":3}`,
-		"zero concurrency": `{"profiles":[{"name":"a","concurrency":0,"activeDeadlineSeconds":5}]}`,
-		"no deadline":      `{"profiles":[{"name":"a","concurrency":1}]}`,
-		"dotted name":      `{"profiles":[{"name":"a.b","concurrency":1,"activeDeadlineSeconds":5}]}`,
-	} {
-		write(body)
-		if _, err := newFileSource(path); err == nil {
-			t.Errorf("%s: accepted", name)
-		}
+	case <-time.After(namespaceCheckInterval + 5*time.Second):
+		t.Fatal("a moved profile namespace did not end the process")
 	}
 }

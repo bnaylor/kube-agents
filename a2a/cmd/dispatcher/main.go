@@ -1,23 +1,23 @@
 // The profile dispatcher (#3655): the only fetcher and holder of profile
-// submissions. The work is in a2a/dispatch; this program reads its config,
-// connects as the `dispatcher` bus identity and runs it. PR 2 of #3655
-// renders its Deployment, identity, grants and the env read here.
+// submissions. The work is in a2a/dispatch; this program watches its config
+// and its worker pools through the API, connects as the `dispatcher` bus
+// identity and runs it. PR 2 of #3655 renders its Deployment, identity,
+// grants, Role and the dispatch ConfigMap.
 package main
 
 import (
 	"context"
-	"encoding/json"
-	"flag"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/dispatch"
@@ -30,14 +30,18 @@ import (
 const natsUser = "dispatcher"
 
 const (
-	// envProfilesFile names the profile config (dispatch.Snapshot as JSON):
-	// the AgentProfiles' dispatch fields, the install ceiling and reserves,
-	// and each pool's ready pods. PROPOSED: PR 2 renders it.
-	envProfilesFile = "DISPATCH_PROFILES_FILE"
-	// defaultProfilesFile is where it is mounted when the env names none.
-	defaultProfilesFile = "/etc/kube-agents/dispatch/profiles.json"
-	// maxProfilesFileBytes bounds the config read.
-	maxProfilesFileBytes = 4 << 20
+	// envNamespace is the dispatcher's own namespace, where its ConfigMap is.
+	envNamespace = "POD_NAMESPACE"
+	// envConfigMap names the dispatch ConfigMap (<agent>-a2a-dispatch).
+	// PROPOSED: PR 2 renders it.
+	envConfigMap = "DISPATCH_CONFIGMAP"
+
+	// configWait bounds the wait for the first config at startup: past it
+	// the process exits and the kubelet's restart says so.
+	configWait = 2 * time.Minute
+	// namespaceCheckInterval paces the check that the profile namespace the
+	// pool watches is still the config's.
+	namespaceCheckInterval = 10 * time.Second
 
 	reconnectWait   = 2 * time.Second
 	reconnectJitter = 500 * time.Millisecond
@@ -58,52 +62,34 @@ func (unavailableVerifier) CheckProfileRun(context.Context, capability.Ref, stri
 	return errProfileRunUnavailable
 }
 
-func main() { os.Exit(run(os.Args[1:], os.Getenv)) }
+// errProfileNamespaceMoved ends the process when the config's profile
+// namespace changes under the pool's watch, so the restart re-watches it.
+var errProfileNamespaceMoved = errors.New("the profile namespace changed; restarting to watch the new one")
 
-func run(args []string, getenv func(string) string) int {
+func main() { os.Exit(run(os.Getenv)) }
+
+func run(getenv func(string) string) int {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	slog.SetDefault(log)
-	cfg, profilesPath, err := parseConfig(args, getenv)
+	settings, err := readSettings(getenv)
 	if err != nil {
 		log.Error("config", "err", err)
 		return 2
 	}
-	url := getenv("NATS_URL")
-	if url == "" {
-		log.Error("NATS_URL is required")
-		return 2
-	}
-	src, err := newFileSource(profilesPath)
-	if err != nil {
-		log.Error("profile config", "path", profilesPath, "err", err)
-		return 1
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	opts, err := authOptions(getenv)
+	restCfg, err := rest.InClusterConfig()
 	if err != nil {
-		log.Error("bus credentials", "err", err)
+		log.Error("in-cluster config", "err", err)
 		return 1
 	}
-	client, err := lib.Connect(ctx, url, lib.WithName(clientName), lib.WithLogger(log),
-		lib.WithAgreementPolicy(lib.AgreementPolicy{Submitter: cfg.Submitter}),
-		lib.WithNATSOptions(append(opts, nats.ReconnectWait(reconnectWait), nats.ReconnectJitter(reconnectJitter, reconnectJitter))...))
+	kube, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
-		log.Error("bus connect", "err", err)
+		log.Error("kubernetes client", "err", err)
 		return 1
 	}
-	defer client.Close()
-
-	d, err := dispatch.New(cfg, client, src, unavailableVerifier{}, log)
-	if err != nil {
-		log.Error("dispatcher", "err", err)
-		return 1
-	}
-	go src.watch(ctx, cfg.RefreshInterval, log)
-	log.Info("dispatching", "lease", cfg.Lease, "renew", cfg.Renew, "restartGrace", cfg.RestartGrace,
-		"acceptTimeout", cfg.AcceptTimeout, "profiles", profilesPath)
-	if err := d.Run(ctx); err != nil {
+	if err := serve(ctx, log, settings, kube); err != nil {
 		log.Error("dispatcher stopped", "err", err)
 		return 1
 	}
@@ -111,31 +97,80 @@ func run(args []string, getenv func(string) string) int {
 	return 0
 }
 
-// parseConfig is the env's intervals with flags over them (for a run by
-// hand), validated: the lease must span three renewals and the restart grace
-// two, or the process does not start.
-func parseConfig(args []string, getenv func(string) string) (dispatch.Config, string, error) {
-	cfg, err := dispatch.ConfigFromEnv(getenv)
+// settings is what the environment gives the process.
+type settings struct {
+	natsURL, namespace, configMap string
+	auth                          []nats.Option
+}
+
+func readSettings(getenv func(string) string) (settings, error) {
+	s := settings{natsURL: getenv("NATS_URL"), namespace: getenv(envNamespace), configMap: getenv(envConfigMap)}
+	switch {
+	case s.natsURL == "":
+		return s, errors.New("NATS_URL is required")
+	case s.namespace == "":
+		return s, fmt.Errorf("%s is required", envNamespace)
+	case s.configMap == "":
+		return s, fmt.Errorf("%s is required", envConfigMap)
+	}
+	auth, err := authOptions(getenv)
 	if err != nil {
-		return dispatch.Config{}, "", err
+		return s, fmt.Errorf("bus credentials: %w", err)
 	}
-	fs := flag.NewFlagSet("dispatcher", flag.ContinueOnError)
-	fs.DurationVar(&cfg.Lease, "lease", cfg.Lease, "how long a lease lives without a renewal ("+dispatch.EnvLeaseSeconds+")")
-	fs.DurationVar(&cfg.Renew, "renew", cfg.Renew, "how often a worker renews ("+dispatch.EnvRenewSeconds+")")
-	fs.DurationVar(&cfg.RestartGrace, "restart-grace", cfg.RestartGrace, "after a start, how long a re-adopted task may go unrenewed ("+dispatch.EnvRestartGraceSeconds+")")
-	fs.DurationVar(&cfg.AcceptTimeout, "accept-timeout", cfg.AcceptTimeout, "how long an offer waits for its accept ("+dispatch.EnvAcceptTimeoutSeconds+")")
-	path := getenv(envProfilesFile)
-	if path == "" {
-		path = defaultProfilesFile
+	s.auth = auth
+	return s, nil
+}
+
+// serve watches the config, waits for the first one, watches the worker
+// pools in its profile namespace, then dispatches until ctx ends.
+func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.Interface) error {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	store := dispatch.NewConfigStore(log)
+	go func() { _ = store.WatchConfigMap(ctx, kube, s.namespace, s.configMap, lib.DispatchConfigKey) }()
+	if err := store.WaitForConfig(ctx, configWait); err != nil {
+		return err
 	}
-	fs.StringVar(&path, "profiles", path, "the profile config file ("+envProfilesFile+")")
-	if err := fs.Parse(args); err != nil {
-		return dispatch.Config{}, "", err
+	profileNS := store.Config().ProfileNamespace
+	pool := dispatch.NewPodPool(ctx, kube, profileNS, log)
+	go pool.Run(ctx)
+	go watchProfileNamespace(ctx, cancel, store, profileNS)
+
+	client, err := lib.Connect(ctx, s.natsURL, lib.WithName(clientName), lib.WithLogger(log),
+		lib.WithAgreementPolicy(lib.AgreementPolicy{Submitter: dispatch.DefaultSubmitter}),
+		lib.WithNATSOptions(append(s.auth, nats.ReconnectWait(reconnectWait), nats.ReconnectJitter(reconnectJitter, reconnectJitter))...))
+	if err != nil {
+		return fmt.Errorf("bus connect: %w", err)
 	}
-	if fs.NArg() > 0 {
-		return dispatch.Config{}, "", fmt.Errorf("unexpected arguments %v", fs.Args())
+	defer client.Close()
+	d, err := dispatch.New(dispatch.DefaultConfig(), client, store, pool, unavailableVerifier{}, log)
+	if err != nil {
+		return err
 	}
-	return cfg, path, cfg.Validate()
+	log.Info("dispatching", "configmap", s.configMap, "profileNamespace", profileNS)
+	if err := d.Run(ctx); err != nil {
+		return err
+	}
+	if cause := context.Cause(ctx); errors.Is(cause, errProfileNamespaceMoved) {
+		return cause
+	}
+	return nil
+}
+
+func watchProfileNamespace(ctx context.Context, cancel context.CancelCauseFunc, src dispatch.Source, watched string) {
+	t := time.NewTicker(namespaceCheckInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if ns := src.Config().ProfileNamespace; ns != watched {
+				cancel(errProfileNamespaceMoved)
+				return
+			}
+		}
+	}
 }
 
 // authOptions is the projected-token identity the deployment uses, or a
@@ -149,104 +184,4 @@ func authOptions(getenv func(string) string) ([]nats.Option, error) {
 		tokenFile = lib.BusTokenPath
 	}
 	return lib.KSATokenNATSOptions(tokenFile, natsUser)
-}
-
-// fileSource is a dispatch.Source read from a JSON file and re-read on
-// every refresh, so the caps follow the config without a restart. A file
-// that stops parsing keeps the last good snapshot.
-type fileSource struct {
-	*dispatch.StaticSource
-	path string
-
-	mu      sync.Mutex
-	modTime time.Time
-}
-
-func newFileSource(path string) (*fileSource, error) {
-	snap, mod, err := readSnapshot(path)
-	if err != nil {
-		return nil, err
-	}
-	return &fileSource{StaticSource: dispatch.NewStaticSource(snap), path: path, modTime: mod}, nil
-}
-
-func readSnapshot(path string) (dispatch.Snapshot, time.Time, error) {
-	f, err := os.Open(filepath.Clean(path))
-	if err != nil {
-		return dispatch.Snapshot{}, time.Time{}, err
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return dispatch.Snapshot{}, time.Time{}, err
-	}
-	if st.Size() > maxProfilesFileBytes {
-		return dispatch.Snapshot{}, time.Time{}, fmt.Errorf("%s is %d bytes, over %d", path, st.Size(), maxProfilesFileBytes)
-	}
-	var snap dispatch.Snapshot
-	dec := json.NewDecoder(f)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&snap); err != nil {
-		return dispatch.Snapshot{}, time.Time{}, fmt.Errorf("%s: %w", path, err)
-	}
-	if err := checkSnapshot(snap); err != nil {
-		return dispatch.Snapshot{}, time.Time{}, fmt.Errorf("%s: %w", path, err)
-	}
-	return snap, st.ModTime(), nil
-}
-
-// checkSnapshot refuses a config the dispatcher can't act on safely.
-func checkSnapshot(s dispatch.Snapshot) error {
-	seen := map[string]bool{}
-	for _, p := range s.Profiles {
-		switch {
-		case !lib.ValidSubjectToken(p.Name):
-			return fmt.Errorf("profile name %q is not a subject token", p.Name)
-		case seen[p.Name]:
-			return fmt.Errorf("profile %s is listed twice", p.Name)
-		case p.Concurrency < 1:
-			return fmt.Errorf("profile %s: concurrency must be at least 1", p.Name)
-		case p.ActiveDeadlineSeconds < 1:
-			return fmt.Errorf("profile %s: activeDeadlineSeconds must be at least 1", p.Name)
-		}
-		seen[p.Name] = true
-	}
-	return nil
-}
-
-func (s *fileSource) watch(ctx context.Context, every time.Duration, log *slog.Logger) {
-	t := time.NewTicker(every)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			if err := s.reload(); err != nil {
-				log.Warn("profile config not reloaded; keeping the last good one", "path", s.path, "err", err)
-			}
-		}
-	}
-}
-
-func (s *fileSource) reload() error {
-	st, err := os.Stat(s.path)
-	if err != nil {
-		return err
-	}
-	s.mu.Lock()
-	unchanged := st.ModTime().Equal(s.modTime)
-	s.mu.Unlock()
-	if unchanged {
-		return nil
-	}
-	snap, mod, err := readSnapshot(s.path)
-	if err != nil {
-		return err
-	}
-	s.Set(snap)
-	s.mu.Lock()
-	s.modTime = mod
-	s.mu.Unlock()
-	return nil
 }
