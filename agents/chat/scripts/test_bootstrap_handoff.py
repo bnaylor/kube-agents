@@ -684,6 +684,15 @@ class HandOffTest(unittest.TestCase):
         self.assertEqual(self._carded_run(carded, running, ["t_0", "t_1", "t_2", "t_3"]),
                          [f"{h.CLUSTER_KEY_PREFIX}t_3"])
 
+    def test_a_stray_cluster_card_takes_no_carded_agents_slot(self):
+        # #3702: cap 3 over a, b, c; a's create failed, b and c are on the board,
+        # and so is a card for x, which the sweep card never listed. Counting x
+        # against the cap would leave a without a card for the whole sweep.
+        carded = ",".join(f"{h.CLUSTER_KEY_PREFIX}t_{n}" for n in "abc")
+        clusters = [(f"t_{n}", "running", None, "") for n in "bcx"]
+        self.assertEqual(self._carded_run(carded, clusters, ["t_a", "t_b", "t_c"], cap=3),
+                         [f"{h.CLUSTER_KEY_PREFIX}t_a"])
+
     def test_an_archived_carded_card_frees_no_slot_for_an_unlisted_profile(self):
         carded = f"{h.CLUSTER_KEY_PREFIX}t_1,{h.CLUSTER_KEY_PREFIX}t_2"
         clusters = [("t_1", "running", None, ""), ("t_2", "archived", None, "")]

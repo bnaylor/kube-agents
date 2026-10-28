@@ -1,8 +1,8 @@
 """The onboarding sweep's hand-off to ranking, run by ``bootstrap_scan_gate.py``.
 
 After the gate files the sweep card, this module runs once a minute on the
-gate's tick: it files one ``bootstrap-inventory-cluster-*`` card per Cluster
-Agent, waits for those cards and the sweep to settle, writes
+gate's tick: it files one ``bootstrap-inventory-cluster-*`` card per carded
+Cluster Agent (up to the first-run cap), waits for those cards and the sweep to settle, writes
 ``INVENTORY.raw.md`` from their structured ``metadata``, and files the
 ``bootstrap-inventory-prioritize`` card that ranks it into the report the user
 receives — or, when no cluster's audit reached the raw file, writes that report
@@ -891,10 +891,15 @@ def file_cluster_cards(
     have = {c["key"] for c in state["clusters"]} | state.get("archived_keys", set())
     stale = state.get("stale_keys", {})
     filed, unfiled = 0, []
+    # With ``carded``, only the carded agents' cards count against the cap: a
+    # stray cluster card on the board (one someone filed by hand, or a key the
+    # card never listed) must not take the slot of a carded agent whose create
+    # failed. Without it, every cluster card of the sweep counts, as before.
+    counted = len(state["clusters"]) if carded is None else sum(1 for c in state["clusters"] if c["key"] in carded)
     for agent in roster:
         if agent["key"] in have or (carded is not None and agent["key"] not in carded):
             continue
-        if cap is not None and len(state["clusters"]) + filed >= cap:
+        if cap is not None and counted + filed >= cap:
             break
         old = stale.get(agent["key"])
         if old and not _archive(old):

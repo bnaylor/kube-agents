@@ -616,6 +616,12 @@ def _task_body(cap: int | None = None, ready: list[dict] | None = None) -> str:
         + "\n".join(f"    - {a['cluster_label']}" for a in past_cap)
         + "\n\n"
     ) if past_cap else ""
+    step3_count = (
+        "This fleet is past the first-run cap, so they include at least the clusters the note "
+        "above lists."
+        if past_cap
+        else "On a fleet under the first-run cap there are usually none."
+    )
     return (
         "First-time onboarding discovery sweep. Follow the inventory SOP, reading whichever "
         "of these exists:\n"
@@ -662,7 +668,7 @@ def _task_body(cap: int | None = None, ready: list[dict] | None = None) -> str:
         "**Step 3 — audit the clusters the list does not cover**, following Steps 2 to 4 of the "
         "single-cluster audit SOP (its own numbering) for each, reading whichever of these "
         f"exists:\n{cluster_audit_list}\n\n"
-        "and record each in that SOP's `metadata` shape. Usually there are none.\n\n"
+        f"and record each in that SOP's `metadata` shape. {step3_count}\n\n"
         "**Step 4 — complete this card now. Do not wait for the per-cluster cards, do not write "
         f"`{RAW_INVENTORY_PATH}` or `{INVENTORY_PATH}`, and do not file a ranking card.** The "
         "onboarding gate waits for the per-cluster cards, writes the raw findings from their "

@@ -2405,6 +2405,7 @@ class ScanGateTest(unittest.TestCase):
         # The clusters past the cap are named as having agents, so the worker
         # audits them without reporting them as lacking one.
         self.assertIn("Past the first-run cap", body)
+        self.assertIn("This fleet is past the first-run cap, so they include at least the clusters", body)
         for i in range(5):
             if f"cluster-proj-c{i}-us-east4" in sorted(names)[2:]:
                 self.assertIn(f"`c{i}`", body.split("Past the first-run cap", 1)[1])
@@ -2505,7 +2506,9 @@ class ScanGateTest(unittest.TestCase):
     def test_a_roster_under_the_cap_is_listed_whole(self):
         names = [self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(3)]
         self.assertEqual([a["name"] for a in bootstrap_scan_gate.cluster_agents()], sorted(names))
-        self.assertNotIn("Past the first-run cap", bootstrap_scan_gate._task_body())
+        body = bootstrap_scan_gate._task_body()
+        self.assertNotIn("Past the first-run cap", body)
+        self.assertIn("On a fleet under the first-run cap there are usually none.", body)
 
     def test_a_filed_sweep_runs_the_hand_off_instead_of_filing(self):
         (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n")

@@ -559,6 +559,31 @@ def test_a_marker_without_carded_grades_the_first_cap_by_name(capped, monkeypatc
     assert f"no card for {[LATE]}, among the first 2 by profile name" in cards.reason
 
 
+def _with_carded_marker(capped, carded: list[str]) -> None:
+    root = capped(FIRST, _compose(FIRST, PAST)).parent.parent
+    with (root / discovery.SCAN_MARKER).open("a") as fh:
+        fh.write("carded=" + ",".join(discovery.CLUSTER_KEY_PREFIX + p for p in carded) + "\n")
+
+
+@pytest.mark.parametrize("require", ["cards_for_first_cap_profiles", "past_cap_clusters_sweep_audited"])
+def test_a_carded_set_short_of_the_cap_fails(capped, require: str) -> None:
+    # One of a cap of two over a roster of five: graded against the marker
+    # alone, a gate that carded too few would pass.
+    _with_carded_marker(capped, FIRST[:1])
+    result = _verify_capped(require)
+    assert result.status == "fail", result.reason
+    assert "lists 1 carded profile(s); a cap of 2 over a roster of 5 cards 2" in result.reason
+
+
+@pytest.mark.parametrize("require", ["cards_for_first_cap_profiles", "past_cap_clusters_sweep_audited"])
+def test_a_carded_key_for_no_roster_profile_fails(capped, require: str) -> None:
+    _with_carded_marker(capped, [FIRST[0], "cluster-proj-gone-us-east4"])
+    result = _verify_capped(require)
+    assert result.status == "fail", result.reason
+    assert "carded key(s) for no roster profile" in result.reason
+    assert "cluster-proj-gone-us-east4" in result.reason
+
+
 def test_the_read_drops_carded_entries_that_are_not_card_keys(tmp_path: Path) -> None:
     root = _write_root(tmp_path, _capped_board([]), CAPPED_ROSTER)
     good = discovery.CLUSTER_KEY_PREFIX + FIRST[0]

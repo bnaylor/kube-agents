@@ -3659,6 +3659,27 @@ class BootstrapFanoutVerifier(BaseVerifier):
             first = [r for r in ordered if r["key"] in keys]
             rest = [r for r in ordered if r["key"] not in keys]
             chosen = "the profiles the sweep marker lists as carded"
+            # The marker is the gate's own record, so grading against it alone
+            # would pass a gate that carded too few or named a profile that is
+            # not there. (a) every carded key is a roster profile; (b) the set
+            # is the cap's worth, or the whole roster when that is smaller. A
+            # profile scaffolded after filing raises the roster without
+            # changing the set, which can make (b) strict where the roster was
+            # under the cap at filing; with the roster above the cap, as this
+            # check requires, it cannot. Whether the set is the first by
+            # profile name at filing needs the profiles' scaffold times, which
+            # the follow-up issue covers.
+            unknown = sorted(keys - {r["key"] for r in ordered})
+            if unknown:
+                return "fail", f"{where}: the sweep marker lists carded key(s) for no roster profile: {unknown}", payload
+            want = min(cap, len(ordered))
+            if len(keys) != want:
+                return (
+                    "fail",
+                    f"{where}: the sweep marker lists {len(keys)} carded profile(s); a cap of {cap} over a roster "
+                    f"of {len(ordered)} cards {want}",
+                    payload,
+                )
         else:
             first, rest = ordered[:cap], ordered[cap:]
             chosen = f"the first {cap} by profile name"
