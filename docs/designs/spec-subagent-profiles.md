@@ -318,14 +318,29 @@ What the operator renders per profile, as built (amended 10/6):
   from the profile and the consumer names and inbox from the attested pod name, the same way
   it already does for session pods. A refused profile is left out of the map rather than
   failing it for everyone.
+- Per-task credentials (#3889), staged. A worker gets two connections. Its pod connection,
+  which presents the ServiceAccount token alone, gets the dispatch subjects, its inbox and its
+  topics. After it accepts a task it opens a task connection with the token as the connection
+  token and a task credential as the password.
+  The dispatcher signs the credential (`a2a/taskcred`), and the callout refuses it unless its
+  pod name and UID are the pod the token is bound to, and its profile and tier are the
+  entry's. The task connection gets that one task's `.events` publish and its `.in` and
+  `.events` consumers, filtered exactly on the task, and its JWT expires with the credential.
+  The password carries the credential because the server copies CONNECT's `jwt` field into
+  its `$SYS` advisories and `connz`, and a refused connection would publish it. The operator
+  generates the task-signing key beside the callout's keys, in a Secret only the dispatcher
+  mounts, and renders the public half into the callout's environment. The narrowing lands in
+  steps: the first PR adds the task connection, and the pod connection keeps its profile-wide
+  task reach. The worker PR moves the worker onto the task connection and removes that reach,
+  and it has to land before #3659's tiers stronger than Read go live.
 - The card: the operator is a bus principal for this and nothing else. Its entry publishes on
   `a2a.agents.*` and direct-gets the directory, so reconcile can tell a missing or stale card
   from a current one. The grant is a wildcard over the profile token because callout grants are
   fixed for the life of a connection, and a profile created later still has to be publishable.
 
-Two limits of what is built. Credentials are per profile, as decided 8/24, so two pods of one
-profile can reach each other's task subjects; per-task credentials stay with the authority
-work. And a profile deleted while its agent is on `today` releases its finalizer with no
+Two limits of what is built. Until #3889's later PRs (the dispatcher's mint and the worker's
+task connection) land, a worker's pod connection still reaches every task of its profile, so
+two pods of one profile can reach each other's task subjects. And a profile deleted while its agent is on `today` releases its finalizer with no
 tombstone, because there is no bus to publish one on. The directory survives a flip to
 `today` on the bus's PVC, so that card is still there when the agent goes back to `next`.
 Nothing sweeps directory entries that have no profile. Fixing that means either holding

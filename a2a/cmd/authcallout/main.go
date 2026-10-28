@@ -53,6 +53,12 @@ const (
 	// grants name. Required: see authcallout.ParseReservedAddressees.
 	envReservedAddressees = "A2A_RESERVED_ADDRESSEES"
 
+	// envTaskSigningKeys carries the task-signing public keys, comma
+	// separated, which the operator renders from the task-signing Secret it
+	// generates beside the callout keys. Optional: see
+	// authcallout.ParseTaskSigningKeys.
+	envTaskSigningKeys = "A2A_TASK_SIGNING_PUBLIC_KEYS"
+
 	defaultAuthMapKey  = "identities.json"
 	defaultStatusAddr  = ":8080"
 	defaultMapWait     = 60 * time.Second
@@ -139,6 +145,15 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("%s: %w", envReservedAddressees, err)
 	}
 
+	// The task-signing public keys. Unset is not a refusal, unlike the two
+	// above: without a key no task connection is honoured, which narrows a
+	// worker rather than widening anyone. A malformed one is, so a render
+	// bug surfaces here rather than as every task connection refused.
+	taskKeys, err := authcallout.ParseTaskSigningKeys(os.Getenv(envTaskSigningKeys))
+	if err != nil {
+		return fmt.Errorf("%s: %w", envTaskSigningKeys, err)
+	}
+
 	restCfg, err := rest.InClusterConfig()
 	if err != nil {
 		return fmt.Errorf("in-cluster config: %w", err)
@@ -169,6 +184,7 @@ func run(log *slog.Logger) error {
 		GrantTTL:           grantTTL,
 		ReservedPrincipals: reserved,
 		ReservedAddressees: reservedAddressees,
+		TaskSigningKeys:    taskKeys,
 	}, log)
 	if err != nil {
 		return err

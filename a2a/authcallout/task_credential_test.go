@@ -1,0 +1,505 @@
+package authcallout
+
+import (
+	"context"
+	"io"
+	"log/slog"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nkeys"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/taskcred"
+)
+
+// Per-task credentials (#3889): a profile worker's task connection presents
+// its ServiceAccount token as the connection token and a task credential the
+// dispatcher signed as the password, and gets that one task's subjects. The
+// unit tests read the refusal reasons, which the client never sees; the
+// integration tests prove the scope against a real server.
+
+const (
+	taskOne = "task-1"
+	taskTwo = "task-2"
+
+	// auditorPod1UID is profileTokens' attested UID for auditorPod1.
+	auditorPod1UID = "uid-p1"
+)
+
+func taskSigningKey(t *testing.T) (nkeys.KeyPair, string) {
+	t.Helper()
+	kp, err := taskcred.NewSigningKey()
+	if err != nil {
+		t.Fatalf("NewSigningKey: %v", err)
+	}
+	pub, _ := kp.PublicKey()
+	return kp, pub
+}
+
+// taskToken mints a nats credential for auditorPod1's task-1, as the
+// dispatcher would, with edit applied first.
+func taskToken(t *testing.T, kp nkeys.KeyPair, edit func(*taskcred.Claims)) string {
+	t.Helper()
+	c := taskcred.Claims{
+		Task:     taskOne,
+		Profile:  auditor,
+		Tier:     "read",
+		Pod:      auditorPod1,
+		PodUID:   auditorPod1UID,
+		Audience: taskcred.AudienceNATS,
+		Expires:  time.Now().Add(10 * time.Minute),
+	}
+	if edit != nil {
+		edit(&c)
+	}
+	tok, err := taskcred.Mint(kp, c)
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	return tok
+}
+
+func newTaskTestService(t *testing.T, keys []string, grantTTL time.Duration) *Service {
+	t.Helper()
+	issuerKP, err := nkeys.CreateAccount()
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	issuerSeed, _ := issuerKP.Seed()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store := NewStore(log)
+	if err := store.Update([]byte(profileMap)); err != nil {
+		t.Fatalf("loading the identity map: %v", err)
+	}
+	validator, err := NewTokenValidator(tokenReviewer(profileTokens(), nil), testAudience)
+	if err != nil {
+		t.Fatalf("NewTokenValidator: %v", err)
+	}
+	svc, err := NewService(store, validator, Config{
+		IssuerSeed:         string(issuerSeed),
+		ReservedPrincipals: renderedFixtureAuthUsers(t),
+		ReservedAddressees: renderedFixtureAddressees(t),
+		TaskSigningKeys:    keys,
+		GrantTTL:           grantTTL,
+	}, log)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	return svc
+}
+
+func authorizeWithTask(svc *Service, saToken, task string) (decision, error) {
+	req := &jwt.AuthorizationRequestClaims{}
+	req.ConnectOptions.Token = saToken
+	req.ConnectOptions.Password = task
+	return svc.authorize(context.Background(), req)
+}
+
+// Each mismatch between the credential and the connection presenting it is a
+// refusal, and the reason names the claim.
+func TestATaskCredentialMustBeThisConnections(t *testing.T) {
+	kp, pub := taskSigningKey(t)
+	other, _ := taskSigningKey(t)
+	svc := newTaskTestService(t, []string{pub}, 0)
+
+	cases := []struct {
+		name  string
+		token string
+		want  string
+	}{
+		{"another pod", taskToken(t, kp, func(c *taskcred.Claims) { c.Pod = auditorPod2 }), "pod"},
+		{"another pod UID", taskToken(t, kp, func(c *taskcred.Claims) { c.PodUID = "uid-p2" }), "pod UID"},
+		{"another profile", taskToken(t, kp, func(c *taskcred.Claims) { c.Profile = cluster }), "profile"},
+		{"another tier", taskToken(t, kp, func(c *taskcred.Claims) { c.Tier = "unattended" }), "tier"},
+		{"past GrantTTL", taskToken(t, kp, func(c *taskcred.Claims) { c.Expires = time.Now().Add(2 * time.Hour) }), "ceiling"},
+		{"an untrusted key", taskToken(t, other, nil), "not a trusted task-signing key"},
+		{"the proxy audience", taskToken(t, kp, func(c *taskcred.Claims) { c.Audience = taskcred.AudienceCredentialProxy }), "credential-proxy"},
+		{"not a credential", "not-a-jwt", "not a JWT"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, err := authorizeWithTask(svc, tokenAuditorPod1, tc.token)
+			if err == nil {
+				t.Fatalf("authorized with grants %+v", d.perms)
+			}
+			if !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "task credential") {
+				t.Errorf("refusal %q does not name %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// Expiry is read against the callout's clock, moved forward here because Mint
+// stamps iat with the wall clock and a credential issued after its own expiry
+// is refused for that instead. Past the skew Verify refuses it; inside the
+// skew but past now the callout does, since the JWT it minted would already
+// be expired.
+func TestAnExpiredTaskCredentialIsRefused(t *testing.T) {
+	kp, pub := taskSigningKey(t)
+	for name, tc := range map[string]struct{ clock, exp time.Duration }{
+		"past the skew":                {5 * time.Minute, time.Minute},
+		"inside the skew but past now": {70 * time.Second, time.Minute},
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc := newTaskTestService(t, []string{pub}, 0)
+			now := time.Now()
+			svc.now = func() time.Time { return now.Add(tc.clock) }
+			tok := taskToken(t, kp, func(c *taskcred.Claims) { c.Expires = now.Add(tc.exp) })
+			if _, err := authorizeWithTask(svc, tokenAuditorPod1, tok); err == nil || !strings.Contains(err.Error(), "expired") {
+				t.Errorf("refusal %v does not name the expiry", err)
+			}
+			// The same credential a minute earlier on the callout's clock
+			// is honoured, so the refusal above is the expiry's.
+			svc.now = func() time.Time { return now }
+			if _, err := authorizeWithTask(svc, tokenAuditorPod1, tok); err != nil {
+				t.Errorf("the credential before its expiry was refused: %v", err)
+			}
+		})
+	}
+}
+
+// A task credential on an entry that isn't a profile worker's is refused, not
+// ignored; so is one at a callout that trusts no key, and one for an entry
+// with no tier.
+func TestATaskCredentialIsRefusedWhereItCannotBeHonoured(t *testing.T) {
+	kp, pub := taskSigningKey(t)
+	svc := newTaskTestService(t, []string{pub}, 0)
+	if _, err := authorizeWithTask(svc, tokenPodA, taskToken(t, kp, nil)); err == nil || !strings.Contains(err.Error(), "not a profile worker") {
+		t.Errorf("a session pod's task credential: %v", err)
+	}
+	if _, err := authorizeWithTask(svc, gatewayToken, taskToken(t, kp, nil)); err == nil {
+		t.Error("a static entry's task credential was accepted")
+	}
+	// cluster-a's entry names no tier.
+	tok := taskToken(t, kp, func(c *taskcred.Claims) { c.Profile, c.Pod, c.PodUID = cluster, clusterPod, "uid-c" })
+	if _, err := authorizeWithTask(svc, tokenClusterPod, tok); err == nil || !strings.Contains(err.Error(), "tier") {
+		t.Errorf("a credential for an entry with no tier: %v", err)
+	}
+
+	keyless := newTaskTestService(t, nil, 0)
+	if _, err := authorizeWithTask(keyless, tokenAuditorPod1, taskToken(t, kp, nil)); err == nil || !strings.Contains(err.Error(), "trusts no task-signing key") {
+		t.Errorf("a callout with no task-signing key: %v", err)
+	}
+}
+
+func TestNewServiceRefusesTaskSigningKeysItCannotUse(t *testing.T) {
+	_, a := taskSigningKey(t)
+	_, b := taskSigningKey(t)
+	_, c := taskSigningKey(t)
+	acct, _ := nkeys.CreateAccount()
+	acctPub, _ := acct.PublicKey()
+	issuerSeed, _ := acct.Seed()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	validator, err := NewTokenValidator(tokenReviewer(nil, nil), testAudience)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, keys := range map[string][]string{
+		"three keys":     {a, b, c},
+		"an account key": {acctPub},
+		"garbage":        {a, "C-not-a-key"},
+	} {
+		if _, err := NewService(NewStore(log), validator, Config{
+			IssuerSeed:         string(issuerSeed),
+			ReservedPrincipals: renderedFixtureAuthUsers(t),
+			ReservedAddressees: renderedFixtureAddressees(t),
+			TaskSigningKeys:    keys,
+		}, log); err == nil {
+			t.Errorf("%s: NewService accepted it", name)
+		}
+	}
+}
+
+// A valid credential scopes the grant to its task: the events publish and all
+// three consumer filters are exact on it, and nothing of the pod connection's
+// (hand-off, lease, topics) comes with it.
+func TestAValidTaskCredentialGrantsThatTaskOnly(t *testing.T) {
+	kp, pub := taskSigningKey(t)
+	_, oldPub := taskSigningKey(t)
+	svc := newTaskTestService(t, []string{oldPub, pub}, 0)
+	exp := time.Now().Add(10 * time.Minute)
+	d, err := authorizeWithTask(svc, tokenAuditorPod1, taskToken(t, kp, func(c *taskcred.Claims) { c.Expires = exp }))
+	if err != nil {
+		t.Fatalf("refused: %v", err)
+	}
+	if d.task != taskOne || d.notAfter.Unix() != exp.Unix() || d.user != auditorPod1 {
+		t.Errorf("decision task/notAfter/user = %q/%v/%q", d.task, d.notAfter, d.user)
+	}
+	pubs, subs := []string(d.perms.Pub.Allow), []string(d.perms.Sub.Allow)
+
+	for _, want := range []string{
+		lib.TaskEventsSubject(auditor, taskOne),
+		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerOrigin)) + "." + lib.TaskInSubject(auditor, taskOne),
+		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerIn)) + "." + lib.TaskInSubject(auditor, taskOne),
+		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerEvents)) + "." + lib.TaskEventsSubject(auditor, taskOne),
+		consumerSubject("MSG.NEXT", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerIn)),
+		"_INBOX." + auditorPod1 + ".reply",
+	} {
+		if !grantsCover(pubs, want) {
+			t.Errorf("publish %s is not granted; the task connection needs it", want)
+		}
+	}
+	for _, refused := range []string{
+		lib.TaskEventsSubject(auditor, taskTwo),
+		lib.TaskInSubject(auditor, taskOne),
+		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerIn)) + "." + lib.TaskInSubject(auditor, taskTwo),
+		lib.DispatchAcceptSubject(auditor, "read", auditorPod1),
+		lib.DispatchLeaseSubject(auditor, "read", auditorPod1),
+		"a2a.topics." + auditorPublishTopic,
+		"$JS.API.STREAM.INFO." + lib.StreamTopicsState,
+	} {
+		if grantsCover(pubs, refused) {
+			t.Errorf("publish %s is granted on a task-1 connection", refused)
+		}
+	}
+	for _, p := range append(append([]string{}, pubs...), subs...) {
+		if strings.Contains(p, ".*.") || strings.HasSuffix(p, ".*") || (strings.Contains(p, ">") && !strings.HasPrefix(p, "_INBOX."+auditorPod1+".")) {
+			t.Errorf("a wildcard grant on a task connection: %s", p)
+		}
+	}
+	if grantsCover(subs, lib.DispatchSubject(auditor, "read", auditorPod1)) || grantsCover(subs, "a2a.topics."+auditorSubscribeTopic) {
+		t.Errorf("a task connection subscribes beyond its inbox: %v", subs)
+	}
+}
+
+// TRANSITIONAL, flip with #3889's worker PR. Today the pod connection, with
+// no credential, keeps the profile-wide task reach it had before #3889:
+// .events on every task of its profile and its consumers filtered on <P>.*.
+// When the worker moves onto its task connection, that reach goes (the TODO on
+// profileWorkerGrants), and this test becomes "the pod connection holds no
+// a2a.tasks. grant and no consumer on TASKS", which it asserted before the
+// removal was staged. It must flip before any tier stronger than Read goes
+// live (#3659).
+func TestATokenlessWorkerKeepsProfileWideTaskReachUntilTheWorkerPR(t *testing.T) {
+	_, pub := taskSigningKey(t)
+	svc := newTaskTestService(t, []string{pub}, 0)
+	for name, tc := range map[string]struct{ token, profile, pod string }{
+		"tiered":   {tokenAuditorPod1, auditor, auditorPod1},
+		"tierless": {tokenClusterPod, cluster, clusterPod},
+	} {
+		d, err := svc.authorize(context.Background(), &jwt.AuthorizationRequestClaims{ConnectOptions: jwt.ConnectOptions{Token: tc.token}})
+		if err != nil {
+			t.Fatalf("%s: refused: %v", name, err)
+		}
+		if d.task != "" || !d.notAfter.IsZero() {
+			t.Errorf("%s: a pod connection carries task %q, notAfter %v", name, d.task, d.notAfter)
+		}
+		pubs := []string(d.perms.Pub.Allow)
+		for _, task := range []string{taskOne, taskTwo} {
+			for _, want := range []string{
+				lib.TaskEventsSubject(tc.profile, task),
+				consumerSubject("CREATE", lib.SessionConsumerName(tc.pod, lib.SessionConsumerIn)) + "." + lib.TaskInSubject(tc.profile, "*"),
+			} {
+				if !grantsCover(pubs, want) {
+					t.Errorf("%s: the pod connection lost %s before the worker PR moved it onto a task connection", name, want)
+				}
+			}
+		}
+	}
+}
+
+// The task connection is strictly narrower than the pod connection it sits
+// beside: every task-plane grant it holds, the pod connection covers too, and
+// the pod connection reaches a sibling task the task connection is refused.
+// Stays true after the worker PR in its first half; the second half flips
+// with TestATokenlessWorkerKeepsProfileWideTaskReachUntilTheWorkerPR.
+func TestATaskConnectionIsNarrowerThanThePodConnection(t *testing.T) {
+	kp, pub := taskSigningKey(t)
+	svc := newTaskTestService(t, []string{pub}, 0)
+	pod, err := svc.authorize(context.Background(), &jwt.AuthorizationRequestClaims{ConnectOptions: jwt.ConnectOptions{Token: tokenAuditorPod1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := authorizeWithTask(svc, tokenAuditorPod1, taskToken(t, kp, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range task.perms.Pub.Allow {
+		if !grantsCover(pod.perms.Pub.Allow, g) {
+			t.Errorf("the task connection holds %s, which the pod connection does not", g)
+		}
+	}
+	sibling := lib.TaskEventsSubject(auditor, taskTwo)
+	if !grantsCover(pod.perms.Pub.Allow, sibling) || grantsCover(task.perms.Pub.Allow, sibling) {
+		t.Errorf("want %s on the pod connection (transitional) and not on the task-1 connection", sibling)
+	}
+}
+
+// The minted JWT expires no later than the credential, and no later than
+// GrantTTL.
+func TestTheMintedJWTExpiresWithItsTaskCredential(t *testing.T) {
+	kp, pub := taskSigningKey(t)
+	userKP, _ := nkeys.CreateUser()
+	userPub, _ := userKP.PublicKey()
+	req := &jwt.AuthorizationRequestClaims{}
+	req.UserNkey = userPub
+
+	for name, tc := range map[string]struct {
+		ttl time.Duration
+		exp time.Duration
+	}{
+		"the credential is shorter": {time.Hour, 5 * time.Minute},
+		"GrantTTL is shorter":       {10 * time.Minute, 10*time.Minute + 20*time.Second},
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc := newTaskTestService(t, []string{pub}, tc.ttl)
+			exp := time.Now().Add(tc.exp)
+			d, err := authorizeWithTask(svc, tokenAuditorPod1, taskToken(t, kp, func(c *taskcred.Claims) { c.Expires = exp }))
+			if err != nil {
+				t.Fatalf("refused: %v", err)
+			}
+			raw, err := svc.mint(req, d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			uc, err := jwt.DecodeUserClaims(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if uc.Expires > exp.Unix() {
+				t.Errorf("minted exp %d is after the credential's %d", uc.Expires, exp.Unix())
+			}
+			if ceiling := time.Now().Add(tc.ttl).Unix(); uc.Expires > ceiling {
+				t.Errorf("minted exp %d is past GrantTTL (%d)", uc.Expires, ceiling)
+			}
+		})
+	}
+}
+
+// --- against a real server ---
+
+// connectForTask dials as a task connection: the ServiceAccount token as the
+// connection token, the task credential as the password.
+func (h *harness) connectForTask(t *testing.T, user, saToken, task string, extra ...nats.Option) (*nats.Conn, chan error, error) {
+	t.Helper()
+	violations := make(chan error, 16)
+	nc, err := nats.Connect(h.url, append([]nats.Option{h.tls,
+		nats.Token(saToken),
+		nats.UserInfo("", task),
+		nats.CustomInboxPrefix("_INBOX." + user),
+		nats.Name(user + "-task"),
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, e error) { violations <- e }),
+	}, extra...)...)
+	if err != nil {
+		return nil, nil, err
+	}
+	t.Cleanup(nc.Close)
+	return nc, violations, nil
+}
+
+func TestATaskConnectionReachesItsTaskAndNoOther(t *testing.T) {
+	kp, pub := taskSigningKey(t)
+	h := startHarness(t, profileMap, profileTokens(), withTaskSigningKeys(pub))
+	nc, violations, err := h.connectForTask(t, auditorPod1, tokenAuditorPod1, taskToken(t, kp, nil))
+	if err != nil {
+		t.Fatalf("a valid task credential was refused: %v", err)
+	}
+
+	in := lib.SessionConsumerName(auditorPod1, lib.SessionConsumerIn)
+	checkPublish(t, nc, violations, map[string]bool{
+		lib.TaskEventsSubject(auditor, taskOne): false,
+		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerOrigin)) + "." + lib.TaskInSubject(auditor, taskOne):     false,
+		consumerSubject("CREATE", in) + "." + lib.TaskInSubject(auditor, taskOne):                                                                  false,
+		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerEvents)) + "." + lib.TaskEventsSubject(auditor, taskOne): false,
+		consumerSubject("MSG.NEXT", in): false,
+		"_INBOX." + auditorPod1 + ".r":  false,
+
+		// Another task of the same profile, by every route.
+		lib.TaskEventsSubject(auditor, taskTwo):                                                                                                    true,
+		consumerSubject("CREATE", in) + "." + lib.TaskInSubject(auditor, taskTwo):                                                                  true,
+		consumerSubject("CREATE", in) + "." + lib.TaskInSubject(auditor, "*"):                                                                      true,
+		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerEvents)) + "." + lib.TaskEventsSubject(auditor, taskTwo): true,
+		// Its own task's input, which the requester writes.
+		lib.TaskInSubject(auditor, taskOne): true,
+		// The pod connection's grants stay on the pod connection.
+		lib.DispatchAcceptSubject(auditor, "read", auditorPod1): true,
+		lib.DispatchLeaseSubject(auditor, "read", auditorPod1):  true,
+		"a2a.topics." + auditorPublishTopic:                     true,
+	})
+	for _, subject := range []string{
+		lib.TaskEventsSubject(auditor, taskTwo),
+		lib.TaskEventsSubject(auditor, taskOne),
+		lib.DispatchSubject(auditor, "read", auditorPod1),
+		"a2a.topics." + auditorSubscribeTopic,
+	} {
+		if !subscribeRefused(t, nc, violations, subject) {
+			t.Errorf("subscribe %s was allowed on a task connection", subject)
+		}
+	}
+}
+
+func TestABadTaskCredentialIsRefusedAtConnect(t *testing.T) {
+	kp, pub := taskSigningKey(t)
+	untrusted, _ := taskSigningKey(t)
+	h := startHarness(t, profileMap, profileTokens(), withTaskSigningKeys(pub))
+	for name, tok := range map[string]string{
+		"another pod":     taskToken(t, kp, func(c *taskcred.Claims) { c.Pod = auditorPod2 }),
+		"another pod UID": taskToken(t, kp, func(c *taskcred.Claims) { c.PodUID = "uid-p2" }),
+		"another profile": taskToken(t, kp, func(c *taskcred.Claims) { c.Profile = cluster }),
+		"another tier":    taskToken(t, kp, func(c *taskcred.Claims) { c.Tier = "unattended" }),
+		"untrusted key":   taskToken(t, untrusted, nil),
+	} {
+		if _, _, err := h.connectForTask(t, auditorPod1, tokenAuditorPod1, tok); err == nil {
+			t.Errorf("%s: connected", name)
+		}
+	}
+	// The same pod's token with no credential still connects, as the pod
+	// connection.
+	h.connectAs(t, auditorPod1, tokenAuditorPod1)
+
+	// Expired: the callout's clock five minutes on, a credential for one.
+	now := time.Now()
+	late := startHarness(t, profileMap, profileTokens(), withTaskSigningKeys(pub), withNow(func() time.Time { return now.Add(5 * time.Minute) }))
+	if _, _, err := late.connectForTask(t, auditorPod1, tokenAuditorPod1, taskToken(t, kp, func(c *taskcred.Claims) { c.Expires = now.Add(time.Minute) })); err == nil {
+		t.Error("expired: connected")
+	}
+}
+
+// The server closes a task connection when its credential expires: the minted
+// JWT carries the credential's expiry.
+func TestATaskConnectionClosesWhenItsCredentialExpires(t *testing.T) {
+	kp, pub := taskSigningKey(t)
+	h := startHarness(t, profileMap, profileTokens(), withTaskSigningKeys(pub))
+	closed := make(chan struct{})
+	_, _, err := h.connectForTask(t, auditorPod1, tokenAuditorPod1,
+		taskToken(t, kp, func(c *taskcred.Claims) { c.Expires = time.Now().Add(3 * time.Second) }),
+		nats.NoReconnect(),
+		nats.ClosedHandler(func(*nats.Conn) { close(closed) }))
+	if err != nil {
+		t.Fatalf("refused: %v", err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the task connection outlived its credential by more than 6s")
+	}
+}
+
+// TRANSITIONAL, flip with #3889's worker PR: on a real server the pod
+// connection still reaches its profile's task plane, every task of it, while
+// the task connection beside it is refused the sibling task. After the worker
+// PR the pod connection's rows below become refusals.
+func TestOnARealServerThePodConnectionIsWiderThanTheTaskConnection(t *testing.T) {
+	kp, pub := taskSigningKey(t)
+	h := startHarness(t, profileMap, profileTokens(), withTaskSigningKeys(pub))
+	pod, podViolations := h.connectAs(t, auditorPod1, tokenAuditorPod1)
+	checkPublish(t, pod, podViolations, map[string]bool{
+		lib.TaskEventsSubject(auditor, taskOne): false,
+		lib.TaskEventsSubject(auditor, taskTwo): false,
+		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerIn)) + "." + lib.TaskInSubject(auditor, "*"): false,
+		lib.DispatchAcceptSubject(auditor, "read", auditorPod1):                                                                        false,
+	})
+	task, taskViolations, err := h.connectForTask(t, auditorPod1, tokenAuditorPod1, taskToken(t, kp, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkPublish(t, task, taskViolations, map[string]bool{
+		lib.TaskEventsSubject(auditor, taskOne): false,
+		lib.TaskEventsSubject(auditor, taskTwo): true,
+		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerIn)) + "." + lib.TaskInSubject(auditor, "*"): true,
+	})
+}

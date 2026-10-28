@@ -123,7 +123,7 @@ func tokenReviewer(tokens map[string]Attested, onReview func(token string) func(
 	return c
 }
 
-// harnessOption tweaks one harness. There is one so far; see onTokenReview.
+// harnessOption tweaks one harness.
 type harnessOption func(*harnessOptions)
 
 type harnessOptions struct {
@@ -135,11 +135,27 @@ type harnessOptions struct {
 	// grantTTL, when set, replaces the callout's one-hour grant lifetime,
 	// so a test can watch a connection outlive the JWT it was issued.
 	grantTTL time.Duration
+	// taskKeys are the task-signing public keys the callout trusts, for the
+	// per-task credential tests (task_credential_test.go).
+	taskKeys []string
+	// now, when set, is the callout's clock.
+	now func() time.Time
 }
 
 // withGrantTTL shortens every grant the callout issues.
 func withGrantTTL(d time.Duration) harnessOption {
 	return func(o *harnessOptions) { o.grantTTL = d }
+}
+
+// withTaskSigningKeys makes the callout honour task credentials from these
+// keys.
+func withTaskSigningKeys(keys ...string) harnessOption {
+	return func(o *harnessOptions) { o.taskKeys = keys }
+}
+
+// withNow sets the callout's clock.
+func withNow(now func() time.Time) harnessOption {
+	return func(o *harnessOptions) { o.now = now }
 }
 
 // watchingTokenReviews wraps every TokenReview the callout performs.
@@ -254,7 +270,9 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 		// keeps equal to its render.
 		ReservedAddressees: renderedFixtureAddressees(t),
 
-		GrantTTL: options.grantTTL,
+		GrantTTL:        options.grantTTL,
+		TaskSigningKeys: options.taskKeys,
+		Now:             options.now,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
