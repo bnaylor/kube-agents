@@ -1,7 +1,9 @@
 package lib
 
 import (
+	"bytes"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -191,7 +193,7 @@ func TestADispatchConfigIsChecked(t *testing.T) {
 		t.Fatalf("a good config: %v", err)
 	}
 	one := validDispatchConfig()
-	one.Ceiling, one.ChildReserve, one.InteractiveReserve = 1, 0, 1
+	one.Ceiling, one.ChildReserve, one.InteractiveReserve = 1, 0, 0
 	if err := one.Validate(); err != nil {
 		t.Errorf("a ceiling of 1 with no child reserve: %v", err)
 	}
@@ -199,16 +201,17 @@ func TestADispatchConfigIsChecked(t *testing.T) {
 		edit func(*DispatchConfig)
 		want string
 	}{
-		"no namespace":           {func(c *DispatchConfig) { c.Namespace = "" }, "namespace"},
-		"no ceiling":             {func(c *DispatchConfig) { c.Ceiling = 0 }, "ceiling"},
-		"reserve at ceiling":     {func(c *DispatchConfig) { c.ChildReserve = 6 }, "childReserve"},
-		"reserve of a 1 ceiling": {func(c *DispatchConfig) { c.Ceiling, c.ChildReserve, c.InteractiveReserve = 1, 1, 1 }, "childReserve"},
-		"short lease":            {func(c *DispatchConfig) { c.LeaseSeconds = 59 }, "three renewals"},
-		"short grace":            {func(c *DispatchConfig) { c.RestartGraceSeconds = 39 }, "two renewals"},
-		"no accept timeout":      {func(c *DispatchConfig) { c.AcceptTimeoutSeconds = 0 }, "acceptTimeoutSeconds"},
-		"duplicate profile":      {func(c *DispatchConfig) { c.Profiles = append(c.Profiles, c.Profiles[0]) }, "twice"},
-		"no concurrency":         {func(c *DispatchConfig) { c.Profiles[0].Concurrency = 0 }, "concurrency"},
-		"misnamed durable":       {func(c *DispatchConfig) { c.Profiles[0].Durables[0].Name = "other" }, "durable"},
+		"no namespace":              {func(c *DispatchConfig) { c.Namespace = "" }, "namespace"},
+		"no ceiling":                {func(c *DispatchConfig) { c.Ceiling = 0 }, "ceiling"},
+		"reserve at ceiling":        {func(c *DispatchConfig) { c.ChildReserve = 6 }, "childReserve"},
+		"reserve of a 1 ceiling":    {func(c *DispatchConfig) { c.Ceiling, c.ChildReserve, c.InteractiveReserve = 1, 0, 1 }, "interactiveReserve"},
+		"reserves fill the ceiling": {func(c *DispatchConfig) { c.Ceiling, c.ChildReserve, c.InteractiveReserve = 4, 2, 2 }, "reserved for neither"},
+		"short lease":               {func(c *DispatchConfig) { c.LeaseSeconds = 59 }, "three renewals"},
+		"short grace":               {func(c *DispatchConfig) { c.RestartGraceSeconds = 39 }, "two renewals"},
+		"no accept timeout":         {func(c *DispatchConfig) { c.AcceptTimeoutSeconds = 0 }, "acceptTimeoutSeconds"},
+		"duplicate profile":         {func(c *DispatchConfig) { c.Profiles = append(c.Profiles, c.Profiles[0]) }, "twice"},
+		"no concurrency":            {func(c *DispatchConfig) { c.Profiles[0].Concurrency = 0 }, "concurrency"},
+		"misnamed durable":          {func(c *DispatchConfig) { c.Profiles[0].Durables[0].Name = "other" }, "durable"},
 	} {
 		c := validDispatchConfig()
 		c.Profiles = append([]DispatchProfile(nil), c.Profiles...)
@@ -226,5 +229,31 @@ func TestThePoolSelectorNamesTheWorkerComponentProfileAndTier(t *testing.T) {
 	want := "kubeagents.x-k8s.io/a2a-component=agentprofile-worker,kubeagents.x-k8s.io/agentprofile=tse,kubeagents.x-k8s.io/agentprofile-tier=read"
 	if got := ProfilePoolSelector("tse", "read"); got != want {
 		t.Errorf("selector = %q, want %q", got, want)
+	}
+}
+
+// The dispatch config the operator renders (its fixture, written by the
+// operator's tests) decodes into DispatchConfig and passes the dispatcher's
+// own checks: the operator module can't import this one, so this is what
+// holds the two sets of JSON names equal.
+func TestTheOperatorsDispatchConfigDecodesAndValidates(t *testing.T) {
+	raw, err := os.ReadFile("testdata/rendered-dispatch-config.json")
+	if err != nil {
+		t.Fatalf("%v\nRegenerate with: go test ./internal/controller/ -run 'Fixture' -update (in k8s-operator)", err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var cfg DispatchConfig
+	if err := dec.Decode(&cfg); err != nil {
+		t.Fatalf("the operator's dispatch config does not decode strictly: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("the operator's dispatch config fails the dispatcher's checks: %v", err)
+	}
+	if len(cfg.Profiles) != 1 || cfg.Profiles[0].Name != "tse" || len(cfg.Profiles[0].Parameters) != 3 || len(cfg.Profiles[0].Durables) != 2 {
+		t.Errorf("profiles = %+v", cfg.Profiles)
+	}
+	if cfg.Version == "" || cfg.Namespace == "" || cfg.ProfileNamespace != cfg.Namespace+"-profiles" {
+		t.Errorf("version %q, namespace %q, profile namespace %q", cfg.Version, cfg.Namespace, cfg.ProfileNamespace)
 	}
 }
