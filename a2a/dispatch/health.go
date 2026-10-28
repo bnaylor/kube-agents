@@ -2,6 +2,7 @@ package dispatch
 
 import (
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -83,4 +84,32 @@ func (d *Dispatcher) logHealth() {
 		d.log.Warn("admission stalled: submissions waiting over a cap with no admission; a cross-chain cycle holds until the parents' deadlines",
 			"durables", h.Stalled, "stallAfter", d.cfg.StallAfter)
 	}
+}
+
+// Ready reports whether the dispatcher is serving: Run holds its accept and
+// lease subscriptions, and every durable the current config lists is bound.
+// When it isn't, the string says what is missing. A durable the operator
+// hasn't created yet, or one the grants don't cover, keeps it unready, so a
+// config the dispatcher can't fully serve shows on the pod and not only in
+// the log.
+func (d *Dispatcher) Ready() (bool, string) {
+	if !d.running.Load() {
+		return false, "not serving yet"
+	}
+	cfg := d.src.Config()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var unbound []string
+	for _, p := range cfg.Profiles {
+		for _, dur := range p.Durables {
+			if d.subs[dur.Name] == nil {
+				unbound = append(unbound, dur.Name)
+			}
+		}
+	}
+	if len(unbound) > 0 {
+		sort.Strings(unbound)
+		return false, "durables not bound yet: " + strings.Join(unbound, ", ")
+	}
+	return true, ""
 }

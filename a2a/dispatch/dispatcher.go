@@ -121,6 +121,8 @@ type Dispatcher struct {
 	// that left a durable unbindable.
 	regrantNotBefore time.Time
 	reconnects       atomic.Int64
+	// running is set while Run holds its answer subscriptions.
+	running atomic.Bool
 }
 
 // New builds a dispatcher on bus. src is the install config, pool the
@@ -177,6 +179,8 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 		return fmt.Errorf("subscribe %s: %w", leaseWildcard, err)
 	}
 	defer leaseSub.Stop()
+	d.running.Store(true)
+	defer d.running.Store(false)
 
 	d.syncBindings(ctx)
 	refresh := time.NewTicker(d.cfg.RefreshInterval)

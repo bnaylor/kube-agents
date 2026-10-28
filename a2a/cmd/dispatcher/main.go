@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,8 +34,8 @@ const natsUser = "dispatcher"
 const (
 	// envNamespace is the dispatcher's own namespace, where its ConfigMap is.
 	envNamespace = "POD_NAMESPACE"
-	// envConfigMap names the dispatch ConfigMap (<agent>-a2a-dispatch).
-	// PROPOSED: PR 2 renders it.
+	// envConfigMap names the dispatch ConfigMap (<agent>-a2a-dispatch) the
+	// operator renders.
 	envConfigMap = "DISPATCH_CONFIGMAP"
 
 	// configWait bounds the wait for the first config at startup: past it
@@ -42,6 +44,11 @@ const (
 	// namespaceCheckInterval paces the check that the profile namespace the
 	// pool watches is still the config's.
 	namespaceCheckInterval = 10 * time.Second
+
+	// statusAddr serves /readyz and /healthz: the container port the
+	// Deployment names "status" and probes.
+	statusAddr    = ":8080"
+	statusTimeout = 5 * time.Second
 
 	reconnectWait   = 2 * time.Second
 	reconnectJitter = 500 * time.Millisecond
@@ -127,6 +134,16 @@ func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.In
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	store := dispatch.NewConfigStore(log)
+	// The status server comes up before the config wait, which can take up
+	// to configWait: a /healthz that isn't answering yet fails liveness at
+	// 10s x 6 whatever the reason. /readyz stays false until the rest is up.
+	pr := &probes{configLoaded: store.Ready}
+	srv := serveStatus(log, pr)
+	defer func() {
+		sctx, scancel := context.WithTimeout(context.Background(), statusTimeout)
+		defer scancel()
+		_ = srv.Shutdown(sctx)
+	}()
 	go func() { _ = store.WatchConfigMap(ctx, kube, s.namespace, s.configMap, lib.DispatchConfigKey) }()
 	if err := store.WaitForConfig(ctx, configWait); err != nil {
 		return err
@@ -143,10 +160,12 @@ func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.In
 		return fmt.Errorf("bus connect: %w", err)
 	}
 	defer client.Close()
+	pr.setBus(func() bool { return client.Conn().IsConnected() })
 	d, err := dispatch.New(dispatch.DefaultConfig(), client, store, pool, unavailableVerifier{}, log)
 	if err != nil {
 		return err
 	}
+	pr.setDispatcher(d.Ready)
 	log.Info("dispatching", "configmap", s.configMap, "profileNamespace", profileNS)
 	if err := d.Run(ctx); err != nil {
 		return err
@@ -174,7 +193,10 @@ func watchProfileNamespace(ctx context.Context, cancel context.CancelCauseFunc, 
 }
 
 // authOptions is the projected-token identity the deployment uses, or a
-// static user for a run by hand against a bus with no callout.
+// static user for a run by hand against a bus with no callout. The token
+// path is the verifier's: lib.KSATokenNATSOptions (what lib.WithKSAToken
+// wraps), read here so a missing token fails before the config wait. The
+// bus CA (NATS_CA_FILE) is lib.Connect's, through lib.TLSOptions.
 func authOptions(getenv func(string) string) ([]nats.Option, error) {
 	if user := getenv("NATS_USER"); user != "" {
 		return []nats.Option{nats.UserInfo(user, getenv("NATS_PASSWORD")), nats.CustomInboxPrefix("_INBOX." + user)}, nil
@@ -184,4 +206,74 @@ func authOptions(getenv func(string) string) ([]nats.Option, error) {
 		tokenFile = lib.BusTokenPath
 	}
 	return lib.KSATokenNATSOptions(tokenFile, natsUser)
+}
+
+// probes is the status server's view of the process. Ready means the
+// dispatch config is loaded, the bus is connected, and the dispatcher is
+// serving with every listed durable bound (dispatch.Dispatcher.Ready). The
+// bus and the dispatcher arrive after the config, so until each is set it
+// reads as not ready.
+type probes struct {
+	configLoaded func() bool
+
+	mu        sync.Mutex
+	connected func() bool
+	serving   func() (bool, string)
+}
+
+func (p *probes) setBus(connected func() bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.connected = connected
+}
+
+func (p *probes) setDispatcher(serving func() (bool, string)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.serving = serving
+}
+
+func (p *probes) ready() (bool, string) {
+	if !p.configLoaded() {
+		return false, "the dispatch config is not loaded yet"
+	}
+	p.mu.Lock()
+	connected, serving := p.connected, p.serving
+	p.mu.Unlock()
+	if connected == nil || !connected() {
+		return false, "not connected to the bus"
+	}
+	if serving == nil {
+		return false, "the dispatcher is not running yet"
+	}
+	return serving()
+}
+
+// mux routes the two probes. /healthz is unconditional: a bus disconnect
+// or a durable the operator hasn't made yet must not get a dispatcher that
+// is about to recover killed, and holding tasks across a restart costs a
+// restart grace.
+func (p *probes) mux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if ok, why := p.ready(); !ok {
+			http.Error(w, why, http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})
+	return mux
+}
+
+func serveStatus(log *slog.Logger, p *probes) *http.Server {
+	srv := &http.Server{Addr: statusAddr, Handler: p.mux(), ReadHeaderTimeout: statusTimeout}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("status listener", "err", err)
+		}
+	}()
+	return srv
 }
