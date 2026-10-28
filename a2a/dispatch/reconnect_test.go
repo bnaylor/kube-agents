@@ -110,10 +110,19 @@ func TestAnAddedDurableReconnectsOnceAndKeepsHeldWork(t *testing.T) {
 	}
 
 	// Removing tse2 needs no reconnect.
+	g.set("disp-old")
 	ti.update(func(c *lib.DispatchConfig) { c.Version = "v3"; c.Profiles = c.Profiles[:1] })
 	time.Sleep(time.Second) // several refreshes
 	if n := d.Reconnects(); n != 1 {
 		t.Errorf("%d reconnects after a removal, want still 1", n)
+	}
+	// Adding it back needs one again: its grant went with it.
+	g.set("disp-new")
+	ti.update(func(c *lib.DispatchConfig) { c.Version = "v4"; c.Profiles = append(c.Profiles, testProfile("tse2", 2)) })
+	waitFor(t, 15*time.Second, "the second reconnect", func() bool { return d.Reconnects() == 2 })
+	b.submit("tse2", "read", lib.SubmitKindTop, "task-3")
+	if ts := b.waitTerminal("task-3", 15*time.Second); ts.state != lib.StateCompleted {
+		t.Errorf("task-3 after the re-add: %+v", ts)
 	}
 }
 
