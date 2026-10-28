@@ -56,7 +56,7 @@ func TestTheOperatorsProfilesMapParses(t *testing.T) {
 		t.Fatalf("the operator's rendered profiles map does not parse: %v", err)
 	}
 	want := map[string]string{
-		"provision": "", "session": NarrowingPod, "agent": "", "verifier": "",
+		"provision": "", "session": NarrowingPod, "agent": "", "verifier": "", "dispatcher": "",
 		"operator": "", "profile-auditor-read": NarrowingProfile, "profile-cluster-a-read": NarrowingProfile,
 	}
 	for _, id := range m.Identities {

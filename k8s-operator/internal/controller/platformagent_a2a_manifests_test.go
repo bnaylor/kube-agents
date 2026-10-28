@@ -1125,10 +1125,11 @@ func TestA2AReleaseImagesFollowTheAgentImage(t *testing.T) {
 		resolve func() string
 		name    string
 	}{
-		"gateway": {a2aGatewayImageEnvVar, a2aGatewayImage, "a2a-gateway"},
-		"worker":  {a2aWorkerImageEnvVar, a2aWorkerImage, "a2a-worker"},
-		"callout": {a2aCalloutImageEnvVar, a2aCalloutImage, "a2a-authcallout"},
-		"console": {a2aConsoleImageEnvVar, a2aConsoleImage, "a2a-console"},
+		"gateway":    {a2aGatewayImageEnvVar, a2aGatewayImage, "a2a-gateway"},
+		"worker":     {a2aWorkerImageEnvVar, a2aWorkerImage, "a2a-worker"},
+		"callout":    {a2aCalloutImageEnvVar, a2aCalloutImage, "a2a-authcallout"},
+		"console":    {a2aConsoleImageEnvVar, a2aConsoleImage, "a2a-console"},
+		"dispatcher": {a2aDispatcherImageEnvVar, a2aDispatcherImage, "a2a-dispatcher"},
 	}
 	for label, r := range resolvers {
 		t.Run(label, func(t *testing.T) {

@@ -22,7 +22,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 	"time"
@@ -45,12 +44,11 @@ import (
 // only reader of the profiles' shared durables and the only writer of
 // PROFILE_LEASES. This file renders what it runs on. The binary is PR 3's.
 const (
-	// a2aDispatcherImageEnvVar names the dispatcher's image. Unset, the
-	// operator renders no dispatcher at all, not its identity and not its
-	// Deployment: the image isn't in the release set yet, and a Deployment
-	// with no image to pull would leave every next install with a pod stuck
-	// in ImagePullBackOff. The dispatcher's PR adds the image to the release
-	// set and makes it the default.
+	// Release surface, on the same terms as the verifier's
+	// (a2aVerifierImageName): a bare name resolved through a2aReleaseImage,
+	// with A2A_DISPATCHER_IMAGE the override for an install that pins it
+	// apart.
+	a2aDispatcherImageName   = "a2a-dispatcher"
 	a2aDispatcherImageEnvVar = "A2A_DISPATCHER_IMAGE"
 
 	// a2aDispatcherUser is the dispatcher's NATS user, and so its inbox
@@ -76,9 +74,14 @@ const (
 	agentProfileWorkerComponent = "agentprofile-worker"
 )
 
-func a2aDispatcherImage() string { return strings.TrimSpace(os.Getenv(a2aDispatcherImageEnvVar)) }
+func a2aDispatcherImage() string {
+	return strings.TrimSpace(a2aReleaseImage(a2aDispatcherImageEnvVar, a2aDispatcherImageName))
+}
 
 // a2aDispatcherEnabled reports whether this operator renders the dispatcher.
+// The image is in the release set and resolves like the verifier's, so this
+// is true on every next install; it stays a function so a resolution that
+// comes back empty renders nothing rather than a Deployment with no image.
 func a2aDispatcherEnabled() bool { return a2aDispatcherImage() != "" }
 
 func a2aDispatcherName(agent *agentv1alpha1.PlatformAgent) string {

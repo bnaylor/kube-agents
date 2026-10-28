@@ -52,6 +52,11 @@ Streams bind to the payload spec's subjects and topic classes:
 | `TOPICS-STATE`   | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3                      | Read latest-per-subject                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `TOPICS-JOURNAL` | journal-class topics | `max_age: 30d`, R3                                               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
+Amended 10/28 (#3655): `TASKS`' profile consumers are one shared durable per (profile,
+tier, kind) on `a2a.tasks.{profile}.{tier}.{kind}.*.submit`, created by the operator and read
+only by the dispatcher, each with its own `MaxAckPending`, in place of one per profile on
+`…in`. The dispatcher holds each submission unacknowledged for its task's life.
+
 State and journal topics both live under `a2a.topics.>`, so the two topic streams' subject
 lists are rendered per topic from the provisioned registry - which topics exist is already
 config, and the retention class lives there too. Shared fan-out (blueprints, config
@@ -279,10 +284,11 @@ Status (amended 9/4, the callout armed; amended 9/8, sessions moved; amended 9/1
 `auth_callout` block, and a principal authenticates one of two ways. **Through the
 callout**, by presenting a projected ServiceAccount token: the bus provisioning Job,
 every spawned session pod, the platform agent container, the capability verifier, and
-(amended 10/28, #3655) the AgentProfile dispatcher when the operator has its image.
+(amended 10/28, #3655) the AgentProfile dispatcher, on every next install.
 The dispatcher's grants name each profile durable it reads and each profile it
 dispatches for, because a NATS wildcard matches a whole token and `TASKS.*` would reach
-every session's consumers; it reconnects when its config adds one. With a dispatcher the
+every session's consumers; it reconnects when its config adds one, and tasks it holds keep
+running across the reconnect. With a dispatcher the
 operator principal also creates and deletes those durables, create held by its subject
 to submit filters. **Statically**, from `nats.conf` and listed in `auth_users`:
 the callout itself, which cannot authenticate through the thing it is; the chatops
@@ -494,7 +500,11 @@ Layout:
   The trade is stated where it is made: an install that raises `maxSessions` raises
   `web`'s unreapable-durable ceiling in the same proportion. Deriving downward on a small
   install would silently tighten a working one, so the render takes the larger of 64 and
-  the derived budget. Because creates never edit, an install whose `maxSessions` already
+  the derived budget. Amended 10/28 (#3655): a stream created now also carries 64 slots
+  for the AgentProfile durables, one per (profile, tier, kind), the dispatcher being on
+  every next install, so a default install's `TASKS` starts at 126 and `web`'s ceiling with
+  it; a stream that already exists is held to the sessions' budget alone and is never
+  refused for those slots. Because creates never edit, an install whose `maxSessions` already
   exceeds what its stream holds is under-provisioned today, and the check is reached on
   an operator upgrade alone with no CR edit involved - it runs last, after every other
   stream and bucket, so the refusal leaves a fully provisioned bus short one limit rather
@@ -549,8 +559,8 @@ Layout:
   Amended 8/31: the pod network is fenced too. The operator renders an ingress
   NetworkPolicy on the NATS pod granting **4222 to exactly the enumerated bus clients**
   (the auth callout, the agent pod - whose sidecars, the Hermes bridge included, share
-  its labels - the A2A gateway, the capability verifier, the AgentProfile dispatcher (when
-  rendered), session pods by the spawner's
+  its labels - the A2A gateway, the capability verifier, the AgentProfile dispatcher,
+  session pods by the spawner's
   labels, the provision Job,
   and the hand-applied seed Job; **amended 10/6:** and the operator's own pod, by the
   `kubeagents.x-k8s.io/a2a-bus-client: operator` label from the operator's namespace,

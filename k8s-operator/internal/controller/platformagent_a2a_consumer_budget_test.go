@@ -86,7 +86,10 @@ func TestSessionConsumerCountMatchesTheA2AModule(t *testing.T) {
 // so rendering below it on a small install would TIGHTEN a live stream's cap
 // relative to today. Deriving downward is a silent capacity regression on
 // somebody's working install; deriving upward is the thing being fixed. Hence
-// max(64, budget), and hence the first row.
+// max(64, budget). A new stream also carries the profile durables'
+// allowance (64), the dispatcher being on every next install, so each row
+// renders budget + 64; the budget column is what an existing stream is held
+// to, and the floor is what it meets there.
 func TestTasksMaxConsumersDerivation(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -94,12 +97,12 @@ func TestTasksMaxConsumersDerivation(t *testing.T) {
 		wantBudget  int
 		wantRender  int
 	}{
-		{"unset stays at the shipped cap", nil, 62, 64},
-		{"below the floor does not tighten it", ptr.To(2), 38, 64},
-		{"just under the floor still does not", ptr.To(10), 62, 64},
-		{"the first value above the floor derives", ptr.To(11), 65, 65},
-		{"above the floor derives", ptr.To(20), 92, 92},
-		{"the CRD maximum", ptr.To(10000), 30032, 30032},
+		{"unset", nil, 62, 126},
+		{"a budget below the floor", ptr.To(2), 38, 102},
+		{"just under the floor", ptr.To(10), 62, 126},
+		{"the first budget above the floor", ptr.To(11), 65, 129},
+		{"above the floor", ptr.To(20), 92, 156},
+		{"the CRD maximum", ptr.To(10000), 30032, 30096},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
@@ -124,8 +127,9 @@ func TestTasksMaxConsumersDerivation(t *testing.T) {
 // one at 2 and was told the same 32-consumer reserve, while its bridge ran
 // three times the conversations the asks row was sized for (gke-labs#2043).
 // This asserts only through the budget, the render and the script -- the
-// three things an install sees. A tree without the resolver produces 62, 64
-// and a 32-consumer reserve on every shape below; the rows that declare a
+// three things an install sees. A tree without the resolver produces 62, 126
+// and a 32-consumer reserve on every shape below (the render carries the
+// profile durables' 64); the rows that declare a
 // count expect other numbers, which is what pins that the resolver reads
 // it, and the rows that do not pin that it reads nothing else.
 func TestTasksBudgetReadsTheBridgeSidecarConcurrency(t *testing.T) {
@@ -140,45 +144,45 @@ func TestTasksBudgetReadsTheBridgeSidecarConcurrency(t *testing.T) {
 		wantRender int
 		wantScript []string
 	}{
-		{"no sidecar is the default install", nil, 62, 64,
-			[]string{"required_consumers=62", "--max-consumers=64", "plus 32 reserved", "sized for 2 bridge workers"}},
-		{"a sidecar that is not a bridge changes nothing", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{Name: "fluent-bit", Image: "fb:dev"}}}, 62, 64,
-			[]string{"required_consumers=62", "--max-consumers=64", "plus 32 reserved", "sized for 2 bridge workers"}},
-		{"the bridge's own default written on the CR changes nothing", bridge(lit("2")), 62, 64,
-			[]string{"required_consumers=62", "--max-consumers=64", "plus 32 reserved", "sized for 2 bridge workers"}},
-		{"the presubmit's four clears the floor", bridge(lit("4")), 74, 74,
-			[]string{"required_consumers=74", "--max-consumers=74", "plus 44 reserved", "sized for 4 bridge workers"}},
-		{"the nightly's six", bridge(lit("6")), 86, 86,
-			[]string{"required_consumers=86", "--max-consumers=86", "plus 56 reserved", "sized for 6 bridge workers"}},
+		{"no sidecar is the default install", nil, 62, 126,
+			[]string{"required_consumers=62", "--max-consumers=126", "plus 32 reserved", "sized for 2 bridge workers"}},
+		{"a sidecar that is not a bridge changes nothing", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{Name: "fluent-bit", Image: "fb:dev"}}}, 62, 126,
+			[]string{"required_consumers=62", "--max-consumers=126", "plus 32 reserved", "sized for 2 bridge workers"}},
+		{"the bridge's own default written on the CR changes nothing", bridge(lit("2")), 62, 126,
+			[]string{"required_consumers=62", "--max-consumers=126", "plus 32 reserved", "sized for 2 bridge workers"}},
+		{"the presubmit's four clears the floor", bridge(lit("4")), 74, 138,
+			[]string{"required_consumers=74", "--max-consumers=138", "plus 44 reserved", "sized for 4 bridge workers"}},
+		{"the nightly's six", bridge(lit("6")), 86, 150,
+			[]string{"required_consumers=86", "--max-consumers=150", "plus 56 reserved", "sized for 6 bridge workers"}},
 		{"a valueFrom is the default", bridge(corev1.EnvVar{Name: "BRIDGE_CONCURRENCY", ValueFrom: &corev1.EnvVarSource{
-			SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "eval"}, Key: "parallelism"}}}), 62, 64,
-			[]string{"required_consumers=62", "--max-consumers=64", "plus 32 reserved", "sized for 2 bridge workers"}},
+			SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "eval"}, Key: "parallelism"}}}), 62, 126,
+			[]string{"required_consumers=62", "--max-consumers=126", "plus 32 reserved", "sized for 2 bridge workers"}},
 		// The valueFrom path pinned by a number a literal-only render cannot
 		// produce: a readable 6 beside an unreadable one is 8, not 6 and not 2.
 		{"a bridge that can be read beside one that cannot counts the default for it", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
 			{Name: "bridge-a", Image: "bridge:dev", Env: []corev1.EnvVar{lit("6")}},
 			{Name: "bridge-b", Image: "bridge:dev", Env: []corev1.EnvVar{{Name: "BRIDGE_CONCURRENCY", ValueFrom: &corev1.EnvVarSource{
-				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "eval"}, Key: "parallelism"}}}}}}}, 98, 98,
-			[]string{"required_consumers=98", "--max-consumers=98", "plus 68 reserved", "sized for 8 bridge workers"}},
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "eval"}, Key: "parallelism"}}}}}}}, 98, 162,
+			[]string{"required_consumers=98", "--max-consumers=162", "plus 68 reserved", "sized for 8 bridge workers"}},
 		// The kubelet expands $(NAME) against the sidecar's earlier entries
 		// before the bridge reads it: a reference to a literal 6 runs six
 		// workers, and a render that counted the reference as unreadable
 		// would budget 62, create TASKS at 64 and pass the gate.
-		{"a reference to an earlier literal counts what the kubelet expands it to", bridge(corev1.EnvVar{Name: "EVAL_PARALLELISM", Value: "6"}, lit("$(EVAL_PARALLELISM)")), 86, 86,
-			[]string{"required_consumers=86", "--max-consumers=86", "plus 56 reserved", "sized for 6 bridge workers"}},
-		{"a reference to a later entry is left as written and is the default", bridge(lit("$(EVAL_PARALLELISM)"), corev1.EnvVar{Name: "EVAL_PARALLELISM", Value: "6"}), 62, 64,
-			[]string{"required_consumers=62", "--max-consumers=64", "plus 32 reserved", "sized for 2 bridge workers"}},
+		{"a reference to an earlier literal counts what the kubelet expands it to", bridge(corev1.EnvVar{Name: "EVAL_PARALLELISM", Value: "6"}, lit("$(EVAL_PARALLELISM)")), 86, 150,
+			[]string{"required_consumers=86", "--max-consumers=150", "plus 56 reserved", "sized for 6 bridge workers"}},
+		{"a reference to a later entry is left as written and is the default", bridge(lit("$(EVAL_PARALLELISM)"), corev1.EnvVar{Name: "EVAL_PARALLELISM", Value: "6"}), 62, 126,
+			[]string{"required_consumers=62", "--max-consumers=126", "plus 32 reserved", "sized for 2 bridge workers"}},
 		{"a reference to a valueFrom is the default", bridge(corev1.EnvVar{Name: "EVAL_PARALLELISM", ValueFrom: &corev1.EnvVarSource{
-			SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "eval"}, Key: "parallelism"}}}, lit("$(EVAL_PARALLELISM)")), 62, 64,
-			[]string{"required_consumers=62", "--max-consumers=64", "plus 32 reserved", "sized for 2 bridge workers"}},
-		{"a non-integer is the default, as the bridge would run it", bridge(lit("six")), 62, 64,
-			[]string{"required_consumers=62", "--max-consumers=64", "plus 32 reserved", "sized for 2 bridge workers"}},
-		{"zero is the default, as the bridge would run it", bridge(lit("0")), 62, 64,
-			[]string{"required_consumers=62", "--max-consumers=64", "plus 32 reserved", "sized for 2 bridge workers"}},
+			SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "eval"}, Key: "parallelism"}}}, lit("$(EVAL_PARALLELISM)")), 62, 126,
+			[]string{"required_consumers=62", "--max-consumers=126", "plus 32 reserved", "sized for 2 bridge workers"}},
+		{"a non-integer is the default, as the bridge would run it", bridge(lit("six")), 62, 126,
+			[]string{"required_consumers=62", "--max-consumers=126", "plus 32 reserved", "sized for 2 bridge workers"}},
+		{"zero is the default, as the bridge would run it", bridge(lit("0")), 62, 126,
+			[]string{"required_consumers=62", "--max-consumers=126", "plus 32 reserved", "sized for 2 bridge workers"}},
 		{"two bridges bring their own workers", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
 			{Name: "bridge-a", Image: "bridge:dev", Env: []corev1.EnvVar{lit("4")}},
-			{Name: "bridge-b", Image: "bridge:dev", Env: []corev1.EnvVar{lit("6")}}}}, 110, 110,
-			[]string{"required_consumers=110", "--max-consumers=110", "plus 80 reserved", "sized for 10 bridge workers"}},
+			{Name: "bridge-b", Image: "bridge:dev", Env: []corev1.EnvVar{lit("6")}}}}, 110, 174,
+			[]string{"required_consumers=110", "--max-consumers=174", "plus 80 reserved", "sized for 10 bridge workers"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
@@ -258,7 +262,7 @@ func TestProvisionRefusalNamesTheReserveItSizedFor(t *testing.T) {
 		// lowered to 10 would be refused again at 30 + 56 = 86.
 		"lower spec.harness.tuning.maxSessions to at most 2 -",
 		"with 56 of them reserved",
-		"recreates TASKS at 356",
+		"recreates TASKS at 420",
 		// The parenthetical names the reference shape with a literal $(NAME):
 		// inside the script's double quotes that is a command substitution
 		// unless escaped, and an unescaped one would print an empty string.
@@ -547,13 +551,13 @@ func TestBridgeConcurrencyIsCappedBeforeTheArithmetic(t *testing.T) {
 			if got := a2aTasksConsumerBudget(agent); got != atCap {
 				t.Errorf("budget = %d, want %d", got, atCap)
 			}
-			if got := a2aTasksMaxConsumers(agent); got != atCap {
-				t.Errorf("rendered max_consumers = %d, want %d", got, atCap)
+			if got := a2aTasksMaxConsumers(agent); got != atCap+a2aProfileDurablesAllowed {
+				t.Errorf("rendered max_consumers = %d, want %d", got, atCap+a2aProfileDurablesAllowed)
 			}
 			script := a2aProvisionScript(agent)
-			if !strings.Contains(script, "--max-consumers="+strconv.Itoa(atCap)) {
+			if !strings.Contains(script, "--max-consumers="+strconv.Itoa(atCap+a2aProfileDurablesAllowed)) {
 				add, _ := streamAddInvocation(script, "TASKS")
-				t.Errorf("the provision script does not render --max-consumers=%d (stream add: %s)", atCap, add)
+				t.Errorf("the provision script does not render --max-consumers=%d (stream add: %s)", atCap+a2aProfileDurablesAllowed, add)
 			}
 			if !strings.Contains(script, "required_consumers="+strconv.Itoa(atCap)) {
 				t.Errorf("the provision script does not gate on required_consumers=%d", atCap)
@@ -624,7 +628,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 		{"the default install names maxSessions and two ways out", nil, 0,
 			[]string{
 				"spec.harness.tuning.maxSessions=10 needs (62).",
-				"so the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream and let provisioning recreate it at 64,",
+				"so the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream and let provisioning recreate it at 126,",
 				"and therefore the maxSessions that fits. The two do not finish the same way. Lowering maxSessions finishes by itself:",
 			},
 			[]string{"bridge workers", "fewer workers", "BRIDGE_CONCURRENCY", "The three"}},
@@ -634,7 +638,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 		{"the presubmit's four names both inputs and three ways out", bridge("4"), 0,
 			[]string{
 				"spec.harness.tuning.maxSessions=10 and the 4 bridge workers the CR declares (BRIDGE_CONCURRENCY on spec.deployment.sidecars) need together (74; the reserve is 44 at 4 workers and 32 at the bridge's default of 2).",
-				"so the ways out are to lower maxSessions until the budget fits the stream, to declare the bridge sidecar with fewer workers (a lower BRIDGE_CONCURRENCY, or none for the bridge's default of 2) until it does, or to delete the TASKS stream and let provisioning recreate it at 74,",
+				"so the ways out are to lower maxSessions until the budget fits the stream, to declare the bridge sidecar with fewer workers (a lower BRIDGE_CONCURRENCY, or none for the bridge's default of 2) until it does, or to delete the TASKS stream and let provisioning recreate it at 138,",
 				"and therefore the maxSessions, or the worker count, that fits. The three do not finish the same way. Lowering maxSessions or the bridge's worker count finishes by itself: either CR edit re-renders this Job,",
 				// The rest of the remedy, unchanged.
 				"Delete the Job to re-run it now",
@@ -646,7 +650,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 				"the 1024 bridge workers the CR declares",
 				"need together (6194;",
 				"The CR declares more than 1024; the budget sizes for at most that many, the queue behind the bridge's workers, and a count past it is a typo to correct.",
-				"recreate it at 6194,",
+				"recreate it at 6258,",
 			},
 			[]string{"the two ways out", readClause, "That count is"}},
 		// The count is attributed to the CR only when the CR declares it. A
@@ -658,14 +662,14 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 			[]string{
 				"spec.harness.tuning.maxSessions=10 and the 8 bridge workers " + readClause + " need together (98; the reserve is 68 at 8 workers and 32 at the bridge's default of 2).",
 				"so the ways out are to lower maxSessions until the budget fits the stream, to declare the bridge sidecar with fewer workers",
-				"recreate it at 98,",
+				"recreate it at 162,",
 			},
 			[]string{"the CR declares", "the two ways out", "more than 1024"}},
 		{"two literals are what the CR declares, with no rule to state", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
 			sidecar("bridge-a", lit("4")), sidecar("bridge-b", lit("6"))}}, 0,
 			[]string{
 				"spec.harness.tuning.maxSessions=10 and the 10 bridge workers the CR declares (BRIDGE_CONCURRENCY on spec.deployment.sidecars) need together (110; the reserve is 80 at 10 workers and 32 at the bridge's default of 2).",
-				"recreate it at 110,",
+				"recreate it at 174,",
 			},
 			[]string{readClause, "the render reads", "cannot read", "That count is"}},
 		// A lone reference to a valueFrom is the default, and the message
@@ -678,7 +682,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 			sidecar("hermes-bridge", corev1.EnvVar{Name: "EVAL_PARALLELISM", ValueFrom: fromRef.ValueFrom}, lit("$(EVAL_PARALLELISM)"))}}, 0,
 			[]string{
 				"spec.harness.tuning.maxSessions=10 and the 2 bridge workers " + readClause + " need together (62; the reserve is 32 at 2 workers, the bridge's default).",
-				"so the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream and let provisioning recreate it at 64,",
+				"so the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream and let provisioning recreate it at 126,",
 				"and therefore the maxSessions that fits. The two do not finish the same way.",
 			},
 			[]string{"needs (62)", "the CR declares", "fewer workers", "The three", "and 32 at the bridge's default of 2", "That count is"}},
@@ -690,7 +694,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 			[]string{
 				"the 1024 bridge workers " + readClause + " need together (6194;",
 				"That count is more than 1024; the budget sizes for at most that many, the queue behind the bridge's workers, and a count past it is a typo to correct.",
-				"recreate it at 6194,",
+				"recreate it at 6258,",
 			},
 			[]string{"the CR declares"}},
 		// One worker moved the reserve to 26, so the count is an input
@@ -701,7 +705,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 		{"one worker is named as an input, with no lower count to offer", bridge("1"), 20,
 			[]string{
 				"spec.harness.tuning.maxSessions=20 and the 1 bridge worker the CR declares (BRIDGE_CONCURRENCY on spec.deployment.sidecars) need together (86; the reserve is 26 at 1 worker and 32 at the bridge's default of 2, with no lower count left to declare).",
-				"so the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream and let provisioning recreate it at 86,",
+				"so the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream and let provisioning recreate it at 150,",
 				"and therefore the maxSessions that fits. The two do not finish the same way.",
 			},
 			[]string{"needs (86)", "fewer workers", "The three", "the worker count, that fits", "1 bridge workers", "at 1 workers"}},
@@ -758,7 +762,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 	if !state.failed {
 		t.Fatalf("failed = false on a PodFailurePolicy Job")
 	}
-	for _, want := range []string{"the 4 bridge workers the CR declares", "declare the bridge sidecar with fewer workers", "recreate it at 74,"} {
+	for _, want := range []string{"the 4 bridge workers the CR declares", "declare the bridge sidecar with fewer workers", "recreate it at 138,"} {
 		if !strings.Contains(state.message, want) {
 			t.Errorf("the reconcile's status message does not say %q:\n%s", want, state.message)
 		}
@@ -779,7 +783,7 @@ func TestTasksStreamCarriesItsLimits(t *testing.T) {
 	}
 	for _, want := range []string{
 		"--max-msgs-per-subject=4096",
-		"--max-consumers=152",
+		"--max-consumers=216", // 40*3 + 32, and the profile durables' 64
 		"--discard=old",
 	} {
 		if !strings.Contains(add, want) {
@@ -871,7 +875,7 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 				"stream configuration update can not change MaxConsumers",
 				"lower spec.harness.tuning.maxSessions to at most 10",
 				"delete the TASKS stream",
-				"recreates TASKS at 332",
+				"recreates TASKS at 396",
 				"Delete the Job to re-run it now",
 				// The recreate's third step. Deleting a stream
 				// deletes every consumer on it, and the two
@@ -930,7 +934,7 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 				"max_consumers=8", "needs 332",
 				"minimum is 1, and one session still needs 35",
 				"That leaves deleting the TASKS stream",
-				"recreates TASKS at 332",
+				"recreates TASKS at 396",
 				// The only way out here is the recreate, so the
 				// restart it needs is not optional detail.
 				"kubectl rollout restart deployment/test-agent-a2a-gateway -n test-ns",

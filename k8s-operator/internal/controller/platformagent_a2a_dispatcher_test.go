@@ -33,9 +33,11 @@ func withDispatcher(t *testing.T) {
 	t.Setenv(a2aDispatcherImageEnvVar, testDispatcherImage)
 }
 
-// Without an image the operator renders no dispatcher, not even its bus
-// identity: the image isn't in the release set yet.
-func TestNoDispatcherImageRendersNoDispatcher(t *testing.T) {
+// The dispatcher's image is in the release set: with no override the
+// operator derives it like the verifier's and renders the dispatcher on
+// every next install, its bus identity included; A2A_DISPATCHER_IMAGE stays
+// the override.
+func TestTheDispatcherImageDefaultsToTheRelease(t *testing.T) {
 	hasDispatcher := func() bool {
 		doc, err := renderA2AAuthMap(a2aTestAgent(), nil)
 		if err != nil {
@@ -49,12 +51,19 @@ func TestNoDispatcherImageRendersNoDispatcher(t *testing.T) {
 		return false
 	}
 	t.Setenv(a2aDispatcherImageEnvVar, "")
-	if hasDispatcher() {
-		t.Fatal("the identity map carries the dispatcher with no image to run it")
+	t.Setenv(operatorImageEnvVar, "registry.example/kube-agents/k8s-operator:1.2.3")
+	if got, want := a2aDispatcherImage(), "registry.example/kube-agents/a2a-dispatcher:1.2.3"; got != want {
+		t.Errorf("no override: image %q, want %q", got, want)
+	}
+	if !a2aDispatcherEnabled() || !hasDispatcher() {
+		t.Error("with no override the operator renders no dispatcher")
 	}
 	withDispatcher(t)
+	if got := a2aDispatcherImage(); got != testDispatcherImage {
+		t.Errorf("the override is ignored: %q", got)
+	}
 	if !hasDispatcher() {
-		t.Error("with an image, the identity map has no dispatcher")
+		t.Error("with an override, the identity map has no dispatcher")
 	}
 }
 
@@ -187,10 +196,10 @@ func TestRenderedDispatcherFixtures(t *testing.T) {
 	}
 }
 
-// Turning the image off removes what the dispatcher had: the owned objects
+// Removing the dispatcher takes what it had: the owned objects
 // in the agent's namespace, and the pod-read Role and binding in the profile
 // namespace that carry this agent's labels, and nothing someone else made.
-func TestRemovingTheDispatcherImageRemovesTheDispatcher(t *testing.T) {
+func TestRemovingTheDispatcherRemovesWhatItRendered(t *testing.T) {
 	withDispatcher(t)
 	agent := a2aTestAgent()
 	scheme := setupScheme()
@@ -216,8 +225,7 @@ func TestRemovingTheDispatcherImageRemovesTheDispatcher(t *testing.T) {
 			t.Fatalf("precondition: %T %s not rendered: %v", check.obj, check.key, err)
 		}
 	}
-	t.Setenv(a2aDispatcherImageEnvVar, "")
-	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, nil, true); err != nil || profileErr != nil {
+	if profileErr, err := r.removeA2ADispatcher(ctx, agent); err != nil || profileErr != nil {
 		t.Fatalf("remove: %v / %v", err, profileErr)
 	}
 	for _, check := range []struct {
@@ -232,7 +240,7 @@ func TestRemovingTheDispatcherImageRemovesTheDispatcher(t *testing.T) {
 		{&rbacv1.RoleBinding{}, types.NamespacedName{Namespace: pns, Name: name}},
 	} {
 		if err := c.Get(ctx, check.key, check.obj); !apierrors.IsNotFound(err) {
-			t.Errorf("%T %s survived the image going away: %v", check.obj, check.key, err)
+			t.Errorf("%T %s survived the removal: %v", check.obj, check.key, err)
 		}
 	}
 	// A Role under the dispatcher's name in the profile namespace that
@@ -241,7 +249,7 @@ func TestRemovingTheDispatcherImageRemovesTheDispatcher(t *testing.T) {
 	if err := c.Create(ctx, foreign); err != nil {
 		t.Fatal(err)
 	}
-	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, nil, true); err != nil || profileErr != nil {
+	if profileErr, err := r.removeA2ADispatcher(ctx, agent); err != nil || profileErr != nil {
 		t.Fatalf("remove again: %v / %v", err, profileErr)
 	}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: name}, &rbacv1.Role{}); err != nil {
@@ -249,24 +257,22 @@ func TestRemovingTheDispatcherImageRemovesTheDispatcher(t *testing.T) {
 	}
 }
 
-// With a dispatcher the TASKS budget carries the profile durables'
-// allowance; without one it is what it was.
+// The TASKS stream a fresh install creates carries the profile durables'
+// allowance, the dispatcher being on every next install; the budget an
+// existing stream is held to is the sessions' alone, so a stream that
+// predates the dispatcher is never refused for it.
 func TestTheTasksBudgetCarriesTheProfileDurablesWithADispatcher(t *testing.T) {
 	agent := a2aTestAgent()
-	t.Setenv(a2aDispatcherImageEnvVar, "")
-	budget, created := a2aTasksConsumerBudget(agent), a2aTasksMaxConsumers(agent)
-	withDispatcher(t)
-	// A new stream is created with room for the durables...
-	if got := a2aTasksMaxConsumers(agent); got != max(budget+a2aProfileDurablesAllowed, a2aTasksMaxConsumersFloor) {
-		t.Errorf("a new TASKS with a dispatcher gets max_consumers %d, want %d", got, budget+a2aProfileDurablesAllowed)
+	budget := a2aTasksConsumerBudget(agent)
+	if got := a2aProfileDurableAllowance(); got != a2aProfileDurablesAllowed {
+		t.Errorf("the allowance is %d, want %d with the dispatcher on", got, a2aProfileDurablesAllowed)
 	}
-	// ...but an existing one is held to the sessions' budget alone, so
-	// turning the dispatcher on never refuses provisioning on an install
-	// whose stream predates it (max_consumers can't be raised in place).
-	if got := a2aTasksConsumerBudget(agent); got != budget {
-		t.Errorf("the budget an existing stream is held to moved from %d to %d with a dispatcher", budget, got)
+	if got, want := a2aTasksMaxConsumers(agent), max(budget+a2aProfileDurablesAllowed, a2aTasksMaxConsumersFloor); got != want {
+		t.Errorf("a new TASKS gets max_consumers %d, want %d", got, want)
 	}
-	_ = created
+	if got := a2aTasksConsumerBudget(agent); got != resolveA2AMaxSessions(agent)*a2aSessionConsumersPerSession+a2aTasksReserve(agent) {
+		t.Errorf("the budget an existing stream is held to carries the allowance: %d", got)
+	}
 }
 
 // The reserves are disjoint shares of the ceiling that always leave a slot

@@ -374,27 +374,28 @@ func TestBridgeConcurrencyReadsTheSidecarLikeTheBridgeDoes(t *testing.T) {
 }
 
 // The floor's edge, stated in the comment and pinned here: the first
-// maxSessions whose budget clears a2aTasksMaxConsumersFloor, and the default
-// install still under it.
+// maxSessions whose budget clears a2aTasksMaxConsumersFloor, the default
+// install's budget still under it, and the width a new stream is created at
+// with the profile durables' allowance on top.
 func TestTheFloorHidesTheReserveUpToTen(t *testing.T) {
 	first := 0
 	for m := 1; m <= a2aTasksMaxConsumersFloor; m++ {
 		agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
 		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &m}}
-		if a2aTasksMaxConsumers(agent) > a2aTasksMaxConsumersFloor {
+		if a2aTasksConsumerBudget(agent) > a2aTasksMaxConsumersFloor {
 			first = m
 			break
 		}
 	}
 	if first != 11 {
-		t.Errorf("the first maxSessions rendering above the floor is %d, the comment above a2aTasksReservedConsumers says 11", first)
+		t.Errorf("the first maxSessions whose budget clears the floor is %d, the comment above a2aTasksReservedConsumers says 11", first)
 	}
 	def := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
 	if got := a2aTasksConsumerBudget(def); got != 62 {
 		t.Errorf("default budget = %d, the comment says 62", got)
 	}
-	if got := a2aTasksMaxConsumers(def); got != a2aTasksMaxConsumersFloor {
-		t.Errorf("default install renders max_consumers=%d, want the floor %d", got, a2aTasksMaxConsumersFloor)
+	if got := a2aTasksMaxConsumers(def); got != 126 {
+		t.Errorf("default install renders max_consumers=%d, the comment says 126 (62 and the profile durables' 64)", got)
 	}
 }
 
@@ -617,8 +618,11 @@ func TestCiDeploySizesMaxSessionsToTheTasksFloor(t *testing.T) {
 		if fits := budget <= a2aTasksMaxConsumersFloor; fits != tc.fits {
 			t.Errorf("at %d workers with maxSessions=%d the budget is %d against a %d-wide TASKS; fits=%v, want %v", tc.workers, n, budget, a2aTasksMaxConsumersFloor, fits, tc.fits)
 		}
-		if got := a2aTasksMaxConsumers(agent); tc.fits && got != a2aTasksMaxConsumersFloor {
-			t.Errorf("at %d workers the render creates TASKS at %d consumers, not the floor %d", tc.workers, got, a2aTasksMaxConsumersFloor)
+		// The stream is created at the budget and the profile durables'
+		// allowance, so a budget within the floor fits it with that room to
+		// spare.
+		if got := a2aTasksMaxConsumers(agent); tc.fits && got != budget+a2aProfileDurableAllowance() {
+			t.Errorf("at %d workers the render creates TASKS at %d consumers, not the budget %d and the profile durables' %d", tc.workers, got, budget, a2aProfileDurableAllowance())
 		}
 	}
 }
