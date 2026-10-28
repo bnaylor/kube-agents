@@ -93,7 +93,7 @@ Profile workers run in their own namespace, `<agent-namespace>-profiles`, which 
 
 The profile's ServiceAccounts live there too. While the namespace is missing, or doesn't carry the chart's markers, a profile renders no identity and withdraws its card, and `IdentityReady` says `ProfileNamespaceAbsent`.
 
-Nothing runs a pod from a profile yet. The dispatcher and the warm workers come later.
+Nothing runs a pod from a profile yet. A `mode: next` install runs the dispatcher, `<agent>-a2a-dispatcher`, which reads the profiles' submissions and hands each to a ready worker, but the warm workers come later.
 
 ## Status
 

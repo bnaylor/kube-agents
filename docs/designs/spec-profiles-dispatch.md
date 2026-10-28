@@ -295,8 +295,44 @@ paths:
   from holding every slot; the reserves are disjoint, filled child first, and leave at least
   one slot for top-level unattended work, so below a ceiling of 3 not every reserve is
   honoured in full, and the PlatformAgent carries a `ProfileReservesShort` warning saying
-  which.
+  which. At a ceiling of 2 there is a child reserve and no interactive one. At a ceiling of 1
+  there is neither: every task runs alone, so a parent can never start a child.
 - Each durable counts against the TASKS consumer budget (#2077), so that formula includes them.
+
+**As built (amended 10/28, #3655).** The dispatcher is its own Deployment,
+`<agent>-a2a-dispatcher`: one replica, replaced with `Recreate`, since two at once would each
+enforce the ceiling against half the in-flight count. The mechanics the decisions above
+leave open:
+
+- **Settings.** The operator renders a dispatch ConfigMap, `<agent>-a2a-dispatch`, from
+  `spec.harness.tuning.profiles` and the bound profiles, every value resolved, and the
+  dispatcher watches it. It carries the ceiling and both reserves, each profile's tiers,
+  concurrency, queue timeout, deadline and durables, and four intervals: `leaseSeconds`
+  (default 90), `renewSeconds` (20; a lease is at least three renewals),
+  `restartGraceSeconds` (60) and `acceptTimeoutSeconds` (10). A change applies to new
+  offers. A task already handed out keeps the intervals its offer carried.
+- **Hand-off.** The dispatcher writes the task's lease record, then offers the task to a free
+  warm pod on `a2a.dispatch.<profile>.<tier>.<pod>` and waits `acceptTimeoutSeconds` for its
+  `.accept`. With no accept it tries the next pod. With no free pod the submission waits over
+  its cap and is redelivered. Writing the record first means a crash mid-offer re-adopts the
+  task (and fails it if nobody renews) rather than offering it twice.
+- **Holding.** The submission stays unacknowledged for the task's whole life. This replaces
+  the subagent spec's ack after Job create. The worker renews on its `.lease` subject every
+  `renewSeconds`, and the dispatcher extends the record by `leaseSeconds`. When the worker
+  has published the task's terminal it sends a renewal with `final` set (`LeaseRenewal.Final`).
+  The dispatcher has no read on `.events`, so that renewal is how it learns the task ended:
+  it acks the submission, deletes the record and frees the slot at once.
+- **Restart.** A re-adopted task's record gets `restartGraceSeconds` before an expired lease
+  fails it, which covers the gap `Recreate` leaves.
+- **Grants.** The callout fixes a connection's grants when it connects, and the dispatcher's
+  name each durable and each profile's `.events`. When the config adds a durable or a profile
+  the dispatcher reconnects, retrying with backoff while the callout's map catches up. Tasks
+  it holds keep running across the reconnect.
+- **Terminal notice.** A task the dispatcher ends gets a final status on its `.events`:
+  `rejected` when it is refused at admission (nothing ran), `failed` once a worker had it. The
+  message is `reason: <code> - <detail>`, the executors' form, which the gateway already
+  reads. The codes are `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and
+  `queue-timeout` at admission, and `lease-expired` and `deadline-exceeded` while it holds.
 
 ### Execution
 
