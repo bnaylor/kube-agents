@@ -695,7 +695,7 @@ class HandOffTest(unittest.TestCase):
         roster = ["t_0", "t_1", "t_2"]
         self.assertEqual(self._carded_run(f"garbage,,bootstrap-inventory-other-t_0,{h.CLUSTER_KEY_PREFIX}t_1", [], roster),
                          [f"{h.CLUSTER_KEY_PREFIX}t_1"])
-        for carded in ("!!", h.CARDED_NONE, f"{h.CLUSTER_KEY_PREFIX}t_0;rm"):
+        for carded in ("!!", "-", f"{h.CLUSTER_KEY_PREFIX}t_0;rm"):
             with self.subTest(carded=carded):
                 self.assertEqual(self._carded_run(carded, [], roster), [])
 
@@ -991,7 +991,7 @@ class FirstRunClusterCardsTest(unittest.TestCase):
         for content, want in (("task_id=t\n", None),
                               (f"task_id=t\ncarded={key}a,{key}b.c\n", {f"{key}a", f"{key}b.c"}),
                               (f"task_id=t\ncarded={key}a,x,{key}\n", {f"{key}a"}),
-                              (f"task_id=t\ncarded={h.CARDED_NONE}\n", set())):
+                              ("task_id=t\ncarded=-\n", set())):
             with self.subTest(content=content):
                 marker.write_text(content)
                 got = h.carded_keys(marker)

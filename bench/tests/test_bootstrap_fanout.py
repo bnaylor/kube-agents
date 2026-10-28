@@ -527,6 +527,50 @@ def test_a_card_for_the_wrong_profiles_fails(capped) -> None:
     assert "among the first 2 by profile name" in result.reason
 
 
+LATE = "cluster-proj-a0-us-east4"  # sorts before every CAPPED_ROSTER profile
+
+
+def _with_late_profile(capped, monkeypatch: pytest.MonkeyPatch, marker_carded: list[str] | None) -> None:
+    # A profile scaffolded after the sweep was filed, which sorts first: the
+    # gate carded FIRST and the sweep audited the late one with the rest.
+    monkeypatch.setitem(CAPPED_ROSTER, LATE, {"project": "proj", "cluster": "a0", "location": "us-east4"})
+    # capped returns the sandbox's raw file, under tmp_path/sandbox; the pod's root is tmp_path.
+    root = capped(FIRST, _compose(FIRST, [LATE, *PAST]), roster=dict(CAPPED_ROSTER)).parent.parent
+    if marker_carded is not None:
+        with (root / discovery.SCAN_MARKER).open("a") as fh:
+            fh.write("carded=" + ",".join(discovery.CLUSTER_KEY_PREFIX + p for p in marker_carded) + "\n")
+
+
+def test_a_late_profile_that_sorts_first_is_graded_against_the_carded_set(capped, monkeypatch) -> None:
+    _with_late_profile(capped, monkeypatch, FIRST)
+    cards = _verify_capped("cards_for_first_cap_profiles")
+    assert cards.status == "pass", cards.reason
+    assert "the sweep marker lists as carded" in cards.reason
+    audited = _verify_capped("past_cap_clusters_sweep_audited")
+    assert audited.status == "pass", audited.reason
+    assert "all 4 cluster(s) past the cap of 2" in audited.reason
+
+
+def test_a_marker_without_carded_grades_the_first_cap_by_name(capped, monkeypatch) -> None:
+    # An older build's marker: the late profile is among the first two by name.
+    _with_late_profile(capped, monkeypatch, None)
+    cards = _verify_capped("cards_for_first_cap_profiles")
+    assert cards.status == "fail", cards.reason
+    assert f"no card for {[LATE]}, among the first 2 by profile name" in cards.reason
+
+
+def test_the_read_drops_carded_entries_that_are_not_card_keys(tmp_path: Path) -> None:
+    root = _write_root(tmp_path, _capped_board([]), CAPPED_ROSTER)
+    good = discovery.CLUSTER_KEY_PREFIX + FIRST[0]
+    with (root / discovery.SCAN_MARKER).open("a") as fh:
+        fh.write(f"carded={good},junk,{discovery.CLUSTER_KEY_PREFIX}\n")
+    payload, why = discovery.read_fanout(lambda s, t: _run_script(root), 5.0)
+    assert why == "" and payload["carded"] == [good]
+    root2 = _write_root(tmp_path / "old", _capped_board([]), CAPPED_ROSTER)
+    payload, _ = discovery.read_fanout(lambda s, t: _run_script(root2), 5.0)
+    assert payload["carded"] is None
+
+
 def test_a_past_cap_cluster_missing_from_the_raw_report_fails(capped) -> None:
     # The sweep audited two of the three and listed the third in the fleet only.
     capped(FIRST, _compose(FIRST, PAST[:-1]))

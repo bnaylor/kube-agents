@@ -2480,6 +2480,28 @@ class ScanGateTest(unittest.TestCase):
         self.assertIn("uncarded=3\n", marker)
         self.assertIn(f"carded={agents[0]['key']},{agents[1]['key']}\n", marker)
 
+    def test_an_empty_listing_at_filing_pins_nothing(self):
+        # The listing returns [] when it fails as well as when there are no
+        # Cluster Agents. Pinned as empty, a failed listing would leave every
+        # Cluster Agent uncarded; unpinned, the next tick cards the live roster
+        # under the cap.
+        (self.d / bootstrap_scan_gate.bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("2")
+        kanban = types.ModuleType("hermes_cli.kanban")
+        kanban.run_slash = lambda cmd: '{"id": "t_real"}'
+        modules = {"hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.kanban": kanban}
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), \
+                mock.patch.dict(sys.modules, modules), \
+                mock.patch.object(bootstrap_scan_gate, "cluster_agents", mock.Mock(return_value=[])), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self._orig(self.d), "t_real")
+        marker = (self.d / SCAN_FILED).read_text()
+        self.assertNotIn("carded=", marker)
+        self.assertNotIn("uncarded=", marker)
+        names = sorted(self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(5))
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), contextlib.redirect_stderr(io.StringIO()):
+            roster = bootstrap_scan_gate.cluster_agents()
+        self.assertEqual([a["name"] for a in roster], names[:2])
+
     def test_a_roster_under_the_cap_is_listed_whole(self):
         names = [self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(3)]
         self.assertEqual([a["name"] for a in bootstrap_scan_gate.cluster_agents()], sorted(names))

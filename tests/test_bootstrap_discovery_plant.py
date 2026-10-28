@@ -186,6 +186,13 @@ elif "task_id=$1" in script:
         sys.exit(1)
     if os.environ.get("SIGNAL_ON_RESTORE"):
         os.kill(os.getppid(), getattr(signal, "SIG" + os.environ["SIGNAL_ON_RESTORE"]))
+elif script == 'rm -f "$1" && rm -f "$2"':
+    # The trap's, the destroy's and step 2's removal of a bench cap: one exec,
+    # the cap and then the sentinel, so the sentinel outlives a failed cap rm.
+    record("uncap+unmark")
+    if os.environ.get("UNCAP_FAIL") == "1":
+        sys.stderr.write("error: unable to upgrade connection: container not found\n")
+        sys.exit(1)
 elif "/opt/data/.first_run_cluster_cards.bench" in cmd:
     if "echo bench" in script:
         record("cap_state")
@@ -604,7 +611,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         destroyed, calls = self._run(self._destroy_script)
         self.assertEqual(destroyed.returncode, 0, destroyed.stderr)
-        self.assertEqual([c for c in calls if c.endswith(("[cap]", "[uncap]", "[mark]", "[unmark]"))], [])
+        self.assertEqual([c for c in calls if c.endswith(("[cap]", "[uncap]", "[mark]", "[unmark]", "[uncap+unmark]"))], [])
 
     def test_a_set_cap_is_written_before_the_re_arm(self):
         self._capped()
@@ -629,15 +636,19 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertLess(cap[0], self._indices(calls, "[open_cards]")[0])
         self.assertLess(cap[0], self._indices(calls, "[rearm]")[0])
         # A plant that succeeds leaves it for the verifier; the destroy removes it.
-        self.assertEqual(self._indices(calls, "[uncap]"), [])
-        self.assertEqual(self._indices(calls, "[unmark]"), [])
+        self.assertEqual(self._indices(calls, "[uncap+unmark]"), [])
         self.assertIn("First-run cluster card cap set to 2", completed.stdout)
 
     def _assert_cap_then_sentinel_removed(self, calls):
-        uncap, unmark = self._indices(calls, "[uncap]"), self._indices(calls, "[unmark]")
-        self.assertEqual((len(uncap), len(unmark)), (1, 1), calls)
-        self.assertLess(uncap[0], unmark[0])
-        self.assertIn(" rm -f /opt/data/.first_run_cluster_cards.bench [unmark]", calls[unmark[0]])
+        # One exec, cap first: the sentinel's rm runs only after the cap's
+        # succeeded, in the pod, with no second exec to fail between them.
+        removed = self._indices(calls, "[uncap+unmark]")
+        self.assertEqual(len(removed), 1, calls)
+        self.assertEqual(self._indices(calls, "[uncap]") + self._indices(calls, "[unmark]"), [], calls)
+        self.assertIn(
+            ' rm -f "$1" && rm -f "$2" sh /opt/data/.first_run_cluster_cards /opt/data/.first_run_cluster_cards.bench [uncap+unmark]',
+            calls[removed[0]],
+        )
 
     def test_the_destroy_removes_a_cap_it_set_then_its_sentinel(self):
         self._capped()
@@ -650,7 +661,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self._capped()
         completed, calls = self._run(self._destroy_script, UNCAP_FAIL=1)
         self.assertNotEqual(completed.returncode, 0)
-        self.assertEqual(self._indices(calls, "[unmark]"), [])
+        self._assert_cap_then_sentinel_removed(calls)
         self.assertIn("remove /opt/data/.first_run_cluster_cards and /opt/data/.first_run_cluster_cards.bench", completed.stderr)
         self.assertIn("The next run's step 2, capped or not", completed.stderr)
 
@@ -665,12 +676,12 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self._capped()
         completed, calls = self._run(GATE_FILES=0, UNCAP_FAIL=1)
         self.assertNotEqual(completed.returncode, 0)
-        self.assertEqual(self._indices(calls, "[unmark]"), [])
+        self._assert_cap_then_sentinel_removed(calls)
         self.assertIn("Cleanup incomplete", completed.stderr)
         self.assertIn("The next run's step 2, capped or not", completed.stderr)
 
     def _nothing_changed(self, calls):
-        for tag in ("[cap]", "[mark]", "[uncap]", "[unmark]", "[archive]", "[rearm]", "[open_cards]"):
+        for tag in ("[cap]", "[mark]", "[uncap]", "[unmark]", "[uncap+unmark]", "[archive]", "[rearm]", "[open_cards]"):
             self.assertEqual(self._indices(calls, tag), [], tag)
         self.assertEqual([c for c in calls if "[clear " in c], [])
 
@@ -680,7 +691,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         completed, calls = self._run_handoff(CAP_STATE="bench")
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self._assert_cap_then_sentinel_removed(calls)
-        self.assertLess(self._indices(calls, "[unmark]")[0], self._indices(calls, "[open_cards]")[0])
+        self.assertLess(self._indices(calls, "[uncap+unmark]")[0], self._indices(calls, "[open_cards]")[0])
         self.assertEqual(self._indices(calls, "[cap]") + self._indices(calls, "[mark]"), [])
         self.assertIn("Removed the first-run cluster card cap an earlier run of this stack left", completed.stdout)
 
@@ -688,7 +699,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self._capped()
         completed, calls = self._run_handoff(CAP_STATE="bench")
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        order = [self._indices(calls, tag)[0] for tag in ("[uncap]", "[unmark]", "[mark]", "[cap]")]
+        order = [self._indices(calls, tag)[0] for tag in ("[uncap+unmark]", "[mark]", "[cap]")]
         self.assertEqual(order, sorted(order), calls)
 
     def test_a_capped_run_refuses_an_operators_cap_file(self):
@@ -702,7 +713,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
     def test_an_uncapped_run_leaves_an_operators_cap_file_alone(self):
         completed, calls = self._run_handoff(CAP_STATE="operator")
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual([c for c in calls if c.endswith(("[cap]", "[uncap]", "[mark]", "[unmark]"))], [])
+        self.assertEqual([c for c in calls if c.endswith(("[cap]", "[uncap]", "[mark]", "[unmark]", "[uncap+unmark]"))], [])
         # The run's sweep is bounded by that cap, so the log says so.
         self.assertIn(
             "Note: /opt/data/.first_run_cluster_cards exists on platform-agent-host and this stack did not write it; "
@@ -713,7 +724,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
     def test_an_orphaned_sentinel_with_no_cap_is_removed_and_nothing_else(self):
         completed, calls = self._run_handoff(CAP_STATE="orphan none")
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual([c for c in calls if c.endswith(("[cap]", "[uncap]", "[mark]", "[unmark]"))],
+        self.assertEqual([c for c in calls if c.endswith(("[cap]", "[uncap]", "[mark]", "[unmark]", "[uncap+unmark]"))],
                          [c for c in calls if c.endswith("[unmark]")])
         self.assertEqual(len(self._indices(calls, "[unmark]")), 1, calls)
         self.assertIn("left without its cap.", completed.stdout)
@@ -731,7 +742,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
                     self._script.write_text(self._plant)
                 completed, calls = self._run_handoff(CAP_STATE="orphan operator")
                 self.assertEqual(len(self._indices(calls, "[unmark]")), 1, calls)
-                self.assertEqual(self._indices(calls, "[uncap]"), [])
+                self.assertEqual(self._indices(calls, "[uncap]") + self._indices(calls, "[uncap+unmark]"), [])
                 self.assertIn("holds another value, so it is an operator's", completed.stdout)
                 if capped:
                     self.assertEqual(completed.returncode, 1, completed.stderr)
@@ -755,7 +766,10 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
                 if capped:
                     self._capped()
                 completed, calls = self._run_handoff(CAP_STATE="fail")
-                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(completed.returncode, 1, completed.stderr)
+                # The read fails into the case's ERROR arm, as step 1's does.
+                self.assertIn("ERROR: could not read /opt/data/.first_run_cluster_cards or "
+                              "/opt/data/.first_run_cluster_cards.bench on platform-agent-host (got '')", completed.stderr)
                 self._nothing_changed(calls)
 
     def test_a_cap_write_that_fails_stops_the_apply_and_is_removed(self):
@@ -763,7 +777,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         completed, calls = self._run(CAP_FAIL=1)
         self.assertNotEqual(completed.returncode, 0)
         self.assertEqual(self._indices(calls, "[rearm]"), [])
-        self.assertEqual(len(self._indices(calls, "[uncap]")), 1, calls)
+        self.assertEqual(len(self._indices(calls, "[uncap+unmark]")), 1, calls)
 
 
 class Step1StateQueryTest(unittest.TestCase):

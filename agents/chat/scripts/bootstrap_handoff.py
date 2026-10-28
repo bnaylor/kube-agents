@@ -61,9 +61,6 @@ MARKER_LINE = re.compile(r"^\s*(\w+)\s*=\s*(\S+)\s*$")
 # name, which cluster_agent_profile._validate holds to these characters. No
 # comma, so the marker's `carded=` list splits on one.
 CLUSTER_KEY = re.compile(rf"^{re.escape(CLUSTER_KEY_PREFIX)}[a-zA-Z0-9._-]+$")
-# What the marker's `carded=` holds when the sweep card listed no Cluster Agent:
-# not a key, so it reads as an empty set rather than as no `carded=` at all.
-CARDED_NONE = "-"
 BOARD_FILE = "kanban.db"
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
 
@@ -251,8 +248,9 @@ def carded_keys(marker: Path) -> frozenset[str] | None:
     for those agents only: the card told its worker to audit every other
     cluster, so a profile that became ready since, or one that sorts into a
     slot a failed or archived card left, must not get a card as well. None for
-    a sweep filed by an older build, or a marker that cannot be read, which
-    keeps the cap as the only bound. An entry that is not a cluster card key
+    a sweep filed by an older build, one whose roster listing came back empty
+    when it was filed (the gate pins nothing then), or a marker that cannot be
+    read, which keeps the cap as the only bound. An entry that is not a cluster card key
     is dropped rather than read as no list, so a damaged ``carded=`` narrows
     the set and never widens it; at most FIRST_RUN_CLUSTER_CARDS_MAX are kept.
     """

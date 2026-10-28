@@ -92,8 +92,8 @@ audited) and this `metadata`:
 ```
 
 `fleet` is every cluster Step 1 listed: the hand-off names any of them that no audit reported on, so
-a silent gap does not read as a clean cluster. `clusters` is an empty list when every cluster had an
-agent. `telemetry` is the collector the agents export to: read `.status.telemetry` on the PlatformAgent
+a silent gap does not read as a clean cluster. `clusters` is an empty list only when no cluster
+lacked a Cluster Agent and none was past the first-run cap. `telemetry` is the collector the agents export to: read `.status.telemetry` on the PlatformAgent
 once and summarise it. A Cluster Agent cannot see that resource, so the report shows it beside their
 observability findings. A cluster you could not reach goes in `gaps`, not silently out of `fleet`. If you could not
 list the clusters at all, say so in `gaps` and complete anyway — onboarding runs once.

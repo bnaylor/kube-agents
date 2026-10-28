@@ -669,7 +669,8 @@ def _task_body(cap: int | None = None, ready: list[dict] | None = None) -> str:
         "`metadata`, and files the ranking card itself. Call `kanban_complete` with a short "
         "factual `result` and this `metadata`: `fleet` — one `{project, cluster, location, "
         "status}` object per cluster Step 1 listed; `clusters` — the Step 3 audits, each in the "
-        "single-cluster SOP's shape (an empty list when every cluster had an agent); `telemetry` — "
+        "single-cluster SOP's shape (an empty list only when no cluster lacked a Cluster Agent and none "
+        "was past the first-run cap); `telemetry` — "
         "the PlatformAgent's `.status.telemetry`, one line; `gaps` — anything you could not do, and why. A cluster you could not reach goes in `gaps`, not "
         "silently out of `fleet`.\n\n"
         "Do not message the user directly — delivery is handled for you."
@@ -738,8 +739,14 @@ def file_scan_task(data_dir: Path) -> str | None:
         )
         return None
 
+    # An empty listing pins nothing: no `carded=` and no `uncarded=`, so later
+    # ticks card the live roster under the cap, as before the pin. The listing
+    # returns [] both when it failed and when there are no Cluster Agents, and
+    # does not say which; a failed listing pinned as empty would leave every
+    # Cluster Agent uncarded for the whole sweep.
     _mark_filed(
-        data_dir, task_id, uncarded=max(0, len(ready) - cap), cap=cap, carded=[a["key"] for a in ready[:cap]]
+        data_dir, task_id, uncarded=max(0, len(ready) - cap), cap=cap,
+        carded=[a["key"] for a in ready[:cap]] if ready else None,
     )
     sys.stderr.write(f"bootstrap_scan_gate: filed sweep card {task_id}\n")
     return task_id
@@ -756,16 +763,17 @@ def _mark_filed(
     sweep was filed under; later ticks hold to it rather than re-reading the
     file (#3702). ``carded`` is the keys of the agents the card listed for
     cards, and later ticks file for those only; written as a comma-separated
-    list of valid keys, at most FIRST_RUN_CLUSTER_CARDS_MAX, or as
-    ``CARDED_NONE`` when the card listed none.
+    list of valid keys, at most FIRST_RUN_CLUSTER_CARDS_MAX, and not at all
+    when none is left, which later ticks read as no pin.
     """
     marker = data_dir / SCAN_FILED_MARKER
+    carded_field = _carded_field(carded or [])
     try:
         marker.write_text(
             f"task_id={task_id}\nfiled_at={int(time.time())}\n"
             + (f"uncarded={uncarded}\n" if uncarded else "")
             + (f"cap={cap}\n" if cap is not None else "")
-            + (f"carded={_carded_field(carded)}\n" if carded is not None else ""),
+            + (f"carded={carded_field}\n" if carded_field else ""),
             encoding="utf-8",
         )
     except Exception as e:  # noqa: BLE001 - never fail the cron run
@@ -779,7 +787,7 @@ def _mark_filed(
 
 def _carded_field(carded: list[str]) -> str:
     keys = [k for k in carded if bootstrap_handoff.CLUSTER_KEY.match(k)][: bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_MAX]
-    return ",".join(keys) or bootstrap_handoff.CARDED_NONE
+    return ",".join(keys)
 
 
 def main(data_dir: Path | None = None) -> int:

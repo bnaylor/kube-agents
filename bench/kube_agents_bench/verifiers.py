@@ -3528,15 +3528,18 @@ class BootstrapFanoutVerifier(BaseVerifier):
     The first-run cap (#3702) has the gate file cards for only the first
     ``cap`` Cluster Agents by profile name and leave the rest to the sweep's
     own worker. Two requirements grade it, each with ``cap`` set to the value
-    the case's stack wrote:
+    the case's stack wrote. The carded set is the one the sweep marker's
+    ``carded=`` records, the agents the sweep card listed when it was filed; a
+    marker without one (an older build) falls back to the first ``cap`` of the
+    roster by profile name. A profile scaffolded after the filing can sort
+    first and still be the sweep's.
 
-    - ``cards_for_first_cap_profiles``: of the same roster sorted by profile
-      name, exactly the first ``cap`` got one card each, assigned to and keyed
-      by the profile; no profile past the cap got one, and no card went
-      anywhere else. A build without the cap files a card for every profile,
-      which fails here.
-    - ``past_cap_clusters_sweep_audited``: every roster cluster past the cap
-      is in ``INVENTORY.raw.md`` on the shell sandbox as audited by the sweep
+    - ``cards_for_first_cap_profiles``: exactly the carded profiles got one
+      card each, assigned to and keyed by the profile; no other profile got
+      one, and no card went anywhere else. A build without the cap files a
+      card for every profile, which fails here.
+    - ``past_cap_clusters_sweep_audited``: every roster cluster outside the
+      carded set is in ``INVENTORY.raw.md`` on the shell sandbox as audited by the sweep
       itself: a Coverage row whose card is the sweep (or the hand-off's "the
       sweep audited it itself" gap line), not a row from a card of its own and
       not the gap line for a fleet cluster no audit reported on. The cap's
@@ -3650,7 +3653,15 @@ class BootstrapFanoutVerifier(BaseVerifier):
                 f"build from one without the cap ({[r['profile'] for r in ordered]})",
                 payload,
             )
-        first, rest = ordered[:cap], ordered[cap:]
+        carded = payload.get("carded")
+        if carded is not None:
+            keys = set(carded)
+            first = [r for r in ordered if r["key"] in keys]
+            rest = [r for r in ordered if r["key"] not in keys]
+            chosen = "the profiles the sweep marker lists as carded"
+        else:
+            first, rest = ordered[:cap], ordered[cap:]
+            chosen = f"the first {cap} by profile name"
         if self.require == "cards_for_first_cap_profiles":
             expected = {(r["profile"], r["key"]) for r in first}
             past = {(r["profile"], r["key"]) for r in rest}
@@ -3666,12 +3677,19 @@ class BootstrapFanoutVerifier(BaseVerifier):
                 if over:
                     parts.append(f"card(s) for profile(s) past the cap: {[p for p, _ in over]}")
                 if missing:
-                    parts.append(f"no card for {[p for p, _ in missing]}, among the first {cap} by profile name")
+                    parts.append(f"no card for {[p for p, _ in missing]}, among {chosen}")
                 if duplicated:
                     parts.append(f"more than one card for {[p for p, _ in duplicated]}")
                 if stray:
                     parts.append(f"card(s) matching no Cluster Agent: {stray}")
                 return "fail", "; ".join(parts), payload
+            if carded is not None:
+                return (
+                    "pass",
+                    f"{where}: one card for each of the {len(first)} of {len(ordered)} Cluster Agent(s) the sweep "
+                    "marker lists as carded, and none past the cap",
+                    payload,
+                )
             return (
                 "pass",
                 f"{where}: one card for each of the first {cap} of {len(ordered)} Cluster Agent(s) by profile name, "

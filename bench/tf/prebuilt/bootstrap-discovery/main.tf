@@ -194,9 +194,10 @@ resource "null_resource" "sweep" {
           clear_inventory || failed="$failed, remove the INVENTORY files"
           # Terraform skips the destroy after a failed create, so this is the
           # only removal the cap step 2 wrote gets. The sentinel goes only once
-          # the cap has, so a cap left behind is still marked as this stack's.
+          # the cap has, in the same exec, so a cap left behind is still marked
+          # as this stack's.
           if [ -n "$capped" ]; then
-            { agent rm -f ${local.cap_file} >&2 && agent rm -f ${local.cap_mark} >&2; } \
+            agent sh -c 'rm -f "$1" && rm -f "$2"' sh ${local.cap_file} ${local.cap_mark} >&2 \
               || failed="$failed, remove ${local.cap_file} and ${local.cap_mark}"
           fi
           if [ -n "$failed" ]; then
@@ -366,13 +367,15 @@ resource "null_resource" "sweep" {
       # value, which an operator wrote since; `operator` when a cap file is
       # there without the sentinel; `none` otherwise. The sentinel alone is no
       # proof: an orphaned one beside an operator's later cap would have that
-      # cap removed. An empty sentinel matches nothing. A failed read stops the
-      # apply here.
+      # cap removed. An empty sentinel matches nothing. A failed read, the exec
+      # or a `cat` in the pod, prints no state and stops the apply below, as
+      # step 1's does.
       # Known limit: an orphaned sentinel beside an operator's cap of the same
-      # value reads as `bench`, and that cap is removed. It takes the trap's or
-      # the destroy's second exec (the sentinel's removal) failing after the
-      # first succeeded, then an operator writing exactly this stack's last
-      # value before the next run. The cap file cannot carry proof of its
+      # value reads as `bench`, and that cap is removed. Every removal takes
+      # the cap and the sentinel in one exec, cap first, so an orphan takes the
+      # sentinel's `rm` failing inside the pod after the cap's succeeded, then
+      # an operator writing exactly this stack's last value before the next
+      # run. The cap file cannot carry proof of its
       # writer: the gate reads it as a bare integer, and anything beside the
       # number would read as malformed and fall back to the default.
       cap="${local.cards_cap}"
@@ -384,14 +387,13 @@ resource "null_resource" "sweep" {
             if [ -n "$mark" ] && [ "$mark" = "$file" ]; then echo bench; else echo orphan operator; fi
           fi
         elif [ -e "$2" ]; then echo operator; else echo none; fi' \
-        sh ${local.cap_mark} ${local.cap_file})"
+        sh ${local.cap_mark} ${local.cap_file} || true)"
       # Whatever this run's cap: a leftover cap would bound this sweep, the
       # next case's and the install's real onboarding. The cap goes first, so
       # a removal that fails part-way leaves it marked for the next run.
       case "$cap_read" in
         bench)
-          agent rm -f ${local.cap_file}
-          agent rm -f ${local.cap_mark}
+          agent sh -c 'rm -f "$1" && rm -f "$2"' sh ${local.cap_file} ${local.cap_mark}
           echo "Removed the first-run cluster card cap an earlier run of this stack left in ${local.cap_file}."
           cap_state=none ;;
         "orphan none"|"orphan operator")
@@ -601,13 +603,11 @@ resource "null_resource" "sweep" {
       # an install that had an operator's file, so the file here is this
       # stack's. Left behind, the cap would bound the next sweep, the next
       # case's and the install's real onboarding, so the sentinel goes only once
-      # the cap has: the next run's step 2 removes a cap whose sentinel still
+      # the cap has, in the same exec: the next run's step 2 removes a cap whose sentinel still
       # holds its value, and a sentinel left without its cap.
       if [ -n "${self.triggers.cards_cap}" ]; then
-        { kubectl exec -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
-            rm -f ${self.triggers.cap_file} \
-          && kubectl exec -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
-            rm -f ${self.triggers.cap_mark}; } \
+        kubectl exec -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
+          sh -c 'rm -f "$1" && rm -f "$2"' sh ${self.triggers.cap_file} ${self.triggers.cap_mark} \
           || failed="$failed, remove ${self.triggers.cap_file} and ${self.triggers.cap_mark}"
       fi
       if [ -n "$failed" ]; then
