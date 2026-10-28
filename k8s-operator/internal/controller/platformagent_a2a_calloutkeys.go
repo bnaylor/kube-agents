@@ -123,7 +123,7 @@ func (r *PlatformAgentReconciler) ensureA2ACalloutKeysSecret(ctx context.Context
 		// for the door's token: one created by anything else is neither
 		// trusted for its keys nor overwritten.
 		if !metav1.IsControlledBy(existing, agent) {
-			return nil, fmt.Errorf("refusing to adopt unowned Secret %s/%s as the A2A callout keys; delete it, or give it a controller reference to this PlatformAgent", name.Namespace, name.Name)
+			return nil, fmt.Errorf("refusing to adopt unowned Secret %s/%s as the A2A callout keys; delete it and the operator creates a fresh one (a controller reference is not a remedy: it would adopt keys of unknown origin as they are)", name.Namespace, name.Name)
 		}
 		keys, ok := readA2ACalloutKeys(existing)
 		if ok {

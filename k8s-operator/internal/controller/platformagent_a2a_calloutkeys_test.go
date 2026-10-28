@@ -149,12 +149,24 @@ func TestTheCalloutKeysSecretIsOnlyReadWhenOwned(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, data := range map[string]map[string][]byte{
-		"valid seeds":   valid,
-		"corrupt seeds": {"issuer-seed": []byte("not a seed")},
+	notController := false
+	for name, tc := range map[string]struct {
+		data   map[string][]byte
+		owners []metav1.OwnerReference
+	}{
+		"no owner, valid seeds":   {data: valid},
+		"no owner, corrupt seeds": {data: map[string][]byte{"issuer-seed": []byte("not a seed")}},
+		// An owner reference that isn't the controller, and a controller
+		// reference to a PlatformAgent of the same name but another UID (one
+		// deleted and recreated), are not this PlatformAgent's either.
+		"a non-controller owner reference": {data: valid, owners: []metav1.OwnerReference{{
+			APIVersion: "kubeagents.x-k8s.io/v1alpha1", Kind: "PlatformAgent", Name: agent.Name, UID: agent.UID, Controller: &notController}}},
+		"a controller reference with another UID": {data: valid, owners: []metav1.OwnerReference{{
+			APIVersion: "kubeagents.x-k8s.io/v1alpha1", Kind: "PlatformAgent", Name: agent.Name, UID: "another-uid", Controller: func() *bool { b := true; return &b }()}}},
 	} {
-		t.Run("an unowned Secret with "+name+" is refused", func(t *testing.T) {
-			planted := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}, Data: data}
+		data := tc.data
+		t.Run("a Secret with "+name+" is refused", func(t *testing.T) {
+			planted := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace, OwnerReferences: tc.owners}, Data: data}
 			r, cl := mcpTestReconciler(t, planted)
 			keys, err := r.ensureA2ACalloutKeysSecret(ctx, agent)
 			if err == nil || !strings.Contains(err.Error(), "refusing to adopt unowned Secret") {
@@ -176,10 +188,18 @@ func TestTheCalloutKeysSecretIsOnlyReadWhenOwned(t *testing.T) {
 		if err := ctrl.SetControllerReference(agent, owned, setupScheme()); err != nil {
 			t.Fatal(err)
 		}
-		r, _ := mcpTestReconciler(t, owned)
+		r, cl := mcpTestReconciler(t, owned)
 		keys, err := r.ensureA2ACalloutKeysSecret(ctx, agent)
 		if err != nil || keys == nil {
 			t.Fatalf("an owned, incomplete Secret was not repaired: %v", err)
+		}
+		after := &corev1.Secret{}
+		if err := cl.Get(ctx, types.NamespacedName{Name: owned.Name, Namespace: owned.Namespace}, after); err != nil {
+			t.Fatal(err)
+		}
+		stored, ok := readA2ACalloutKeys(after)
+		if !ok || stored.IssuerPublic != keys.IssuerPublic || stored.XKeyPublic != keys.XKeyPublic {
+			t.Error("the repaired Secret does not hold the keys the repair returned")
 		}
 	})
 }
