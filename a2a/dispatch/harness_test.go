@@ -115,7 +115,13 @@ func workerUser(pod string) string { return "w-" + pod }
 // newBus starts the server with a user for each pod.
 func newBus(t *testing.T, pods ...string) *bus {
 	t.Helper()
-	users := []*natsserver.User{{Username: adminUser, Password: adminPass}}
+	return newBusWith(t, nil, pods...)
+}
+
+// newBusWith adds extra users (a dispatcher's, with narrower grants).
+func newBusWith(t *testing.T, extra []*natsserver.User, pods ...string) *bus {
+	t.Helper()
+	users := append([]*natsserver.User{{Username: adminUser, Password: adminPass}}, extra...)
 	for _, pod := range pods {
 		users = append(users, &natsserver.User{Username: workerUser(pod), Password: workerPW,
 			Permissions: &natsserver.Permissions{

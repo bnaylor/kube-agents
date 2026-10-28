@@ -32,6 +32,19 @@ const (
 	// DefaultRefreshInterval paces re-reading the config's durables and
 	// binding or unbinding them.
 	DefaultRefreshInterval = 10 * time.Second
+	// DefaultRegrantAttempts bounds the reconnects one config change may
+	// cost: a durable the new connection still can't bind (the callout's
+	// watch lagging the config) gets another reconnect, up to this many.
+	DefaultRegrantAttempts = 5
+	// DefaultRegrantBackoff is the pause before the second such reconnect,
+	// doubling after.
+	DefaultRegrantBackoff = 2 * time.Second
+	// DefaultBindAttemptTimeout bounds one bind of an added durable after a
+	// reconnect.
+	DefaultBindAttemptTimeout = 5 * time.Second
+	// DefaultReconnectTimeout bounds one reconnect, well inside the held
+	// durables' 2m AckWait, so no held task is redelivered by it.
+	DefaultReconnectTimeout = 30 * time.Second
 	// DefaultSubmitter is the one principal whose submissions are held.
 	DefaultSubmitter = "gateway"
 	// DefaultStream is the stream the durables are on.
@@ -53,8 +66,14 @@ type Config struct {
 	HealthInterval  time.Duration
 	StallAfter      time.Duration
 	RefreshInterval time.Duration
-	Submitter       string
-	Stream          string
+	// RegrantAttempts, RegrantBackoff, BindAttemptTimeout and
+	// ReconnectTimeout pace the reconnect a config adding a durable needs.
+	RegrantAttempts    int
+	RegrantBackoff     time.Duration
+	BindAttemptTimeout time.Duration
+	ReconnectTimeout   time.Duration
+	Submitter          string
+	Stream             string
 	// UnattendedTiers are the tiers on the unattended side of the
 	// interactive reserve.
 	UnattendedTiers []string
@@ -67,9 +86,14 @@ func DefaultConfig() Config {
 		HealthInterval:  DefaultHealthInterval,
 		StallAfter:      DefaultStallAfter,
 		RefreshInterval: DefaultRefreshInterval,
-		Submitter:       DefaultSubmitter,
-		Stream:          DefaultStream,
-		UnattendedTiers: []string{DefaultUnattendedTier},
+
+		RegrantAttempts:    DefaultRegrantAttempts,
+		RegrantBackoff:     DefaultRegrantBackoff,
+		BindAttemptTimeout: DefaultBindAttemptTimeout,
+		ReconnectTimeout:   DefaultReconnectTimeout,
+		Submitter:          DefaultSubmitter,
+		Stream:             DefaultStream,
+		UnattendedTiers:    []string{DefaultUnattendedTier},
 	}
 }
 
@@ -78,6 +102,8 @@ func (c Config) Validate() error {
 	switch {
 	case c.RetryDelay <= 0 || c.HealthInterval <= 0 || c.StallAfter <= 0 || c.RefreshInterval <= 0:
 		return fmt.Errorf("dispatch config: retry delay, health interval, stall threshold and refresh interval must be positive")
+	case c.RegrantAttempts < 1 || c.RegrantBackoff <= 0 || c.BindAttemptTimeout <= 0 || c.ReconnectTimeout <= 0:
+		return fmt.Errorf("dispatch config: regrant attempts, backoff, bind timeout and reconnect timeout must be positive")
 	case c.Submitter == "" || c.Stream == "":
 		return fmt.Errorf("dispatch config: submitter and stream are required")
 	}

@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -100,6 +102,12 @@ type Dispatcher struct {
 	subs      map[string]lib.HeldSubscription
 	binding   map[string]bool
 	draining  []lib.HeldSubscription
+	// granted is the durables the current connection's grants cover: the
+	// callout fixes a principal's grants per connection, from the config
+	// the operator rendered when it connected. A config listing a durable
+	// outside it needs a reconnect first.
+	granted    map[string]bool
+	reconnects atomic.Int64
 }
 
 // New builds a dispatcher on bus. src is the install config, pool the
@@ -124,6 +132,7 @@ func New(cfg Config, bus *lib.Client, src Source, pool Pool, verifier Verifier, 
 		released:  map[string]bool{},
 		subs:      map[string]lib.HeldSubscription{},
 		binding:   map[string]bool{},
+		granted:   map[string]bool{},
 	}, nil
 }
 
@@ -134,6 +143,12 @@ func New(cfg Config, bus *lib.Client, src Source, pool Pool, verifier Verifier, 
 func (d *Dispatcher) Run(ctx context.Context) error {
 	d.mu.Lock()
 	d.started = d.now()
+	// The connection was made against the config as it stands now.
+	for _, p := range d.src.Config().Profiles {
+		for _, dur := range p.Durables {
+			d.granted[dur.Name] = true
+		}
+	}
 	d.mu.Unlock()
 	acceptSub, err := d.bus.SubscribeCore(acceptWildcard, d.onAccept)
 	if err != nil {
@@ -183,33 +198,49 @@ func (d *Dispatcher) shutdown() {
 	}
 }
 
-// syncBindings binds every durable the config lists that isn't bound yet,
-// each on its own goroutine (a durable the operator hasn't created yet
-// retries for the lib's bind window, and must not hold up the rest), and
-// stops intake on any bound durable the config no longer lists: a profile
-// absent from the config has no durables to read. Tasks already held from an
-// unbound durable keep running to their end.
+// syncBindings brings the bound durables in line with the config. A
+// durable the config adds outside the current connection's grants first
+// costs a reconnect (regrant), since grants are fixed per connection. Every
+// granted durable not bound yet is bound on its own goroutine (a durable
+// the operator hasn't created yet retries for the lib's bind window, and
+// must not hold up the rest). A bound durable the config no longer lists
+// has its intake stopped, with no reconnect: a profile absent from the
+// config has no durables to read, and tasks already held from it run to
+// their end.
 func (d *Dispatcher) syncBindings(ctx context.Context) {
 	cfg := d.src.Config()
-	want := map[string]bool{}
+	want := map[string]string{} // durable name -> profile
+	durables := map[string]lib.DispatchDurable{}
+	var added []string
+	d.mu.Lock()
 	for _, p := range cfg.Profiles {
 		for _, dur := range p.Durables {
-			want[dur.Name] = true
-			d.mu.Lock()
-			skip := d.subs[dur.Name] != nil || d.binding[dur.Name]
-			if !skip {
-				d.binding[dur.Name] = true
-			}
-			d.mu.Unlock()
-			if !skip {
-				go d.bind(ctx, p.Name, dur)
+			want[dur.Name], durables[dur.Name] = p.Name, dur
+			if !d.granted[dur.Name] {
+				added = append(added, dur.Name)
 			}
 		}
 	}
+	d.mu.Unlock()
+	if len(added) > 0 {
+		d.regrant(ctx, want, durables, added)
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	for name := range d.granted {
+		if want[name] == "" {
+			delete(d.granted, name)
+		}
+	}
+	for name, profile := range want {
+		if !d.granted[name] || d.subs[name] != nil || d.binding[name] {
+			continue
+		}
+		d.binding[name] = true
+		go d.bind(ctx, profile, durables[name])
+	}
 	for name, sub := range d.subs {
-		if !want[name] {
+		if want[name] == "" {
 			sub.StopIntake()
 			d.draining = append(d.draining, sub)
 			delete(d.subs, name)
@@ -218,20 +249,92 @@ func (d *Dispatcher) syncBindings(ctx context.Context) {
 	}
 }
 
-func (d *Dispatcher) bind(ctx context.Context, profile string, dur lib.DispatchDurable) {
-	name := dur.Name
-	sub, err := d.bus.SubscribeHeld(ctx, lib.SubscribeConfig{
+// regrant reconnects so the bus connection carries grants for the durables
+// the config added, then binds them. A bind still refused (the callout's
+// watch lagging the config) gets another reconnect, with backoff, up to
+// RegrantAttempts; then it is logged as an error and left for the next
+// refresh. Held work is untouched throughout (lib.Client.Reconnect).
+func (d *Dispatcher) regrant(ctx context.Context, want map[string]string, durables map[string]lib.DispatchDurable, added []string) {
+	backoff := d.cfg.RegrantBackoff
+	pending := added
+	for attempt := 1; attempt <= d.cfg.RegrantAttempts; attempt++ {
+		if attempt > 1 && !sleepCtx(ctx, backoff) {
+			return
+		}
+		if attempt > 1 {
+			backoff *= 2
+		}
+		rctx, cancel := context.WithTimeout(ctx, d.cfg.ReconnectTimeout)
+		err := d.bus.Reconnect(rctx)
+		cancel()
+		d.reconnects.Add(1)
+		if err != nil {
+			d.log.Warn("reconnect for new durables' grants", "attempt", attempt, "err", err)
+			continue
+		}
+		var refused []string
+		for _, name := range pending {
+			if err := d.bindNow(ctx, want[name], durables[name]); err != nil {
+				refused = append(refused, name)
+				d.log.Warn("bind refused after a reconnect; the grants may lag the config", "durable", name, "attempt", attempt, "err", err)
+			}
+		}
+		d.mu.Lock()
+		for _, name := range pending {
+			if !slices.Contains(refused, name) {
+				d.granted[name] = true
+			}
+		}
+		d.mu.Unlock()
+		if len(refused) == 0 {
+			d.log.Info("reconnected for new durables", "durables", added, "attempts", attempt)
+			return
+		}
+		pending = refused
+	}
+	d.log.Error("durables still not bindable after reconnecting; retrying on the next refresh",
+		"durables", pending, "attempts", d.cfg.RegrantAttempts)
+}
+
+// bindNow binds one durable within BindAttemptTimeout.
+func (d *Dispatcher) bindNow(ctx context.Context, profile string, dur lib.DispatchDurable) error {
+	bctx, cancel := context.WithTimeout(ctx, d.cfg.BindAttemptTimeout)
+	defer cancel()
+	sub, err := d.subscribe(bctx, profile, dur)
+	if err != nil {
+		return err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if old := d.subs[dur.Name]; old != nil {
+		old.StopIntake()
+		d.draining = append(d.draining, old)
+	}
+	d.subs[dur.Name] = sub
+	return nil
+}
+
+func (d *Dispatcher) subscribe(ctx context.Context, profile string, dur lib.DispatchDurable) (lib.HeldSubscription, error) {
+	return d.bus.SubscribeHeld(ctx, lib.SubscribeConfig{
 		Stream:    d.cfg.Stream,
-		Durable:   name,
+		Durable:   dur.Name,
 		Subject:   lib.ProfileDurableFilter(profile, dur.Tier, dur.Kind),
 		Session:   profile,
 		Agreement: &lib.AgreementPolicy{Submitter: d.cfg.Submitter},
 	}, d.handle)
+}
+
+// Reconnects counts the reconnects config changes have cost.
+func (d *Dispatcher) Reconnects() int64 { return d.reconnects.Load() }
+
+func (d *Dispatcher) bind(ctx context.Context, profile string, dur lib.DispatchDurable) {
+	name := dur.Name
+	sub, err := d.subscribe(ctx, profile, dur)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	delete(d.binding, name)
 	if err != nil {
-		d.log.Warn("bind a profile durable; retrying on the next refresh", "durable", name, "err", err)
+		d.log.Error("bind a profile durable; retrying on the next refresh", "durable", name, "err", err)
 		return
 	}
 	if ctx.Err() != nil {
