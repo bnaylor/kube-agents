@@ -123,7 +123,9 @@ type Config struct {
 	TaskSigningKeys []string
 
 	// TaskCredentialMaxLifetime is the furthest a task credential's expiry
-	// may be from now; one further out is refused, not shortened. It is
+	// may be, both from now (exp-now) and from its issue time (exp-iat), each
+	// plus the skew; one further out either way is refused, not shortened.
+	// It is
 	// decoupled from GrantTTL on purpose: a task runs to its profile's
 	// deadline (spec.lifecycle.activeDeadlineSeconds, which has no CRD
 	// maximum), and the credential has to last that long. Revocation stays
@@ -131,8 +133,8 @@ type Config struct {
 	// (see mint); a worker whose connection expires reconnects with the
 	// same credential until the credential's own expiry.
 	//
-	// Zero means the default, 6h, which matches the operator's. The
-	// operator doesn't render it in this PR; #4121 renders it from the
+	// Zero means the default, 6h, which matches #4121's. The operator
+	// doesn't render it in this PR; #4121's operator will render it from the
 	// PlatformAgent's spec.harness.tuning.profiles.maxTaskDeadlineSeconds,
 	// the same value it clamps profile deadlines to, so the dispatcher never
 	// signs an expiry the callout refuses.
@@ -154,8 +156,8 @@ type Config struct {
 // reads, named in its errors so a refusal says which setting to fix.
 const envTaskCredentialMaxLifetimeName = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
 
-// ParseTaskCredentialMaxLifetime reads the task credential lifetime the
-// operator renders (#4121, time.Duration.String, e.g. "6h0m0s"). Empty is
+// ParseTaskCredentialMaxLifetime reads the task credential lifetime #4121's
+// operator will render (time.Duration.String, e.g. "6h0m0s"). Empty is
 // (0, nil): unset, the default. Anything that isn't a positive Go duration is
 // an error, which the caller passes on as Config.TaskCredentialMaxLifetimeInvalid
 // rather than stopping: see that field.
@@ -597,9 +599,10 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 
 // verifyTaskCredential checks a task credential against the connection that
 // presented it. taskcred.Verify checks the credential itself: the signature,
-// a trusted task-signing key, the nats audience, an expiry no further out than
-// TaskCredentialMaxLifetime (refused, not shortened) and well-formed claims. What only the
-// callout can check is that it is this connection's:
+// a trusted task-signing key, the nats audience, an expiry within
+// TaskCredentialMaxLifetime both from now and from the credential's issue time
+// (refused, not shortened), and well-formed claims. What only the callout can
+// check is that it is this connection's:
 //
 //   - the pod and its UID are the pod the cluster attested for the
 //     ServiceAccount token on this same CONNECT, so a copied credential is

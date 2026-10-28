@@ -2340,9 +2340,10 @@ Mutation(
         ("\tg := executorTaskGrants(profile, task, stem)\n",
          "\tg := executorTaskGrants(profile, task, stem)\n\tg.Publish = append(g.Publish, lib.TaskSupervisorSubject(profile, \"*\"))\n"),
         "test_A3_the_supervisor_subject_has_exactly_one_writer",
-        "derive an AgentProfile's pods a grant on their profile's supervisor "
-        "subject, the janitor's. A profile pod could then end its own task, or "
-        "a sibling's, and have it read as the janitor declaring it dead",
+        "derive an AgentProfile pod's task connection (profileTaskGrants) a "
+        "grant on its profile's supervisor subject, the janitor's. A profile "
+        "pod could then end its own task, or a sibling's, and have it read as "
+        "the janitor declaring it dead",
     ),
     Mutation(
         "A3-profile-pod-writes-its-own-in-subject",
@@ -2350,9 +2351,10 @@ Mutation(
         ("\tg := executorTaskGrants(profile, task, stem)\n",
          "\tg := executorTaskGrants(profile, task, stem)\n\tg.Publish = append(g.Publish, lib.TaskInSubject(profile, \"*\"))\n"),
         "test_A3_the_executors_grant_does_not_reach_its_own_in_subject",
-        "derive an AgentProfile's pods a publish grant on their profile's in "
-        "subject. Every pod of the profile could then steer or cancel any of "
-        "the profile's tasks as if from the requester",
+        "derive an AgentProfile pod's task connection (profileTaskGrants) a "
+        "publish grant on its profile's in subject. Every pod of the profile "
+        "could then steer or cancel any of the profile's tasks as if from the "
+        "requester",
     ),
     Mutation(
         "A3-session-gains-publish-on-anothers-in-subject",

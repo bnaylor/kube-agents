@@ -83,7 +83,7 @@ func A2ACalloutKeysSecretName(agentName string) string {
 
 // A2ATaskSigningKeySecretName is the Secret holding the task-signing key the
 // dispatcher signs per-task credentials with (#3889). Generated beside the
-// callout's keys; only the dispatcher mounts it.
+// callout's keys; only the dispatcher will mount it, and nothing mounts it yet.
 func A2ATaskSigningKeySecretName(agentName string) string {
 	return agentName + a2aTaskSigningKeySuffix
 }

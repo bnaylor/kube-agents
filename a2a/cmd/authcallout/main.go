@@ -60,11 +60,12 @@ const (
 	envTaskSigningKeys = "A2A_TASK_SIGNING_PUBLIC_KEYS"
 
 	// envTaskCredentialMaxLifetime is the furthest out a task credential's
-	// expiry may be, as a Go duration. The operator renders it with
+	// expiry may be, as a Go duration. #4121's operator will render it with
 	// time.Duration.String ("6h0m0s" by default, 60s to 21600s) from the
-	// PlatformAgent's spec.harness.tuning.profiles.maxTaskDeadlineSeconds
-	// (#4121), the same value it clamps profile deadlines to. Optional; unset
-	// means the callout's 6h default, which matches the operator's. See
+	// PlatformAgent's spec.harness.tuning.profiles.maxTaskDeadlineSeconds,
+	// the same value it will clamp profile deadlines to; this PR's operator
+	// doesn't set it. Optional; unset means the callout's 6h default, which
+	// matches #4121's. See
 	// authcallout.Config.TaskCredentialMaxLifetime.
 	envTaskCredentialMaxLifetime = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
 

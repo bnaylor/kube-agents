@@ -310,11 +310,13 @@ func TestATokenlessWorkerKeepsProfileWideTaskReachUntilTheWorkerPR(t *testing.T)
 	}
 }
 
-// The task connection is strictly narrower than the pod connection it sits
-// beside: every task-plane grant it holds, the pod connection covers too, and
-// the pod connection reaches a sibling task the task connection is refused.
-// Stays true after the worker PR in its first half; the second half flips
-// with TestATokenlessWorkerKeepsProfileWideTaskReachUntilTheWorkerPR.
+// TRANSITIONAL, flip with #3889's worker PR. Today the task connection is
+// strictly narrower than the pod connection it sits beside: every task-plane
+// grant it holds, the pod connection covers too, and the pod connection
+// reaches a sibling task the task connection is refused. Both halves flip when
+// the worker PR removes the pod connection's task reach: the pod connection
+// then holds no task-plane grant at all, and neither connection reaches the
+// sibling. Flip with TestATokenlessWorkerKeepsProfileWideTaskReachUntilTheWorkerPR.
 func TestATaskConnectionIsNarrowerThanThePodConnection(t *testing.T) {
 	kp, pub := taskSigningKey(t)
 	svc := newTaskTestService(t, []string{pub}, 0)
@@ -485,7 +487,7 @@ func TestATaskConnectionClosesWhenItsCredentialExpires(t *testing.T) {
 	select {
 	case <-closed:
 	case <-time.After(10 * time.Second):
-		t.Fatal("the task connection outlived its credential by more than 6s")
+		t.Fatal("the task connection was still open 10s after connecting, 7s past its 3s credential")
 	}
 }
 

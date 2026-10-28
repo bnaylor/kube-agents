@@ -517,7 +517,10 @@ func decodePayload(data map[string]interface{}) (payload, error) {
 	return p, nil
 }
 
-// validUID accepts the lowercase hex-and-dash shape Kubernetes UIDs have.
+// validUID accepts lowercase alphanumerics and dashes. Kubernetes UIDs are
+// lowercase hex and dashes, a subset; the check is the wider set because it is
+// a shape bound, not a UID parser, and the callout compares the claim to the
+// attested UID byte for byte anyway.
 func validUID(s string) bool {
 	if s == "" || len(s) > maxPodUID {
 		return false

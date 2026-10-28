@@ -279,8 +279,11 @@ func generateA2ACalloutKeys() (*a2aCalloutKeys, map[string][]byte, error) {
 // only for the pod the cluster attests on the same connection and only within
 // that pod's own profile and tier, so the seed alone authenticates nothing.
 // With a worker pod's ServiceAccount token as well, it scopes that pod to any
-// task of its own profile for up to the callout's grant TTL: the per-profile
-// reach #3889 removes, and no more. Hence a Secret of its own rather than a
+// task of its own profile, for as long as the attacker holds that token: each
+// credential lasts up to the callout's maximum task lifetime
+// (A2A_TASK_CREDENTIAL_MAX_LIFETIME) and each connection up to GrantTTL, and a
+// seed holder can mint another. That is the per-profile reach #3889 removes,
+// and no more. Hence a Secret of its own rather than a
 // key in the callout's, which would put it in front of the callout's reader,
 // and a place in A2ACredentialSecretNames, so no user volume can mount it.
 //
