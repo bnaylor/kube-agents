@@ -127,31 +127,6 @@ func TestARestartDispatchesAnUnstartedTask(t *testing.T) {
 	}
 }
 
-// The record is written before the offer, so a dispatcher stopped while an
-// offer is out leaves the task marked started: the next one re-adopts it
-// and, with no renewal, fails it. It is never offered a second time, since
-// the first worker may have taken it.
-func TestAnInterruptedOfferIsNeverOfferedAgain(t *testing.T) {
-	b := newBus(t, "tse-0")
-	b.ensure("tse", 2, 0, "read")
-	w := b.worker("tse", "read", "tse-0", answerSilent, 0)
-	ti := oneProfile("tse", 2, "tse-0")
-	ti.update(func(c *lib.DispatchConfig) { c.AcceptTimeoutSeconds = 5 })
-	_, stop1 := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
-	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
-	waitFor(t, 10*time.Second, "the offer", func() bool { return w.offerCount() == 1 })
-	stop1()
-	ti.update(func(c *lib.DispatchConfig) { c.AcceptTimeoutSeconds = 1 })
-	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
-	ts := b.waitTerminal("task-1", 20*time.Second)
-	if ts.state != lib.StateFailed || !hasReason(ts, ReasonLeaseExpired) {
-		t.Errorf("terminal %+v, want failed lease-expired", ts)
-	}
-	if n := w.offerCount(); n != 1 {
-		t.Errorf("offered %d times, want 1", n)
-	}
-}
-
 // A task that finishes while its submission is between holders (the old
 // dispatcher crashed, the redelivery hasn't come): the new dispatcher hears
 // the final renewal under that pod's key and settles the task when the

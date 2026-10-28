@@ -1087,3 +1087,99 @@ func TestReconnectKeepsAHeldDelivery(t *testing.T) {
 		t.Errorf("ack pending %d, redelivered %d: want only task-next held and nothing redelivered", info.NumAckPending, info.NumRedelivered)
 	}
 }
+
+// AckSync returns once the server has the ack: the durable shows nothing
+// pending at that moment, with no wait, and the task is never redelivered.
+func TestHeldAckSyncIsConfirmedByTheServer(t *testing.T) {
+	h, worker := newHeldHarness(t, "acksync")
+	h.ensure(2, 2*time.Second)
+	got := make(chan Delivery, 2)
+	sub, err := worker.SubscribeHeld(h.ctx, h.cfg(), func(ctx context.Context, d Delivery) {
+		got <- d
+		<-ctx.Done()
+	})
+	if err != nil {
+		t.Fatalf("SubscribeHeld: %v", err)
+	}
+	defer sub.Stop()
+	h.submit("task-sync")
+	d := <-got
+	actx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
+	defer cancel()
+	if err := d.AckSync(actx); err != nil {
+		t.Fatalf("AckSync: %v", err)
+	}
+	cons, err := h.req.JetStream().Consumer(h.ctx, "TASKS", h.cfg().Durable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info, err := cons.Info(h.ctx); err != nil || info.NumAckPending != 0 {
+		t.Fatalf("ack pending right after AckSync: %+v (%v), want 0", info, err)
+	}
+	if err := d.AckSync(actx); err != nil {
+		t.Errorf("a repeat AckSync: %v", err)
+	}
+	select {
+	case d := <-got:
+		t.Errorf("redelivered after AckSync: %s", d.Envelope().TaskID)
+	case <-time.After(5 * time.Second): // two AckWaits
+	}
+}
+
+// Reconnect drains the old connection rather than closing it: messages it
+// had already received but not yet handed to a slow handler still reach the
+// handler. (A plain close drops them, and for the dispatcher that is a
+// worker's accept or final renewal lost to its own reconnect.)
+func TestReconnectHandsOnWhatTheOldConnectionHadReceived(t *testing.T) {
+	s := startServer(t)
+	ctx := testCtx(t)
+	c, err := Connect(ctx, clientURL(s), WithName("listener"))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	t.Cleanup(c.Close)
+	pub, err := nats.Connect(clientURL(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pub.Close)
+	gate := make(chan struct{})
+	var mu sync.Mutex
+	var seen []string
+	sub, err := c.SubscribeCore("drain.test", func(m *nats.Msg) {
+		<-gate
+		mu.Lock()
+		seen = append(seen, string(m.Data))
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatalf("SubscribeCore: %v", err)
+	}
+	defer sub.Stop()
+	const n = 5
+	for i := 0; i < n; i++ {
+		if err := pub.Publish("drain.test", []byte(fmt.Sprint(i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := pub.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond) // all received; the handler holds the first
+	done := make(chan error, 1)
+	go func() {
+		rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		done <- c.Reconnect(rctx)
+	}()
+	time.Sleep(200 * time.Millisecond)
+	close(gate)
+	if err := <-done; err != nil {
+		t.Fatalf("Reconnect: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != n {
+		t.Errorf("handled %v across the reconnect, want all %d received before it", seen, n)
+	}
+}

@@ -175,6 +175,13 @@ type Delivery interface {
 	// handler runs, so retry. Once the handler returns, the lib's fallback
 	// Nak is best effort and a redelivery is the caller's to recognise.
 	Ack() error
+	// AckSync is Ack that waits for the server to confirm it (a JetStream
+	// double ack): nil means the server has the ack, so nothing will
+	// redeliver the message. Use it before removing anything that only
+	// matters while the delivery could come back. An error means the
+	// server's answer didn't arrive within ctx, and the ack may or may not
+	// have landed: retry.
+	AckSync(ctx context.Context) error
 	// Nak gives the delivery back for redelivery after delay (0: at once).
 	Nak(delay time.Duration) error
 	// Term disposes of the delivery as one that must never be redelivered.
@@ -424,6 +431,32 @@ func (d *heldDelivery) Received() time.Time  { return d.received }
 func (d *heldDelivery) NumDelivered() uint64 { return d.delivered }
 func (d *heldDelivery) Ack() error           { return d.dispose([]byte("+ACK")) }
 func (d *heldDelivery) Term() error          { return d.dispose([]byte("+TERM")) }
+
+// AckSync sends +ACK as a request and waits for the server's reply. The
+// lock is not held across the round trip, so the heartbeat isn't stalled by
+// it; a delivery an earlier Ack already disposed of is not acked again.
+func (d *heldDelivery) AckSync(ctx context.Context) error {
+	nc, _ := d.c.conn()
+	d.mu.Lock()
+	disposed := d.disposed
+	d.mu.Unlock()
+	if disposed {
+		return nil
+	}
+	if d.reply == "" {
+		return fmt.Errorf("held delivery has no reply subject")
+	}
+	if nc == nil {
+		return fmt.Errorf("held delivery: not connected")
+	}
+	if _, err := nc.RequestWithContext(ctx, d.reply, []byte("+ACK")); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	d.disposed = true
+	d.mu.Unlock()
+	return nil
+}
 func (d *heldDelivery) Nak(delay time.Duration) error {
 	if delay <= 0 {
 		return d.dispose([]byte("-NAK"))

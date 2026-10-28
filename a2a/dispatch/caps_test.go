@@ -9,8 +9,8 @@ import (
 )
 
 func bareDispatcher() *Dispatcher {
-	return &Dispatcher{cfg: testConfig(), now: time.Now, active: map[string]*holding{}, waiting: map[string]waiting{},
-		lastAdmit: map[string]time.Time{}, released: map[string]bool{}}
+	return &Dispatcher{cfg: testConfig(), now: time.Now, active: map[holdKey]*holding{}, waiting: map[string]waiting{},
+		lastAdmit: map[string]time.Time{}, released: map[string]time.Time{}, verified: map[holdKey]time.Time{}}
 }
 
 func capsSnapshot(ceiling int) lib.DispatchConfig {
@@ -32,7 +32,7 @@ func refused(d *Dispatcher, snap lib.DispatchConfig, profile, tier, kind string)
 	p, _ := profileOf(snap, profile)
 	h, why := d.reserve(snap, p, tier, kind, "probe")
 	if h != nil {
-		d.release(h)
+		d.release(h, false)
 		return ""
 	}
 	return why

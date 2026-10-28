@@ -40,6 +40,8 @@ func testConfig() Config {
 	c.HealthInterval = 200 * time.Millisecond
 	c.StallAfter = time.Second
 	c.RefreshInterval = 200 * time.Millisecond
+	c.SweepInterval = 200 * time.Millisecond
+	c.SweepAfter = 10 * time.Second
 	return c
 }
 
@@ -392,7 +394,10 @@ const (
 	answerSilent             // never answers
 )
 
-// fakeWorker is a warm worker on its own restricted connection.
+// fakeWorker is a warm worker on its own restricted connection. It keeps
+// the contract's waiting side: an accepted offer starts only on the
+// dispatcher's confirm, an abandon drops it, and one that hears neither
+// within pendingFor is dropped.
 type fakeWorker struct {
 	t             *testing.T
 	b             *bus
@@ -409,10 +414,20 @@ type fakeWorker struct {
 	skipFinal bool
 	// noRenew accepts and never renews.
 	noRenew bool
+	// acceptDelay holds each accept back that long (a late accept).
+	acceptDelay time.Duration
+	// dropAccept takes the offer and waits for a confirm, but its accept
+	// never reaches the bus (a lost accept).
+	dropAccept bool
+	// dropConfirm never hears a confirm (a lost confirm).
+	dropConfirm bool
 
 	mu        sync.Mutex
 	offers    []lib.DispatchMessage
 	abandons  []lib.DispatchMessage
+	confirms  []lib.DispatchMessage
+	pending   map[string]lib.DispatchMessage
+	started   []string
 	cancels   map[string]context.CancelFunc
 	killed    atomic.Bool
 	completed atomic.Int32
@@ -427,7 +442,7 @@ func (b *bus) worker(profile, tier, pod string, mode workerMode, runFor time.Dur
 	}
 	b.t.Cleanup(nc.Close)
 	w := &fakeWorker{t: b.t, b: b, profile: profile, tier: tier, pod: pod, nc: nc, mode: mode, runFor: runFor,
-		cancels: map[string]context.CancelFunc{}}
+		cancels: map[string]context.CancelFunc{}, pending: map[string]lib.DispatchMessage{}}
 	if _, err := nc.Subscribe(lib.DispatchSubject(profile, tier, pod), w.onMessage); err != nil {
 		b.t.Fatal(err)
 	}
@@ -448,6 +463,23 @@ func (w *fakeWorker) abandonCount() int {
 	defer w.mu.Unlock()
 	return len(w.abandons)
 }
+
+func (w *fakeWorker) confirmCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.confirms)
+}
+
+// startedCount is how many tasks the worker started (on a confirm).
+func (w *fakeWorker) startedCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.started)
+}
+
+// pendingFor is how long an accepted offer waits for a confirm or an
+// abandon before the worker drops it.
+const pendingFor = 5 * time.Second
 
 // kill stops every renewal and every task, as a dead pod.
 func (w *fakeWorker) kill() {
@@ -478,10 +510,20 @@ func (w *fakeWorker) onMessage(msg *nats.Msg) {
 	switch m.Type {
 	case lib.DispatchAbandon:
 		w.abandons = append(w.abandons, m)
+		delete(w.pending, m.TaskID)
 		if c := w.cancels[m.TaskID]; c != nil {
 			c()
 		}
 		w.mu.Unlock()
+		return
+	case lib.DispatchConfirm:
+		w.confirms = append(w.confirms, m)
+		offer, ok := w.pending[m.TaskID]
+		delete(w.pending, m.TaskID)
+		w.mu.Unlock()
+		if ok && !w.dropConfirm && !w.killed.Load() {
+			w.start(offer)
+		}
 		return
 	case lib.DispatchOffer:
 		w.offers = append(w.offers, m)
@@ -498,10 +540,30 @@ func (w *fakeWorker) onMessage(msg *nats.Msg) {
 		w.publish(accept, lib.DispatchAccept{TaskID: m.TaskID, Accepted: false, Reason: "busy"})
 		return
 	}
+	w.mu.Lock()
+	w.pending[m.TaskID] = m
+	w.mu.Unlock()
+	time.AfterFunc(pendingFor, func() {
+		w.mu.Lock()
+		delete(w.pending, m.TaskID)
+		w.mu.Unlock()
+	})
+	if w.dropAccept {
+		return
+	}
+	if w.acceptDelay > 0 {
+		time.AfterFunc(w.acceptDelay, func() { w.publish(accept, lib.DispatchAccept{TaskID: m.TaskID, Accepted: true}) })
+		return
+	}
 	w.publish(accept, lib.DispatchAccept{TaskID: m.TaskID, Accepted: true})
+}
+
+// start runs a confirmed task.
+func (w *fakeWorker) start(m lib.DispatchMessage) {
 	ctx, cancel := context.WithCancel(context.Background())
 	w.mu.Lock()
 	w.cancels[m.TaskID] = cancel
+	w.started = append(w.started, m.TaskID)
 	w.mu.Unlock()
 	go w.renew(ctx, m)
 	go w.work(ctx, cancel, m)

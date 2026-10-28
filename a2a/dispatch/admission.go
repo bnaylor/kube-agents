@@ -42,9 +42,13 @@ type refusal struct {
 }
 
 // admit runs the admission checks in order, cheapest first: the tier, the
-// queue age, the parameters, then the verifier. A nil refusal admits.
-func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile, tier string, now time.Time) (*refusal, error) {
+// queue age, the parameters, then the verifier. A nil refusal admits. The
+// verifier's permit is reused for verifiedFor across the same submission's
+// retries over a cap, so a queue waiting on a cap doesn't call the verifier
+// once per retry delay; the cheap checks run every time.
+func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile, hk holdKey, now time.Time) (*refusal, error) {
 	env := del.Envelope()
+	tier := hk.tier
 	if !allowsTier(prof, tier) {
 		return &refusal{ReasonTierNotAllowed, fmt.Sprintf("profile %s does not allow tier %s", prof.Name, tier)}, nil
 	}
@@ -66,12 +70,21 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	case d.verifier == nil:
 		return &refusal{ReasonVerifierRefused, "no verifier is configured"}, nil
 	}
+	d.mu.Lock()
+	at, cached := d.verified[hk]
+	d.mu.Unlock()
+	if cached && now.Sub(at) <= verifiedFor {
+		return nil, nil
+	}
 	if err := d.verifier.CheckProfileRun(ctx, ref, prof.Name, capability.Tier(tier), target); err != nil {
 		if ctx.Err() != nil {
 			return nil, errStopping
 		}
 		return &refusal{ReasonVerifierRefused, capability.Reason(err)}, nil
 	}
+	d.mu.Lock()
+	d.verified[hk] = now
+	d.mu.Unlock()
 	return nil, nil
 }
 

@@ -25,7 +25,7 @@ func TestATaskRunsToCompletion(t *testing.T) {
 	waitFor(t, 10*time.Second, "the offer", func() bool { return w.offerCount() == 1 })
 	waitFor(t, 5*time.Second, "the lease record", func() bool { return len(b.leases()) == 1 })
 	for key, rec := range b.leases() {
-		if key != lib.ProfileLeaseKey("tse", "read", "tse-0", "task-1") || rec.Pod != "tse-0" || rec.AcceptedAt.IsZero() {
+		if key != lib.ProfileLeaseKey("tse", "read", "tse-0", "task-1") || rec.Pod != "tse-0" || rec.ConfirmedAt.IsZero() {
 			t.Errorf("lease %s = %+v", key, rec)
 		}
 	}
@@ -60,8 +60,8 @@ func TestATaskRunsToCompletion(t *testing.T) {
 	}
 }
 
-// No accept within the timeout means the task never started: its record is
-// removed, it goes back to the queue unfailed, and it runs once a worker
+// No accept within the timeout means the task never started: nothing was
+// recorded, it goes back to the queue unfailed, and it runs once a worker
 // that answers appears. A decline is the same.
 func TestNoAcceptPutsTheTaskBackOnTheQueue(t *testing.T) {
 	b := newBus(t, "tse-0", "tse-1", "tse-2")
@@ -78,12 +78,9 @@ func TestNoAcceptPutsTheTaskBackOnTheQueue(t *testing.T) {
 	if ts := b.terminalsOf("task-1"); len(ts) != 0 {
 		t.Fatalf("a task no worker accepted got a terminal: %+v", ts)
 	}
-	time.Sleep(300 * time.Millisecond)
-	for key := range b.leases() {
-		// Only a record for an offer in flight may exist.
-		if !strings.HasSuffix(key, ".task-1") {
-			t.Errorf("stray lease %s", key)
-		}
+	// Nothing is written before a confirm.
+	if l := b.leases(); len(l) != 0 {
+		t.Errorf("leases for a task no worker accepted: %v", l)
 	}
 	good := b.worker("tse", "read", "tse-2", answerAccept, 500*time.Millisecond)
 	ti.pool.Set("tse", "read", "tse-0", "tse-1", "tse-2")
@@ -272,7 +269,7 @@ func TestOnlyTheDispatcherWritesLeases(t *testing.T) {
 
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
 	key := lib.ProfileLeaseKey("tse", "read", "tse-0", "task-1")
-	waitFor(t, 10*time.Second, "the accepted record", func() bool { return !b.leases()[key].AcceptedAt.IsZero() })
+	waitFor(t, 10*time.Second, "the accepted record", func() bool { return !b.leases()[key].ConfirmedAt.IsZero() })
 	first := b.leases()[key].RenewedAt
 	waitFor(t, 5*time.Second, "a renewal written by the dispatcher", func() bool {
 		return b.leases()[key].RenewedAt.After(first.Add(500 * time.Millisecond))
@@ -296,7 +293,7 @@ func TestAPodHoldingALeaseIsNotOffered(t *testing.T) {
 	}
 	now := time.Now()
 	rec, _ := json.Marshal(lib.LeaseRecord{TaskID: "task-old", Pod: "tse-0", Kind: lib.SubmitKindTop,
-		AcceptedAt: now, RenewedAt: now, ExpiresAt: now.Add(time.Hour)})
+		ConfirmedAt: now, RenewedAt: now, ExpiresAt: now.Add(time.Hour)})
 	if _, err := kv.Put(b.ctx, lib.ProfileLeaseKey("tse", "read", "tse-0", "task-old"), rec); err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +339,8 @@ func TestAConfigChangeAppliesToNewOffersOnly(t *testing.T) {
 }
 
 // A profile the config drops has its durables unbound: its new submissions
-// stay on the stream, while a task already held runs to its end.
+// stay on the stream, while a task already held runs to its end and is
+// settled.
 func TestADroppedProfileIsUnbound(t *testing.T) {
 	b := newBus(t, "tse-0", "tse-1")
 	b.ensure("tse", 2, 0, "read")
@@ -359,6 +357,13 @@ func TestADroppedProfileIsUnbound(t *testing.T) {
 	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateCompleted {
 		t.Errorf("the held task: %+v", ts)
 	}
+	// The held task was settled, not just left to finish: its submission
+	// acked and its record gone. (Stopping the durable outright, rather
+	// than only its intake, would cancel the hold and leave both.)
+	waitFor(t, 5*time.Second, "the held task settled", func() bool {
+		ack, _ := b.pending(lib.ProfileDurableName("tse", "read", lib.SubmitKindTop))
+		return ack == 0 && len(b.leases()) == 0
+	})
 	time.Sleep(time.Second)
 	if other.offerCount() != 0 || len(b.terminalsOf("task-2")) != 0 {
 		t.Errorf("a dropped profile's submission was dispatched")

@@ -25,6 +25,9 @@ type Health struct {
 	// StallAfter and no admission from them in that time: what a
 	// cross-chain admission cycle looks like until the deadlines end it.
 	Stalled []string
+	// DroppedAnswers counts worker answers for tasks they don't hold that
+	// were dropped over a pod's budget, since start.
+	DroppedAnswers int64
 }
 
 func (d *Dispatcher) noteWaiting(taskID, durable string, queued time.Time, why string) {
@@ -53,7 +56,8 @@ func (d *Dispatcher) Health() Health {
 	now := d.now()
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	h := Health{Running: map[string]int{}, Waiting: map[string]int{}, OldestWait: map[string]time.Duration{}}
+	h := Health{Running: map[string]int{}, Waiting: map[string]int{}, OldestWait: map[string]time.Duration{},
+		DroppedAnswers: d.droppedAnswers.Load()}
 	for _, a := range d.active {
 		h.Running[a.profile]++
 	}
@@ -79,7 +83,8 @@ func (d *Dispatcher) Health() Health {
 
 func (d *Dispatcher) logHealth() {
 	h := d.Health()
-	d.log.Info("dispatcher health", "running", h.Running, "waiting", h.Waiting, "oldestWait", h.OldestWait)
+	d.log.Info("dispatcher health", "running", h.Running, "waiting", h.Waiting, "oldestWait", h.OldestWait,
+		"droppedAnswers", h.DroppedAnswers)
 	if len(h.Stalled) > 0 {
 		d.log.Warn("admission stalled: submissions waiting over a cap with no admission; a cross-chain cycle holds until the parents' deadlines",
 			"durables", h.Stalled, "stallAfter", d.cfg.StallAfter)
