@@ -5480,7 +5480,7 @@ func TestSessionRetentionIsPinnedInTheManagedScope(t *testing.T) {
 	if got := managedSessions(t, newTestPlatformAgent())["retention_days"]; fmt.Sprint(got) != fmt.Sprint(defaultSessionRetentionDays) {
 		t.Errorf("unset retention_days = %v, want the operator default %d", got, defaultSessionRetentionDays)
 	}
-	for _, want := range []int{1, 365} {
+	for _, want := range []int{defaultSessionRetentionDays + 1, 365} {
 		if want == defaultSessionRetentionDays {
 			t.Fatalf("test value %d must differ from the default to prove the override", want)
 		}

@@ -22,6 +22,8 @@ period, so it inherits Hermes' guarantees rather than restating them:
 - one maintenance lock and a throttle per store, so a worker starting at the same
   moment cannot double-run it (20 hours here rather than Hermes' 24, so a daily tick
   never skips a day);
+- every session that still has a child is pinned first, so no prune deletes the
+  origin a live continuation's ``parent_session_id`` points to (``keep_parents``);
 - no VACUUM from here: the gateway and workers hold these stores while it runs, and
   Hermes VACUUMs each one when a process starts on it.
 
@@ -41,8 +43,10 @@ the failure reaches chat.
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -60,6 +64,9 @@ ROTATED_LOG_RE = re.compile(r"^[A-Za-z0-9_.-]+\.log\.[0-9]+$")
 SECONDS_PER_DAY = 86400
 WATCH_NAME = "Session retention"
 FAILED_PREFIX = f"⚠️ **{WATCH_NAME}:**"
+# The ids this job pinned, in each store's state_meta, so it only ever unpins its own.
+PIN_LEDGER_KEY = "kube_agents_retention_pins"
+SQLITE_TIMEOUT_SECONDS = 30
 # Hermes' error text goes inside one inline code span in chat; this bounds it.
 ERROR_SPAN_CHARS = 300
 # Hermes skips a store pruned less than min_interval_hours ago, timed from the
@@ -121,6 +128,61 @@ def prune_store(home: Path, days: int) -> dict:
             close()
 
 
+def keep_parents(home: Path) -> None:
+    """Pin every session that still has a child, and unpin the ones this job pinned that have none.
+
+    Readers here follow ``parent_session_id`` back to where a conversation
+    started (a compression continuation to its ``a2a-*`` origin, for one), and
+    Hermes' prune clears that link when it deletes the parent. A parent only
+    ages on its own rows, so a conversation still going long after it was
+    compressed would lose its origin. Hermes' prune skips pinned rows, so a pin
+    keeps the parent for as long as a child exists, and every prune honours it,
+    the ones Hermes runs at process start included. When the child goes, the
+    parent is unpinned on the next tick and ages out like any other session.
+
+    It sets the flag on the one row, not through ``set_session_pinned``, which
+    pins the whole lineage and unhides it. The ledger keeps it to its own pins:
+    a pin someone set by hand is never cleared here.
+    """
+    db_path = home / STATE_DB
+    if not db_path.is_file():
+        return
+    conn = sqlite3.connect(db_path, timeout=SQLITE_TIMEOUT_SECONDS, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (PIN_LEDGER_KEY,)).fetchone()
+        ledger = set(json.loads(row[0])) if row and row[0] else set()
+        parents = {
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT p.id FROM sessions p JOIN sessions c ON c.parent_session_id = p.id"
+            )
+        }
+        unpinned = {
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT p.id FROM sessions p JOIN sessions c ON c.parent_session_id = p.id"
+                " WHERE COALESCE(p.pinned, 0) = 0"
+            )
+        }
+        present = {r[0] for r in conn.execute("SELECT id FROM sessions") if r[0] in ledger}
+        release = (ledger & present) - parents
+        conn.executemany("UPDATE sessions SET pinned = 1 WHERE id = ?", [(i,) for i in sorted(unpinned)])
+        conn.executemany("UPDATE sessions SET pinned = 0 WHERE id = ?", [(i,) for i in sorted(release)])
+        ledger = ((ledger & present) - release) | unpinned
+        conn.execute(
+            "INSERT INTO state_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (PIN_LEDGER_KEY, json.dumps(sorted(ledger))),
+        )
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
 def remove_old_rotated_logs(home: Path, days: int, now: float) -> int:
     """Delete ``<name>.log.<n>`` under home/logs older than ``days``; return how many went."""
     logs = home / LOGS_DIR
@@ -159,6 +221,7 @@ def tick(agent_home: Path, *, now: float | None = None) -> list[str]:
         # Separate tries: one store's failure must not stop the rest, and a log
         # that cannot be removed is not a failed prune.
         try:
+            keep_parents(home)  # before the prune; if it fails, the store is not pruned
             result = prune_store(home, days)
             if result.get("error"):
                 lines.append(f"{FAILED_PREFIX} pruning {label(home, agent_home)} failed: `{span_safe(result['error'])}`")

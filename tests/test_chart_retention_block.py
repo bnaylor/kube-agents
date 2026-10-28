@@ -2,8 +2,8 @@
 
 The chart default is an empty map, which renders no block: the operator renders
 its own default retention (defaultSessionRetentionDays) when the CR has none.
-`sessionDays` renders only when set. The schema holds the CRD's bounds (1-365),
-so a value the API server would refuse fails the render instead. The
+`sessionDays` renders only when set. The schema holds the CRD's bounds
+(90-365), so a value the API server would refuse fails the render instead. The
 text-structural tests run everywhere; the render tests need a helm binary.
 
 Run: python3 -m unittest discover -s tests -p 'test_chart_retention_block.py' -v
@@ -72,13 +72,13 @@ class RetentionBlockRenderTest(unittest.TestCase):
         self.assertEqual(self._block_of(self._render("-f", self._values_file({"sessionDays": None}))), "ABSENT")
 
     def test_a_set_day_count_reaches_the_block(self):
-        for days in (1, 30, 365):
+        for days in (90, 180, 365):
             with self.subTest(days=days):
                 block = self._block_of(self._render("-f", self._values_file({"sessionDays": days})))
                 self.assertEqual(block, {"sessionDays": days})
 
     def test_values_the_crd_refuses_fail_the_render(self):
-        for bad in ({"sessionDays": 0}, {"sessionDays": 366}, {"sessionDays": "7"}, {"unknown": True}):
+        for bad in ({"sessionDays": 0}, {"sessionDays": 89}, {"sessionDays": 366}, {"sessionDays": "7"}, {"unknown": True}):
             with self.subTest(bad=bad):
                 proc = self._render("-f", self._values_file(bad))
                 self.assertNotEqual(proc.returncode, 0)

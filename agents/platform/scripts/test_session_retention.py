@@ -3,11 +3,13 @@
 real temporary directory."""
 
 import os
+import sqlite3
 import sys
 import tempfile
 import time
 import types
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -58,10 +60,33 @@ class RetentionTest(unittest.TestCase):
         self.addCleanup(modules.stop)
 
     def store(self, *parts):
+        """A real SQLite file with the columns of Hermes' schema the pin guard touches."""
         home = self.home.joinpath(*parts)
         home.mkdir(parents=True, exist_ok=True)
-        (home / session_retention.STATE_DB).write_text("")
+        with closing(sqlite3.connect(home / session_retention.STATE_DB)) as conn:
+            conn.executescript(
+                "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, parent_session_id TEXT,"
+                " pinned INTEGER NOT NULL DEFAULT 0);"
+                "CREATE TABLE IF NOT EXISTS state_meta (key TEXT PRIMARY KEY, value TEXT);"
+            )
         return home
+
+    def sessions(self, home, *rows):
+        """rows are (id, parent, pinned)."""
+        with closing(sqlite3.connect(home / session_retention.STATE_DB)) as conn:
+            conn.executemany("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?)", rows)
+            conn.commit()
+
+    def pinned(self, home):
+        with closing(sqlite3.connect(home / session_retention.STATE_DB)) as conn:
+            return {r[0] for r in conn.execute("SELECT id FROM sessions WHERE pinned = 1")}
+
+    def delete(self, home, session_id):
+        """What Hermes' prune does to a session and its children's link."""
+        with closing(sqlite3.connect(home / session_retention.STATE_DB)) as conn:
+            conn.execute("UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            conn.commit()
 
     def log(self, home, name, age_days, now):
         logs = home / session_retention.LOGS_DIR
@@ -130,6 +155,66 @@ class EveryStoreIsPruned(RetentionTest):
                 self.assertEqual([], FakeSessionDB.calls)
                 self.assertEqual(1, len(lines))
                 self.assertIn("retention_days", lines[0])
+
+
+class ParentsOfLiveSessionsAreKept(RetentionTest):
+    def test_a_parent_is_pinned_while_its_child_exists_and_released_after(self):
+        home = self.store()
+        self.sessions(home, ("a2a-root", None, 0), ("tip", "a2a-root", 0), ("alone", None, 0))
+        session_retention.tick(self.home)
+        self.assertEqual({"a2a-root"}, self.pinned(home))
+        self.delete(home, "tip")
+        session_retention.tick(self.home)
+        self.assertEqual(set(), self.pinned(home))
+
+    def test_a_chain_keeps_every_parent_and_unwinds_from_the_tip(self):
+        home = self.store("profiles", "platform")
+        self.sessions(home, ("a2a-root", None, 0), ("middle", "a2a-root", 0), ("tip", "middle", 0))
+        session_retention.tick(self.home)
+        self.assertEqual({"a2a-root", "middle"}, self.pinned(home))
+        self.delete(home, "tip")
+        session_retention.tick(self.home)
+        self.assertEqual({"a2a-root"}, self.pinned(home))
+
+    def test_a_pin_set_by_hand_is_never_cleared(self):
+        home = self.store()
+        self.sessions(home, ("kept-by-hand", None, 1), ("child", "kept-by-hand", 0))
+        session_retention.tick(self.home)
+        self.delete(home, "child")
+        session_retention.tick(self.home)
+        self.assertEqual({"kept-by-hand"}, self.pinned(home))
+
+    def test_a_pin_removed_by_hand_is_set_again_while_the_child_exists(self):
+        home = self.store()
+        self.sessions(home, ("root", None, 0), ("tip", "root", 0))
+        session_retention.tick(self.home)
+        self.sessions(home, ("root", None, 0))
+        session_retention.tick(self.home)
+        self.assertEqual({"root"}, self.pinned(home))
+
+    def test_the_pins_are_set_before_hermes_prunes(self):
+        home = self.store()
+        self.sessions(home, ("root", None, 0), ("tip", "root", 0))
+        seen = []
+        FakeSessionDB.results = {}
+        original = FakeSessionDB.maybe_auto_prune_and_vacuum
+
+        def prune(db, *args, **kwargs):
+            seen.append(self.pinned(home))
+            return original(db, *args, **kwargs)
+
+        with patch.object(FakeSessionDB, "maybe_auto_prune_and_vacuum", prune):
+            session_retention.tick(self.home)
+        self.assertEqual([{"root"}], seen)
+
+    def test_a_store_whose_pins_cannot_be_set_is_not_pruned(self):
+        self.store()
+        broken = self.store("profiles", "broken")
+        (broken / session_retention.STATE_DB).write_text("not a database")
+        lines = session_retention.tick(self.home)
+        self.assertEqual([self.home], [c[0].parent for c in FakeSessionDB.calls])
+        self.assertEqual(1, len(lines))
+        self.assertIn("profile `broken`", lines[0])
 
 
 class FailuresAreSaidAndContained(RetentionTest):

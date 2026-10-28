@@ -449,9 +449,23 @@ Hermes log backups (`<name>.log.<n>`) older than the period; the live log files 
 
 The period is the managed scope's `sessions.retention_days`, which the operator
 renders from `spec.harness.retention.sessionDays` (default 90, Hermes' own, so
-an upgrade deletes nothing it would not have deleted anyway). It is in the
-managed scope so that one period covers every profile and a profile cannot
-lengthen its own. A blocked kanban card needs no exemption: its worker starts a
+an upgrade deletes nothing it would not have deleted anyway, and for now also
+the minimum). It is in the managed scope so that one period covers every
+profile and a profile cannot lengthen its own.
+
+Before each prune it pins every session that another session still names as
+its parent, and unpins the ones it pinned whose children are gone. Some readers
+follow `parent_session_id` back to where a conversation started, a compression
+continuation to its origin among them, and a prune clears that link when it
+deletes the parent. A parent ages only on its own rows, so a conversation still
+going long after it was compressed would otherwise lose its origin. Hermes'
+prune skips pinned rows, the prunes it runs at process start included. The job
+sets the flag on the one row (Hermes' own pin command pins the whole lineage and
+unhides it), and keeps the ids it pinned in the store's `state_meta`, so a pin
+set by hand is never cleared. A chain unwinds one parent a day once its newest
+session is pruned. A store whose pins cannot be set is not pruned that day.
+
+A blocked kanban card needs no exemption: its worker starts a
 fresh session on every run and reads its context from the card. A chat thread
 whose session ended and then sat idle past the period starts a fresh session
 when someone replies. It runs at 05:50 UTC, after the workspace collector and
