@@ -6,7 +6,8 @@
 #
 # The sweep is not started by a conversation. The `oobe` cron job's scan stage
 # on the Planning Agent's profile files it once per install, together
-# with one audit card per Cluster Agent. Nothing a chat prompt says reaches that
+# with one audit card per Cluster Agent up to the first-run cap, which this
+# case pins at its maximum (below). Nothing a chat prompt says reaches that
 # path, so the prompt below only reads the board; the grade comes from the
 # stack and the verifiers.
 #

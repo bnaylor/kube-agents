@@ -1,13 +1,14 @@
 # First-Time Environment Discovery & Inventory Scan (`bootstrap-inventory-scan`)
 
 **Purpose:** The fleet half of first-time GKE environment discovery: enumerate the fleet, audit any
-cluster that has no Cluster Agent, and complete.
+cluster that has no Cluster Agent or is past the first-run cap, and complete.
 
 You do not fan out and you do not write the report. The onboarding gate (`bootstrap_scan_gate.py`
-and `bootstrap_handoff.py`, scripts) files one audit card per Cluster Agent itself, and once those
-cards settle it writes their structured `metadata`, with yours, into `/opt/data/INVENTORY.raw.md`
-and files the card that ranks it into the report delivered to chat as `/opt/data/INVENTORY.md`. Your
-job is the fleet list, the clusters no Cluster Agent covers, and the gaps.
+and `bootstrap_handoff.py`, scripts) files the audit cards itself, one per Cluster Agent up to the
+first-run cap; your card names any cluster past the cap, and you audit those. Once the cards settle
+it writes their structured `metadata`, with yours, into `/opt/data/INVENTORY.raw.md` and files the
+card that ranks it into the report delivered to chat as `/opt/data/INVENTORY.md`. Your job is the
+fleet list, the clusters no Cluster Agent card covers, and the gaps.
 
 ---
 

@@ -368,6 +368,13 @@ resource "null_resource" "sweep" {
       # proof: an orphaned one beside an operator's later cap would have that
       # cap removed. An empty sentinel matches nothing. A failed read stops the
       # apply here.
+      # Known limit: an orphaned sentinel beside an operator's cap of the same
+      # value reads as `bench`, and that cap is removed. It takes the trap's or
+      # the destroy's second exec (the sentinel's removal) failing after the
+      # first succeeded, then an operator writing exactly this stack's last
+      # value before the next run. The cap file cannot carry proof of its
+      # writer: the gate reads it as a bare integer, and anything beside the
+      # number would read as malformed and fall back to the default.
       cap="${local.cards_cap}"
       cap_read="$(agent sh -c 'if [ -e "$1" ]; then
           mark="$(cat "$1")" || exit 1

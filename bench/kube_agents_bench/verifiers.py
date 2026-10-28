@@ -3513,7 +3513,7 @@ class BootstrapFanoutVerifier(BaseVerifier):
     """Checks the cluster cards filed for the onboarding discovery sweep.
 
     The onboarding gate, a cron job, files the sweep card and one card per
-    Cluster Agent, so neither the transcript nor the harness's delegation
+    Cluster Agent up to the first-run cap, so neither the transcript nor the harness's delegation
     capture sees them; this reads the sweep, the ``bootstrap-inventory-cluster-*``
     cards created at or after it, and the Cluster Agent roster off the agent's
     disk (:mod:`kube_agents_bench.discovery`).

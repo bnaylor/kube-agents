@@ -57,6 +57,13 @@ CLUSTER_AUDIT_INSTRUCTIONS_PATHS = (
 HANDOFF_MARKER = ".bootstrap_handoff_filed"
 MARKER_FIELD = re.compile(r"^(\w+)=(\S+)$")
 MARKER_LINE = re.compile(r"^\s*(\w+)\s*=\s*(\S+)\s*$")
+# A Cluster Agent card's key as the gate builds it: the prefix and a profile
+# name, which cluster_agent_profile._validate holds to these characters. No
+# comma, so the marker's `carded=` list splits on one.
+CLUSTER_KEY = re.compile(rf"^{re.escape(CLUSTER_KEY_PREFIX)}[a-zA-Z0-9._-]+$")
+# What the marker's `carded=` holds when the sweep card listed no Cluster Agent:
+# not a key, so it reads as an empty set rather than as no `carded=` at all.
+CARDED_NONE = "-"
 BOARD_FILE = "kanban.db"
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
 
@@ -235,6 +242,28 @@ def marker_cap(marker: Path) -> int | None:
     except ValueError:  # not UTF-8
         return None
     return None if raw is None else _clamp_cap(raw, f"{marker}'s cap=")
+
+
+def carded_keys(marker: Path) -> frozenset[str] | None:
+    """The keys of the Cluster Agents the sweep card listed for cards (#3702), from the marker; None when it records none.
+
+    The gate records them when it files the sweep, and the hand-off files cards
+    for those agents only: the card told its worker to audit every other
+    cluster, so a profile that became ready since, or one that sorts into a
+    slot a failed or archived card left, must not get a card as well. None for
+    a sweep filed by an older build, or a marker that cannot be read, which
+    keeps the cap as the only bound. An entry that is not a cluster card key
+    is dropped rather than read as no list, so a damaged ``carded=`` narrows
+    the set and never widens it; at most FIRST_RUN_CLUSTER_CARDS_MAX are kept.
+    """
+    try:
+        raw = _read_marker(marker).get("carded")
+    except ValueError:  # not UTF-8
+        return None
+    if raw is None:
+        return None
+    keys = [k for k in raw.split(",") if CLUSTER_KEY.match(k)]
+    return frozenset(keys[:FIRST_RUN_CLUSTER_CARDS_MAX])
 
 
 def sweep_cluster_cards(data_dir: Path, marker: Path) -> int:
@@ -842,8 +871,10 @@ def _clamp_cap(raw: str, source: str) -> int:
     return value
 
 
-def file_cluster_cards(state: dict, roster: list, parse_task_id, cap: int | None = None) -> tuple[int, list]:
-    """File a card for every Cluster Agent on the roster that has none for this sweep.
+def file_cluster_cards(
+    state: dict, roster: list, parse_task_id, cap: int | None = None, carded: frozenset[str] | None = None
+) -> tuple[int, list]:
+    """File a card for each Cluster Agent on the roster that has none for this sweep, up to its cap.
 
     The gate, not the sweep's worker, is the one creator of these cards: asked
     to make the calls itself, the worker once completed saying it had fanned out
@@ -853,14 +884,17 @@ def file_cluster_cards(state: dict, roster: list, parse_task_id, cap: int | None
     a card someone archived is not filed again. With ``cap``, it stops once the
     sweep has that many cluster cards, so a roster that changes between ticks
     cannot file past the first-run cap the sweep was filed under (#3702); an agent it skips for the cap
-    is left to the sweep and is not counted as unfiled. Returns how many it
-    filed and the agents still without a card.
+    is left to the sweep and is not counted as unfiled. With ``carded``, the
+    keys the sweep card listed, it files for those agents only, and skips any
+    other the same way: a retry after a failed create, or a slot an archived
+    card left, goes to no profile the card already gave its worker. Returns how
+    many it filed and the agents still without a card.
     """
     have = {c["key"] for c in state["clusters"]} | state.get("archived_keys", set())
     stale = state.get("stale_keys", {})
     filed, unfiled = 0, []
     for agent in roster:
-        if agent["key"] in have:
+        if agent["key"] in have or (carded is not None and agent["key"] not in carded):
             continue
         if cap is not None and len(state["clusters"]) + filed >= cap:
             break
@@ -925,7 +959,9 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
         _log(f"sweep {sweep_id} or all of its cluster cards are archived; not handing off")
         return None
     agents = (roster() if callable(roster) else roster) or []
-    filed_now, unfiled = file_cluster_cards(state, agents, parse_task_id, cap=sweep_cluster_cards(data_dir, scan_marker))
+    filed_now, unfiled = file_cluster_cards(
+        state, agents, parse_task_id, cap=sweep_cluster_cards(data_dir, scan_marker), carded=carded_keys(scan_marker)
+    )
     if filed_now:
         # The cards just filed have not run; nothing is settled this tick.
         return None

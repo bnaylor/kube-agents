@@ -65,9 +65,9 @@ graph TD
     A -->|User Initiates Chat| D{"bootstrap_onboarding pre_llm_call Hook"}
 
     B -->|already filed / scanned / delivered?| B2{"skip / file card"}
-    B2 -->|no marker -> kanban_create assignee=platform| P["platform worker lists the fleet, audits agent-less clusters, completes"]
+    B2 -->|no marker -> kanban_create assignee=platform| P["platform worker lists the fleet, audits agent-less and past-cap clusters, completes"]
     P --> PM["Record card id in .bootstrap_scan_filed"]
-    B2 -->|marker present -> hand-off tick| HF["file each Cluster Agent's audit card if missing"]
+    B2 -->|marker present -> hand-off tick| HF["file each carded Cluster Agent's audit card if missing"]
     HF --> HO{"sweep done and cluster cards settled, or the time limit passed?"}
     HO -->|no| F["Silent (wait for the next tick)"]
     HO -->|yes, once per sweep| R["/opt/data/INVENTORY.raw.md from the cards' metadata (bootstrap_handoff.py)"]
@@ -135,7 +135,7 @@ Both cases converge on the same delivery path: the `no_agent` delivery job posts
    If the turn is not from a supported durable chat adapter (or, under `spec.mode: next`, an API-server turn with a bridge route, Rule 5), or no chat origin can be bound, the plugin writes **no** markers and returns `None`: that turn has nowhere to deliver a later report, so onboarding stays armed for the next durable chat turn. An API-server turn matching an eval seam request (Rule 5) is greeted but still writes no marker. `DURABLE_CHAT_PLATFORMS` is a positive allowlist; new adapters must opt in only after implementing persistent delivery.
 
 2. **Delivery job (each tick):** `INVENTORY.md` is still absent → the script emits nothing → silent run.
-3. **Scan completes:** the gate files the per-Cluster-Agent audit cards and the `platform` worker lists the fleet and completes; once the per-cluster cards settle, the scan job's hand-off writes `/opt/data/INVENTORY.raw.md` and files the prioritization card (or, if no cluster was audited, writes `INVENTORY.md` itself). That worker ranks the findings and writes `/opt/data/INVENTORY.md`. The scan job has not filed again this whole time, on `.bootstrap_scan_filed`.
+3. **Scan completes:** the gate files the per-Cluster-Agent audit cards, up to the first-run cap, and the `platform` worker lists the fleet, audits the clusters past the cap, and completes; once the per-cluster cards settle, the scan job's hand-off writes `/opt/data/INVENTORY.raw.md` and files the prioritization card (or, if no cluster was audited, writes `INVENTORY.md` itself). That worker ranks the findings and writes `/opt/data/INVENTORY.md`. The scan job has not filed again this whole time, on `.bootstrap_scan_filed`.
 4. **Next delivery tick:** both `INVENTORY.md` and `.user_aligned` exist and `.bootstrap_completed` is absent → the script reads the report, registers the sweep's findings in the findings queue, claims delivery by creating `.bootstrap_completed` with `O_EXCL`, marks the report's items shown in the findings queue, posts the card built from the files beside the report (through the Slack relay, or through the gateway under `spec.mode: next`) and prints the audits note, or prints the report as text (reshaped for Slack with `KAGE_SLACK_UX` on) when there is no card, and the scheduler delivers what was printed to the bound origin chat. `_cleanup` then archives the report as `INVENTORY.delivered.md`. The first delivery tick at least `RETIRE_AFTER_SECONDS` later finds `.bootstrap_completed`, posts nothing, and removes the two disabled onboarding entries (`_retire_jobs`); `oobe` removes itself once its audits stage is done.
 
 ```mermaid

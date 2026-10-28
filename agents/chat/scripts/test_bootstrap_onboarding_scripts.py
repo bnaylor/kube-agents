@@ -2435,6 +2435,7 @@ class ScanGateTest(unittest.TestCase):
         self.assertEqual(len(filed), 1)
         self.assertIn("uncarded=3\n", (self.d / SCAN_FILED).read_text())
         self.assertIn("cap=2\n", (self.d / SCAN_FILED).read_text())
+        self.assertIn("carded=" + ",".join(a["key"] for a in ready[:2]) + "\n", (self.d / SCAN_FILED).read_text())
         self.assertEqual(bootstrap_scan_gate.bootstrap_handoff.uncarded_agents(self.d / SCAN_FILED), len(ready) - 2)
 
     def test_a_filed_sweep_keeps_the_cap_it_was_filed_under(self):
@@ -2446,6 +2447,38 @@ class ScanGateTest(unittest.TestCase):
         with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), contextlib.redirect_stderr(io.StringIO()):
             roster = bootstrap_scan_gate.cluster_agents()
         self.assertEqual([a["name"] for a in roster], sorted(names)[:2])
+
+    def test_a_filed_sweep_cards_only_the_agents_its_marker_lists(self):
+        # #3702: a profile that sorts first but was not ready when the sweep was
+        # filed is the sweep worker's, even with a slot free under the cap.
+        names = sorted(self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(4))
+        prefix = bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX
+        (self.d / SCAN_FILED).write_text(
+            f"task_id=t_sweep\nfiled_at=1\ncap=3\ncarded={prefix}{names[1]},{prefix}{names[2]}\n"
+        )
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), contextlib.redirect_stderr(io.StringIO()):
+            roster = bootstrap_scan_gate.cluster_agents()
+        self.assertEqual([a["name"] for a in roster], names[1:3])
+
+    def test_filing_the_sweep_lists_the_roster_once(self):
+        # A second listing could fail or see another roster; the marker records
+        # what the card listed.
+        agents = [{"name": f"cluster-c{i}", "key": f"{bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX}cluster-c{i}",
+                   "title": f"t{i}", "cluster_label": f"`c{i}`"} for i in range(5)]
+        (self.d / bootstrap_scan_gate.bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("2")
+        kanban = types.ModuleType("hermes_cli.kanban")
+        kanban.run_slash = lambda cmd: '{"id": "t_real"}'
+        modules = {"hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.kanban": kanban}
+        listing = mock.Mock(side_effect=[agents, agents[:1], []])
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), \
+                mock.patch.dict(sys.modules, modules), \
+                mock.patch.object(bootstrap_scan_gate, "cluster_agents", listing), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self._orig(self.d), "t_real")
+        listing.assert_called_once_with(capped=False)
+        marker = (self.d / SCAN_FILED).read_text()
+        self.assertIn("uncarded=3\n", marker)
+        self.assertIn(f"carded={agents[0]['key']},{agents[1]['key']}\n", marker)
 
     def test_a_roster_under_the_cap_is_listed_whole(self):
         names = [self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(3)]

@@ -666,6 +666,47 @@ class HandOffTest(unittest.TestCase):
         # A sweep filed by an older build records no cap= and keeps the file's.
         self.assertEqual(len(self._mid_sweep("")), 4)
 
+    def _carded_run(self, carded, clusters, roster, cap=3):
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\ncap={cap}\ncarded={carded}\n")
+        self.board.unlink(missing_ok=True)
+        _board(self.board, clusters=clusters)
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster([self._agent(t) for t in roster]))
+        return [shlex.split(cmd)[shlex.split(cmd).index("--idempotency-key") + 1] for cmd in sent]
+
+    def test_a_failed_carded_create_is_retried_and_a_newly_ready_profile_gets_none(self):
+        # #3702: t_3's create failed on the filing tick, and t_0, which sorts
+        # first, has become ready since. The sweep card gave t_0 to its worker,
+        # so the free slot goes to t_3 alone.
+        carded = ",".join(f"{h.CLUSTER_KEY_PREFIX}t_{i}" for i in (1, 2, 3))
+        running = [(f"t_{i}", "running", None, "") for i in (1, 2)]
+        self.assertEqual(self._carded_run(carded, running, ["t_0", "t_1", "t_2", "t_3"]),
+                         [f"{h.CLUSTER_KEY_PREFIX}t_3"])
+
+    def test_an_archived_carded_card_frees_no_slot_for_an_unlisted_profile(self):
+        carded = f"{h.CLUSTER_KEY_PREFIX}t_1,{h.CLUSTER_KEY_PREFIX}t_2"
+        clusters = [("t_1", "running", None, ""), ("t_2", "archived", None, "")]
+        self.assertEqual(self._carded_run(carded, clusters, ["t_0", "t_1", "t_2"], cap=2), [])
+
+    def test_a_malformed_carded_list_narrows_and_never_widens(self):
+        # Entries that are not cluster card keys are dropped; a list with none
+        # left files nothing rather than falling back to the cap alone.
+        roster = ["t_0", "t_1", "t_2"]
+        self.assertEqual(self._carded_run(f"garbage,,bootstrap-inventory-other-t_0,{h.CLUSTER_KEY_PREFIX}t_1", [], roster),
+                         [f"{h.CLUSTER_KEY_PREFIX}t_1"])
+        for carded in ("!!", h.CARDED_NONE, f"{h.CLUSTER_KEY_PREFIX}t_0;rm"):
+            with self.subTest(carded=carded):
+                self.assertEqual(self._carded_run(carded, [], roster), [])
+
+    def test_a_marker_without_carded_keeps_the_cap_as_the_only_bound(self):
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\ncap=2\n")
+        _board(self.board, clusters=[])
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster([self._agent(f"t_{i}") for i in range(4)]))
+        self.assertEqual(len(sent), 2)
+
     def test_a_roster_under_the_cap_files_every_card(self):
         _board(self.board, clusters=[])
         sent = []
@@ -943,6 +984,23 @@ class FirstRunClusterCardsTest(unittest.TestCase):
             self.assertEqual(h.sweep_cluster_cards(self.d, marker), 20)
             marker.write_bytes(b"\xff\xfecap=2\n")
             self.assertEqual(h.sweep_cluster_cards(self.d, marker), 20)
+
+    def test_the_carded_keys_are_read_from_the_marker(self):
+        marker = self.d / "scan_filed"
+        key = h.CLUSTER_KEY_PREFIX
+        for content, want in (("task_id=t\n", None),
+                              (f"task_id=t\ncarded={key}a,{key}b.c\n", {f"{key}a", f"{key}b.c"}),
+                              (f"task_id=t\ncarded={key}a,x,{key}\n", {f"{key}a"}),
+                              (f"task_id=t\ncarded={h.CARDED_NONE}\n", set())):
+            with self.subTest(content=content):
+                marker.write_text(content)
+                got = h.carded_keys(marker)
+                self.assertEqual(got if got is None else set(got), want)
+        many = ",".join(f"{key}p{i:03d}" for i in range(h.FIRST_RUN_CLUSTER_CARDS_MAX + 5))
+        marker.write_text(f"task_id=t\ncarded={many}\n")
+        self.assertEqual(len(h.carded_keys(marker)), h.FIRST_RUN_CLUSTER_CARDS_MAX)
+        marker.write_bytes(b"\xff\xfecarded=x\n")
+        self.assertIsNone(h.carded_keys(marker))
 
     def test_a_marker_that_is_not_utf8_records_no_uncarded_agents(self):
         # _read_marker raises UnicodeDecodeError, a ValueError, which this read catches.
