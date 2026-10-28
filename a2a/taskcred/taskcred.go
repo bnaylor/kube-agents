@@ -4,11 +4,12 @@
 // The auth callout mints a profile worker's grants from what the cluster
 // attests about the connecting pod, and the task is nowhere in that. A
 // credential from the dispatcher, the one component that checks the grant and
-// picks the pod, is how the task gets into the decision. Two verifiers read it,
-// told apart by audience: the callout, which narrows a worker's second bus
-// connection to that task's subjects (AudienceNATS), and the credential proxy,
-// which confines the clusters a task's tools reach (AudienceCredentialProxy).
-// A token minted for one is refused by the other.
+// picks the pod, is how the task gets into the decision. Verifiers are told
+// apart by audience. The callout reads AudienceNATS and narrows a worker's
+// second bus connection to that task's subjects. AudienceCredentialProxy is for
+// the credential proxy, which will confine the clusters a task's tools reach;
+// that verifier is planned for a later #3889 PR and doesn't exist yet. A token
+// minted for one audience is refused by the other.
 //
 // The credential authenticates nothing by itself. Its pod and pod UID must
 // match a pod the cluster attests on the same connection, and its profile and
@@ -73,6 +74,12 @@ const (
 	// and a cluster name 40.
 	maxPodUID      = 64
 	maxTargetField = 128
+
+	// jwtClaimsVersion is the nats.version jwt/v2 writes into every claim it
+	// encodes (its unexported libVersion, 2 for the v2 library). A credential
+	// minted by Mint always carries it; one without it, or with another
+	// value, wasn't.
+	jwtClaimsVersion = 2
 
 	// nonceBytes is the randomness in each credential's subject; see Mint.
 	nonceBytes = 16
@@ -175,7 +182,10 @@ type Claims struct {
 // strictly: an unknown field is refused rather than ignored, since a field a
 // verifier skips is a constraint someone believes is enforced.
 type payload struct {
-	Type    string  `json:"type"`
+	Type string `json:"type"`
+	// Version is jwt/v2's own: GenericClaims.Encode writes nats.version as
+	// the library's JWT version (updateVersion), so every credential Mint
+	// produces carries it, and Verify requires exactly that value.
 	Version int     `json:"version"`
 	Task    string  `json:"task"`
 	Profile string  `json:"profile"`
@@ -291,6 +301,9 @@ func Verify(token string, trusted []string, aud Audience, now time.Time, maxLife
 	}
 	if p.Type != TokenType {
 		return Claims{}, fmt.Errorf("token type %q is not a task credential", p.Type)
+	}
+	if p.Version != jwtClaimsVersion {
+		return Claims{}, fmt.Errorf("task credential claims version %d, want %d (jwt/v2's)", p.Version, jwtClaimsVersion)
 	}
 
 	// aud is known (checked first thing), so equality also refuses a

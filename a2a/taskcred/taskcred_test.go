@@ -512,3 +512,34 @@ func TestACredentialSpanningMoreThanTheCeilingIsRefused(t *testing.T) {
 		t.Errorf("a span inside the ceiling plus skew was refused: %v", err)
 	}
 }
+
+// nats.version is written by jwt/v2 on every Encode, so Mint's credentials
+// always carry 2; Verify requires exactly that. Hand-signed with a trusted key,
+// so only the version check stands between each variant and acceptance.
+func TestTheClaimsVersionIsJWTv2s(t *testing.T) {
+	kp, pub := signingKey(t)
+	now := time.Now()
+	parts := strings.Split(mint(t, kp, validClaims(now)), ".")
+	raw, _ := base64.RawURLEncoding.DecodeString(parts[1])
+	if !strings.Contains(string(raw), `"version":2`) {
+		t.Fatalf("a minted credential's payload carries no version 2: %s", raw)
+	}
+	base := fmt.Sprintf(`{"jti":"J","iat":%d,"iss":%q,"sub":"nonce","aud":"nats","exp":%d,`+
+		`"nats":{"type":"kube-agents-task","version":2,"task":"task-1","profile":"auditor","tier":"read","pod":"auditor-read-x7k2p","pod_uid":"uid-1"}}`,
+		now.Unix(), pub, now.Add(10*time.Minute).Unix())
+	if _, err := Verify(signRaw(t, kp, jwt.AlgorithmNkey, base), []string{pub}, AudienceNATS, now, testLifetime, testSkew); err != nil {
+		t.Fatalf("the version-2 control was refused: %v", err)
+	}
+	for name, repl := range map[string]string{
+		"version 1":    `"version":1,`,
+		"version 3":    `"version":3,`,
+		"no version":   ``,
+		"a string":     `"version":"2",`,
+		"a fractional": `"version":2.5,`,
+	} {
+		payload := strings.Replace(base, `"version":2,`, repl, 1)
+		if _, err := Verify(signRaw(t, kp, jwt.AlgorithmNkey, payload), []string{pub}, AudienceNATS, now, testLifetime, testSkew); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

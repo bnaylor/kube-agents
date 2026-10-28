@@ -170,12 +170,30 @@ func TestAnUnownedTaskSigningSecretIsRefused(t *testing.T) {
 // task-signing Secret or carries the seed. Until the dispatcher exists,
 // nothing mounts it at all.
 func TestTheTaskSigningKeyReachesTheCalloutAsItsPublicHalfOnly(t *testing.T) {
-	r, cl, _ := taskSigningTestReconciler(t)
+	// The MCP door renders only with its env var set.
+	t.Setenv(a2aMCPDoorEnvVar, "true")
+	r, cl, agent := taskSigningTestReconciler(t)
 	ctx := context.Background()
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
 	for i := 0; i < 2; i++ {
 		if _, err := r.Reconcile(ctx, req); err != nil {
 			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	// The gateway Deployment and the provision Job are held until a callout
+	// replica reports serving, which the fake client never fills in. Without
+	// this the walk below would pass on their absence.
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
+
+	// The workloads the walk is about must exist before their absence of a
+	// reference means anything.
+	for what, obj := range map[string]client.Object{
+		"A2A gateway Deployment": &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}},
+		"MCP Deployment":         &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPName(agent), Namespace: agent.Namespace}},
+		"provision Job":          &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: buildA2AProvisionJob(agent).Name, Namespace: agent.Namespace}},
+	} {
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+			t.Fatalf("the %s was not rendered, so the walk below would pass on its absence: %v", what, err)
 		}
 	}
 
