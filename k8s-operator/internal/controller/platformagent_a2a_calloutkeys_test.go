@@ -17,12 +17,15 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/nats-io/nkeys"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 func calloutKeysSecret(data map[string][]byte) *corev1.Secret {
@@ -133,4 +136,50 @@ func TestKeysOfTheWrongTypeAreRefused(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Only a Secret this PlatformAgent controls is read or repaired, as for the
+// door's token. One at the keys' name that something else created is refused,
+// whether its seeds are valid or not, and left as it was; an owned Secret that
+// is incomplete is still repaired as a set.
+func TestTheCalloutKeysSecretIsOnlyReadWhenOwned(t *testing.T) {
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	_, valid, err := generateA2ACalloutKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string]map[string][]byte{
+		"valid seeds":   valid,
+		"corrupt seeds": {"issuer-seed": []byte("not a seed")},
+	} {
+		t.Run("an unowned Secret with "+name+" is refused", func(t *testing.T) {
+			planted := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}, Data: data}
+			r, cl := mcpTestReconciler(t, planted)
+			keys, err := r.ensureA2ACalloutKeysSecret(ctx, agent)
+			if err == nil || !strings.Contains(err.Error(), "refusing to adopt unowned Secret") {
+				t.Fatalf("an unowned callout keys Secret was taken (keys %v, err %v)", keys != nil, err)
+			}
+			after := &corev1.Secret{}
+			if err := cl.Get(ctx, types.NamespacedName{Name: planted.Name, Namespace: planted.Namespace}, after); err != nil {
+				t.Fatal(err)
+			}
+			if len(after.Data) != len(data) || metav1.IsControlledBy(after, agent) {
+				t.Error("the unowned Secret was changed")
+			}
+		})
+	}
+
+	t.Run("an owned, incomplete Secret is repaired", func(t *testing.T) {
+		owned := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace},
+			Data: map[string][]byte{"issuer-seed": []byte("not a seed")}}
+		if err := ctrl.SetControllerReference(agent, owned, setupScheme()); err != nil {
+			t.Fatal(err)
+		}
+		r, _ := mcpTestReconciler(t, owned)
+		keys, err := r.ensureA2ACalloutKeysSecret(ctx, agent)
+		if err != nil || keys == nil {
+			t.Fatalf("an owned, incomplete Secret was not repaired: %v", err)
+		}
+	})
 }
