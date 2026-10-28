@@ -990,8 +990,9 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         executor narrowing is required to call it (the session through
         `executorGrants`), so one that stopped would not silently fall out of
         what is read. A profile pod's own connection (`profileWorkerGrants`,
-        through `profileGrants`) holds no task-plane grant since #3889; it is
-        read too, so a task-plane publish added there is caught.
+        through `profileGrants`) keeps its profile-wide task plane until
+        #3889's worker PR removes it; it is read too, so a task-plane publish
+        added there is caught.
         """
         sessions = h.text("a2a_session_grants")
         body = h.go_function_body(sessions, "executorTaskGrants")
