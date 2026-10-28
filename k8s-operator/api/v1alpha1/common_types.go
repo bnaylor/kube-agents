@@ -1028,7 +1028,7 @@ type DeploymentSpec struct {
 	// ServiceAccount token projection for the "a2a-bus" audience, or a reference
 	// to one of the Secrets the operator renders bus credentials into
 	// (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys,
-	// <agent>-a2a-nats-tls, <agent>-a2a-nats-ca),
+	// <agent>-a2a-nats-tls, <agent>-a2a-nats-ca, <agent>-a2a-task-signing-key),
 	// as either a secret volume or a projected secret source. The refusal is on
 	// the name and the shape of the source, not on what a given Secret happens to
 	// hold at the time. Reading those Secrets through env is not refused here. On
@@ -1046,7 +1046,8 @@ type DeploymentSpec struct {
 	// The same reserved names and reserved sources as SidecarVolumes are refused
 	// at admission -- a ServiceAccount token projection for the "a2a-bus"
 	// audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config,
-	// <agent>-a2a-callout-keys, <agent>-a2a-nats-tls or <agent>-a2a-nats-ca -- and
+	// <agent>-a2a-callout-keys, <agent>-a2a-nats-tls, <agent>-a2a-nats-ca or
+	// <agent>-a2a-task-signing-key -- and
 	// dropped from the render on an install
 	// running the A2A surface.
 	// +listType=map

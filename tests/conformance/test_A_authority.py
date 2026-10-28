@@ -1212,10 +1212,11 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
                 f"addressee's in subject",
             )
         # The task-plane half, the per-session consumer's read filter among
-        # it, is built by executorGrants, which AgentProfile pods share
-        # (gke-labs#2469). The session reaches it only as
-        # executorGrants(pod, pod), and inside it every TaskInSubject names
-        # the addressee argument, so the session's calls still name pod.
+        # it, is built by executorTaskGrants, which AgentProfile pods share
+        # (gke-labs#2469, and the task connection since #3889). The session
+        # reaches it only as executorGrants(pod, pod), a wrapper passing "*"
+        # for the task, and inside executorTaskGrants every TaskInSubject
+        # names the addressee argument, so the session's calls still name pod.
         self.assertEqual(
             ["pod, pod"],
             [a.strip() for a in re.findall(r"executorGrants\(([^)]*)\)", body)],

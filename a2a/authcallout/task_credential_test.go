@@ -637,12 +637,20 @@ func TestATaskConnectionReconnectsWithTheSameCredentialAfterGrantTTL(t *testing.
 }
 
 func TestParseTaskCredentialMaxLifetime(t *testing.T) {
-	for raw, want := range map[string]time.Duration{"": 0, "6h0m0s": 6 * time.Hour, "1m0s": time.Minute, "90m": 90 * time.Minute} {
+	for raw, want := range map[string]time.Duration{
+		"": 0, "6h0m0s": 6 * time.Hour, "1m0s": time.Minute, "90m": 90 * time.Minute,
+		// Trimmed: whitespace alone is unset, and padding doesn't make a
+		// value unusable.
+		"   ": 0, "\n": 0, "6h0m0s\n": 6 * time.Hour, " 6h ": 6 * time.Hour,
+		// The ceiling itself is usable.
+		"168h": 168 * time.Hour,
+	} {
 		if got, err := ParseTaskCredentialMaxLifetime(raw); err != nil || got != want {
 			t.Errorf("%q = %v, %v; want %v", raw, got, err, want)
 		}
 	}
-	for _, raw := range []string{"6", "six hours", "0s", "-1h"} {
+	// Past the 7-day ceiling, and near time.Duration's maximum.
+	for _, raw := range []string{"6", "six hours", "0s", "-1h", "168h1s", "2562047h"} {
 		if got, err := ParseTaskCredentialMaxLifetime(raw); err == nil || !strings.Contains(err.Error(), "A2A_TASK_CREDENTIAL_MAX_LIFETIME") {
 			t.Errorf("%q = %v, %v; want an error naming the variable", raw, got, err)
 		}
@@ -655,7 +663,7 @@ func TestParseTaskCredentialMaxLifetime(t *testing.T) {
 // default is never applied in its place.
 func TestAnUnusableLifetimeSettingRefusesTaskCredentialsOnly(t *testing.T) {
 	kp, pub := taskSigningKey(t)
-	for _, raw := range []string{"six hours", "0s"} {
+	for _, raw := range []string{"six hours", "0s", "168h1s"} {
 		t.Run(raw, func(t *testing.T) {
 			d, perr := ParseTaskCredentialMaxLifetime(raw)
 			h := startHarness(t, profileMap, profileTokens(), withTaskSigningKeys(pub), withTaskLifetime(d, perr))

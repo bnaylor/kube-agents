@@ -71,6 +71,10 @@ const (
 	// defaultTaskCredentialMaxLifetime bounds how far out a task
 	// credential's expiry may be. See Config.TaskCredentialMaxLifetime.
 	defaultTaskCredentialMaxLifetime = 6 * time.Hour
+
+	// maxTaskCredentialMaxLifetime is the most TaskCredentialMaxLifetime may
+	// be set to; see ParseTaskCredentialMaxLifetime.
+	maxTaskCredentialMaxLifetime = 7 * 24 * time.Hour
 )
 
 // Config is what the callout needs to answer.
@@ -162,6 +166,9 @@ const envTaskCredentialMaxLifetimeName = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
 // an error, which the caller passes on as Config.TaskCredentialMaxLifetimeInvalid
 // rather than stopping: see that field.
 func ParseTaskCredentialMaxLifetime(raw string) (time.Duration, error) {
+	// Trimmed like the other rendered settings: a value written through a
+	// ConfigMap or by hand may carry a newline, and whitespace alone is unset.
+	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return 0, nil
 	}
@@ -171,6 +178,13 @@ func ParseTaskCredentialMaxLifetime(raw string) (time.Duration, error) {
 	}
 	if d <= 0 {
 		return 0, fmt.Errorf("%s=%q is not positive", envTaskCredentialMaxLifetimeName, raw)
+	}
+	// A ceiling, so a typo can't make credentials good for years, and so the
+	// exp arithmetic in taskcred.Verify (maxLifetime plus skew) stays far
+	// from time.Duration's ~292-year overflow. 7 days is well above #4121's
+	// own maximum (21600s), so it bounds mistakes, not configurations.
+	if d > maxTaskCredentialMaxLifetime {
+		return 0, fmt.Errorf("%s=%q is above the %s ceiling", envTaskCredentialMaxLifetimeName, raw, maxTaskCredentialMaxLifetime)
 	}
 	return d, nil
 }

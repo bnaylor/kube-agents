@@ -185,10 +185,10 @@ func profileWorkerGrants(profile, tier, pod string) Grants {
 }
 
 // profileTaskGrants is a worker's task connection: an executor's grants exact
-// on one task of its profile, the events publish and the pod's own three
+// on one task of its profile, the events publish and the task's own three
 // consumers (origin, follow-ups, and the events reader the adapter uses to see
-// whether a task already has a terminal before it runs it), and the pod's
-// inbox. No hand-off, lease or topic grant: the pod connection holds those.
+// whether a task already has a terminal before it runs it), and the task's
+// inbox, all named under the task's stem (below). No hand-off, lease or topic grant: the pod connection holds those.
 // The task comes from a verified credential (Service.verifyTaskCredential) and
 // the profile from the attested identity's map entry, never from the
 // credential alone.

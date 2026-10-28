@@ -334,6 +334,15 @@ func (r *PlatformAgentReconciler) ensureA2ATaskSigningKeySecret(ctx context.Cont
 	existing := &corev1.Secret{}
 	err := r.a2aReader().Get(ctx, name, existing)
 	if err == nil {
+		// Not ours: refused before it is read, as ensureA2ADoorTokenSecret
+		// does. Adopting it would let whoever created a Secret at this name
+		// choose the task-signing seed (and so mint task credentials the
+		// callout honours), and repairing it would overwrite somebody
+		// else's object. Only a Secret this PlatformAgent controls is read
+		// or repaired.
+		if !metav1.IsControlledBy(existing, agent) {
+			return nil, fmt.Errorf("refusing to adopt unowned Secret %s/%s as the A2A task-signing key; delete it, or give it a controller reference to this PlatformAgent", name.Namespace, name.Name)
+		}
 		if key, ok := readA2ATaskSigningKey(existing); ok {
 			return key, nil
 		}

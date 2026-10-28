@@ -106,12 +106,17 @@ func TestTheTaskSigningSecretIsReadFromItsSeedAlone(t *testing.T) {
 		}
 	}
 
+	// An OWNED corrupt Secret is repaired as a set.
 	r, cl, agent := taskSigningTestReconciler(t)
 	ctx := context.Background()
-	if err := cl.Create(ctx, &corev1.Secret{
+	owned := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-a2a-task-signing-key", Namespace: "test-ns"},
 		Data:       map[string][]byte{a2aTaskSigningSeedKey: acctSeed},
-	}); err != nil {
+	}
+	if err := ctrl.SetControllerReference(agent, owned, r.Scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Create(ctx, owned); err != nil {
 		t.Fatal(err)
 	}
 	repaired, err := r.ensureA2ATaskSigningKeySecret(ctx, agent)
@@ -120,6 +125,43 @@ func TestTheTaskSigningSecretIsReadFromItsSeedAlone(t *testing.T) {
 	}
 	if !nkeys.IsValidPublicClusterKey(repaired.Public) {
 		t.Errorf("the repair produced %q, not a cluster key", repaired.Public)
+	}
+}
+
+// A Secret at the name that this PlatformAgent doesn't control is refused
+// before it is read: neither a valid seed in it (which would let its author
+// choose the key) nor a corrupt one (which a repair would overwrite) is used.
+func TestAnUnownedTaskSigningSecretIsRefused(t *testing.T) {
+	_, valid, err := generateA2ATaskSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string]map[string][]byte{
+		"a valid seed":   valid,
+		"a corrupt seed": {a2aTaskSigningSeedKey: []byte("garbage")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, cl, agent := taskSigningTestReconciler(t)
+			ctx := context.Background()
+			planted := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent-a2a-task-signing-key", Namespace: "test-ns"},
+				Data:       data,
+			}
+			if err := cl.Create(ctx, planted); err != nil {
+				t.Fatal(err)
+			}
+			key, err := r.ensureA2ATaskSigningKeySecret(ctx, agent)
+			if err == nil || !strings.Contains(err.Error(), "refusing to adopt unowned Secret test-ns/test-agent-a2a-task-signing-key") {
+				t.Fatalf("ensure = %+v, %v; want the unowned-Secret refusal", key, err)
+			}
+			after := &corev1.Secret{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(planted), after); err != nil {
+				t.Fatal(err)
+			}
+			if string(after.Data[a2aTaskSigningSeedKey]) != string(data[a2aTaskSigningSeedKey]) {
+				t.Error("the unowned Secret was rewritten")
+			}
+		})
 	}
 }
 
