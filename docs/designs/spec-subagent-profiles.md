@@ -324,8 +324,16 @@ What the operator renders per profile, as built (amended 10/6):
   token and a task credential as the password.
   The dispatcher signs the credential (`a2a/taskcred`), and the callout refuses it unless its
   pod name and UID are the pod the token is bound to, and its profile and tier are the
-  entry's. The task connection gets that one task's `.events` publish and its `.in` and
-  `.events` consumers, filtered exactly on the task, and its JWT expires with the credential.
+  entry's. The task connection gets that one task's `.events` publish and its three
+  consumers, filtered exactly on the task. They and its inbox are named for the task, not the
+  pod (`<pod>_<task>-origin`, `-in`, `-events`, and `_INBOX.<pod>_<task>`), because a
+  consumer's info, pull and delete subjects carry only its name, and a pod-named consumer would
+  be reachable from the pod's next task. A credential may run to the callout's maximum task
+  lifetime, measured both from now and from its issue time. That is 6h unless the operator sets
+  it from the profile deadline cap, and it can exceed the grant TTL. A setting the callout
+  can't use refuses every task credential, never falling back to 6h, and the callout keeps
+  serving everything else. The connection's JWT still expires at the earlier of the credential
+  and the grant TTL, and the worker reconnects with the same credential.
   The password carries the credential because the server copies CONNECT's `jwt` field into
   its `$SYS` advisories and `connz`, and a refused connection would publish it. The operator
   generates the task-signing key beside the callout's keys, in a Secret only the dispatcher

@@ -10,6 +10,7 @@ import (
 
 	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nats-io/nkeys"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -28,6 +29,13 @@ const (
 
 	// auditorPod1UID is profileTokens' attested UID for auditorPod1.
 	auditorPod1UID = "uid-p1"
+)
+
+// stemOne and stemTwo are auditorPod1's task connections' consumer stems,
+// which also name their inboxes.
+var (
+	stemOne = taskcred.ConsumerStem(auditorPod1, taskOne)
+	stemTwo = taskcred.ConsumerStem(auditorPod1, taskTwo)
 )
 
 func taskSigningKey(t *testing.T) (nkeys.KeyPair, string) {
@@ -115,7 +123,7 @@ func TestATaskCredentialMustBeThisConnections(t *testing.T) {
 		{"another pod UID", taskToken(t, kp, func(c *taskcred.Claims) { c.PodUID = "uid-p2" }), "pod UID"},
 		{"another profile", taskToken(t, kp, func(c *taskcred.Claims) { c.Profile = cluster }), "profile"},
 		{"another tier", taskToken(t, kp, func(c *taskcred.Claims) { c.Tier = "unattended" }), "tier"},
-		{"past GrantTTL", taskToken(t, kp, func(c *taskcred.Claims) { c.Expires = time.Now().Add(2 * time.Hour) }), "ceiling"},
+		{"past the max lifetime", taskToken(t, kp, func(c *taskcred.Claims) { c.Expires = time.Now().Add(defaultTaskCredentialMaxLifetime + time.Hour) }), "ceiling"},
 		{"an untrusted key", taskToken(t, other, nil), "not a trusted task-signing key"},
 		{"the proxy audience", taskToken(t, kp, func(c *taskcred.Claims) { c.Audience = taskcred.AudienceCredentialProxy }), "credential-proxy"},
 		{"not a credential", "not-a-jwt", "not a JWT"},
@@ -233,11 +241,11 @@ func TestAValidTaskCredentialGrantsThatTaskOnly(t *testing.T) {
 
 	for _, want := range []string{
 		lib.TaskEventsSubject(auditor, taskOne),
-		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerOrigin)) + "." + lib.TaskInSubject(auditor, taskOne),
-		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerIn)) + "." + lib.TaskInSubject(auditor, taskOne),
-		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerEvents)) + "." + lib.TaskEventsSubject(auditor, taskOne),
-		consumerSubject("MSG.NEXT", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerIn)),
-		"_INBOX." + auditorPod1 + ".reply",
+		consumerSubject("CREATE", lib.SessionConsumerName(stemOne, lib.SessionConsumerOrigin)) + "." + lib.TaskInSubject(auditor, taskOne),
+		consumerSubject("CREATE", lib.SessionConsumerName(stemOne, lib.SessionConsumerIn)) + "." + lib.TaskInSubject(auditor, taskOne),
+		consumerSubject("CREATE", lib.SessionConsumerName(stemOne, lib.SessionConsumerEvents)) + "." + lib.TaskEventsSubject(auditor, taskOne),
+		consumerSubject("MSG.NEXT", lib.SessionConsumerName(stemOne, lib.SessionConsumerIn)),
+		"_INBOX." + stemOne + ".reply",
 	} {
 		if !grantsCover(pubs, want) {
 			t.Errorf("publish %s is not granted; the task connection needs it", want)
@@ -246,7 +254,7 @@ func TestAValidTaskCredentialGrantsThatTaskOnly(t *testing.T) {
 	for _, refused := range []string{
 		lib.TaskEventsSubject(auditor, taskTwo),
 		lib.TaskInSubject(auditor, taskOne),
-		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerIn)) + "." + lib.TaskInSubject(auditor, taskTwo),
+		consumerSubject("CREATE", lib.SessionConsumerName(stemOne, lib.SessionConsumerIn)) + "." + lib.TaskInSubject(auditor, taskTwo),
 		lib.DispatchAcceptSubject(auditor, "read", auditorPod1),
 		lib.DispatchLeaseSubject(auditor, "read", auditorPod1),
 		"a2a.topics." + auditorPublishTopic,
@@ -257,7 +265,7 @@ func TestAValidTaskCredentialGrantsThatTaskOnly(t *testing.T) {
 		}
 	}
 	for _, p := range append(append([]string{}, pubs...), subs...) {
-		if strings.Contains(p, ".*.") || strings.HasSuffix(p, ".*") || (strings.Contains(p, ">") && !strings.HasPrefix(p, "_INBOX."+auditorPod1+".")) {
+		if strings.Contains(p, ".*.") || strings.HasSuffix(p, ".*") || (strings.Contains(p, ">") && !strings.HasPrefix(p, "_INBOX."+stemOne+".")) {
 			t.Errorf("a wildcard grant on a task connection: %s", p)
 		}
 	}
@@ -318,8 +326,10 @@ func TestATaskConnectionIsNarrowerThanThePodConnection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The task plane only: the consumer names and inbox are the task's own
+	// (taskcred.ConsumerStem), so they differ from the pod's by design.
 	for _, g := range task.perms.Pub.Allow {
-		if !grantsCover(pod.perms.Pub.Allow, g) {
+		if strings.HasPrefix(g, "a2a.tasks.") && !grantsCover(pod.perms.Pub.Allow, g) {
 			t.Errorf("the task connection holds %s, which the pod connection does not", g)
 		}
 	}
@@ -394,25 +404,25 @@ func (h *harness) connectForTask(t *testing.T, user, saToken, task string, extra
 func TestATaskConnectionReachesItsTaskAndNoOther(t *testing.T) {
 	kp, pub := taskSigningKey(t)
 	h := startHarness(t, profileMap, profileTokens(), withTaskSigningKeys(pub))
-	nc, violations, err := h.connectForTask(t, auditorPod1, tokenAuditorPod1, taskToken(t, kp, nil))
+	nc, violations, err := h.connectForTask(t, stemOne, tokenAuditorPod1, taskToken(t, kp, nil))
 	if err != nil {
 		t.Fatalf("a valid task credential was refused: %v", err)
 	}
 
-	in := lib.SessionConsumerName(auditorPod1, lib.SessionConsumerIn)
+	in := lib.SessionConsumerName(stemOne, lib.SessionConsumerIn)
 	checkPublish(t, nc, violations, map[string]bool{
 		lib.TaskEventsSubject(auditor, taskOne): false,
-		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerOrigin)) + "." + lib.TaskInSubject(auditor, taskOne):     false,
-		consumerSubject("CREATE", in) + "." + lib.TaskInSubject(auditor, taskOne):                                                                  false,
-		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerEvents)) + "." + lib.TaskEventsSubject(auditor, taskOne): false,
+		consumerSubject("CREATE", lib.SessionConsumerName(stemOne, lib.SessionConsumerOrigin)) + "." + lib.TaskInSubject(auditor, taskOne):     false,
+		consumerSubject("CREATE", in) + "." + lib.TaskInSubject(auditor, taskOne):                                                              false,
+		consumerSubject("CREATE", lib.SessionConsumerName(stemOne, lib.SessionConsumerEvents)) + "." + lib.TaskEventsSubject(auditor, taskOne): false,
 		consumerSubject("MSG.NEXT", in): false,
-		"_INBOX." + auditorPod1 + ".r":  false,
+		"_INBOX." + stemOne + ".r":      false,
 
 		// Another task of the same profile, by every route.
-		lib.TaskEventsSubject(auditor, taskTwo):                                                                                                    true,
-		consumerSubject("CREATE", in) + "." + lib.TaskInSubject(auditor, taskTwo):                                                                  true,
-		consumerSubject("CREATE", in) + "." + lib.TaskInSubject(auditor, "*"):                                                                      true,
-		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerEvents)) + "." + lib.TaskEventsSubject(auditor, taskTwo): true,
+		lib.TaskEventsSubject(auditor, taskTwo):                                                                                                true,
+		consumerSubject("CREATE", in) + "." + lib.TaskInSubject(auditor, taskTwo):                                                              true,
+		consumerSubject("CREATE", in) + "." + lib.TaskInSubject(auditor, "*"):                                                                  true,
+		consumerSubject("CREATE", lib.SessionConsumerName(stemOne, lib.SessionConsumerEvents)) + "." + lib.TaskEventsSubject(auditor, taskTwo): true,
 		// Its own task's input, which the requester writes.
 		lib.TaskInSubject(auditor, taskOne): true,
 		// The pod connection's grants stay on the pod connection.
@@ -465,7 +475,7 @@ func TestATaskConnectionClosesWhenItsCredentialExpires(t *testing.T) {
 	kp, pub := taskSigningKey(t)
 	h := startHarness(t, profileMap, profileTokens(), withTaskSigningKeys(pub))
 	closed := make(chan struct{})
-	_, _, err := h.connectForTask(t, auditorPod1, tokenAuditorPod1,
+	_, _, err := h.connectForTask(t, stemOne, tokenAuditorPod1,
 		taskToken(t, kp, func(c *taskcred.Claims) { c.Expires = time.Now().Add(3 * time.Second) }),
 		nats.NoReconnect(),
 		nats.ClosedHandler(func(*nats.Conn) { close(closed) }))
@@ -493,13 +503,192 @@ func TestOnARealServerThePodConnectionIsWiderThanTheTaskConnection(t *testing.T)
 		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerIn)) + "." + lib.TaskInSubject(auditor, "*"): false,
 		lib.DispatchAcceptSubject(auditor, "read", auditorPod1):                                                                        false,
 	})
-	task, taskViolations, err := h.connectForTask(t, auditorPod1, tokenAuditorPod1, taskToken(t, kp, nil))
+	task, taskViolations, err := h.connectForTask(t, stemOne, tokenAuditorPod1, taskToken(t, kp, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkPublish(t, task, taskViolations, map[string]bool{
 		lib.TaskEventsSubject(auditor, taskOne): false,
 		lib.TaskEventsSubject(auditor, taskTwo): true,
-		consumerSubject("CREATE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerIn)) + "." + lib.TaskInSubject(auditor, "*"): true,
+		consumerSubject("CREATE", lib.SessionConsumerName(stemOne, lib.SessionConsumerIn)) + "." + lib.TaskInSubject(auditor, "*"): true,
 	})
+}
+
+// A consumer's INFO, MSG.NEXT and DELETE carry its name and no filter, so the
+// task connection's consumers are named for the task (taskcred.ConsumerStem).
+// On one warm pod, task B's connection is refused every operation on the
+// consumers task A's connection and the pod connection made.
+func TestATaskConnectionCannotReachAnotherTasksConsumers(t *testing.T) {
+	kp, pub := taskSigningKey(t)
+	h := startHarness(t, profileMap, profileTokens(), withTaskSigningKeys(pub))
+	provisionTasksStream(t, h)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	create := func(nc *nats.Conn, name, filter string) {
+		t.Helper()
+		js, err := jetstream.New(nc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := js.CreateOrUpdateConsumer(ctx, lib.TasksStream, jetstream.ConsumerConfig{
+			Name: name, FilterSubject: filter, AckPolicy: jetstream.AckNonePolicy, InactiveThreshold: time.Minute, MemoryStorage: true,
+		}); err != nil {
+			t.Fatalf("creating %s: %v", name, err)
+		}
+	}
+	a, _, err := h.connectForTask(t, stemOne, tokenAuditorPod1, taskToken(t, kp, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aIn := lib.SessionConsumerName(stemOne, lib.SessionConsumerIn)
+	create(a, aIn, lib.TaskInSubject(auditor, taskOne))
+	pod, _ := h.connectAs(t, auditorPod1, tokenAuditorPod1)
+	podIn := lib.SessionConsumerName(auditorPod1, lib.SessionConsumerIn)
+	create(pod, podIn, lib.TaskInSubject(auditor, "*"))
+
+	b, bViolations, err := h.connectForTask(t, stemTwo, tokenAuditorPod1, taskToken(t, kp, func(c *taskcred.Claims) { c.Task = taskTwo }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]bool{
+		consumerSubject("INFO", lib.SessionConsumerName(stemTwo, lib.SessionConsumerIn)): false,
+	}
+	for _, name := range []string{aIn, lib.SessionConsumerName(stemOne, lib.SessionConsumerOrigin), lib.SessionConsumerName(stemOne, lib.SessionConsumerEvents), podIn} {
+		for _, op := range []string{"INFO", "MSG.NEXT", "DELETE"} {
+			cases[consumerSubject(op, name)] = true
+		}
+	}
+	checkPublish(t, b, bViolations, cases)
+}
+
+// The credential's lifetime is the callout's TaskCredentialMaxLifetime, not
+// GrantTTL: a task runs to its profile's deadline. The connection JWT is still
+// capped by GrantTTL.
+func TestATaskCredentialMayOutliveGrantTTLButTheConnectionMayNot(t *testing.T) {
+	kp, pub := taskSigningKey(t)
+	userKP, _ := nkeys.CreateUser()
+	userPub, _ := userKP.PublicKey()
+	svc := newTaskTestService(t, []string{pub}, time.Hour)
+
+	exp := time.Now().Add(2 * time.Hour)
+	d, err := authorizeWithTask(svc, tokenAuditorPod1, taskToken(t, kp, func(c *taskcred.Claims) { c.Expires = exp }))
+	if err != nil {
+		t.Fatalf("a credential 2h out was refused under a 1h GrantTTL: %v", err)
+	}
+	raw, err := svc.mint(&jwt.AuthorizationRequestClaims{UserNkey: userPub}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uc, err := jwt.DecodeUserClaims(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ceiling := time.Now().Add(time.Hour).Unix(); uc.Expires > ceiling {
+		t.Errorf("minted exp %d is past GrantTTL (%d); the credential's lifetime must not lengthen the connection", uc.Expires, ceiling)
+	}
+
+	tooLong := taskToken(t, kp, func(c *taskcred.Claims) {
+		c.Expires = time.Now().Add(defaultTaskCredentialMaxLifetime + taskCredentialSkew + time.Minute)
+	})
+	if _, err := authorizeWithTask(svc, tokenAuditorPod1, tooLong); err == nil || !strings.Contains(err.Error(), "ceiling") {
+		t.Errorf("a credential past the max lifetime plus skew: %v", err)
+	}
+
+	short := newTaskTestServiceWithLifetime(t, pub, 30*time.Minute)
+	if _, err := authorizeWithTask(short, tokenAuditorPod1, taskToken(t, kp, func(c *taskcred.Claims) { c.Expires = exp })); err == nil {
+		t.Error("a 2h credential was accepted under a 30m TaskCredentialMaxLifetime")
+	}
+}
+
+func newTaskTestServiceWithLifetime(t *testing.T, pub string, lifetime time.Duration) *Service {
+	t.Helper()
+	svc := newTaskTestService(t, []string{pub}, 0)
+	svc.taskMaxLifetime = lifetime
+	return svc
+}
+
+// When GrantTTL ends a task connection, the worker reconnects with the same
+// credential, still inside its expiry, and gets the same task's grants.
+func TestATaskConnectionReconnectsWithTheSameCredentialAfterGrantTTL(t *testing.T) {
+	kp, pub := taskSigningKey(t)
+	h := startHarness(t, profileMap, profileTokens(), withTaskSigningKeys(pub), withGrantTTL(2*time.Second))
+	cred := taskToken(t, kp, func(c *taskcred.Claims) { c.Expires = time.Now().Add(10 * time.Minute) })
+	closed := make(chan struct{})
+	if _, _, err := h.connectForTask(t, stemOne, tokenAuditorPod1, cred,
+		nats.NoReconnect(), nats.ClosedHandler(func(*nats.Conn) { close(closed) })); err != nil {
+		t.Fatalf("first connect: %v", err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first connection outlived GrantTTL")
+	}
+	nc, violations, err := h.connectForTask(t, stemOne, tokenAuditorPod1, cred)
+	if err != nil {
+		t.Fatalf("reconnecting with the same credential was refused: %v", err)
+	}
+	checkPublish(t, nc, violations, map[string]bool{
+		lib.TaskEventsSubject(auditor, taskOne): false,
+		lib.TaskEventsSubject(auditor, taskTwo): true,
+	})
+}
+
+func TestParseTaskCredentialMaxLifetime(t *testing.T) {
+	for raw, want := range map[string]time.Duration{"": 0, "6h0m0s": 6 * time.Hour, "1m0s": time.Minute, "90m": 90 * time.Minute} {
+		if got, err := ParseTaskCredentialMaxLifetime(raw); err != nil || got != want {
+			t.Errorf("%q = %v, %v; want %v", raw, got, err, want)
+		}
+	}
+	for _, raw := range []string{"6", "six hours", "0s", "-1h"} {
+		if got, err := ParseTaskCredentialMaxLifetime(raw); err == nil || !strings.Contains(err.Error(), "A2A_TASK_CREDENTIAL_MAX_LIFETIME") {
+			t.Errorf("%q = %v, %v; want an error naming the variable", raw, got, err)
+		}
+	}
+}
+
+// An unusable lifetime setting fails closed for task credentials and only
+// for them: on a real server a valid credential is refused, naming the
+// setting, while the same pod's tokenless connection still connects. The
+// default is never applied in its place.
+func TestAnUnusableLifetimeSettingRefusesTaskCredentialsOnly(t *testing.T) {
+	kp, pub := taskSigningKey(t)
+	for _, raw := range []string{"six hours", "0s"} {
+		t.Run(raw, func(t *testing.T) {
+			d, perr := ParseTaskCredentialMaxLifetime(raw)
+			h := startHarness(t, profileMap, profileTokens(), withTaskSigningKeys(pub), withTaskLifetime(d, perr))
+			if _, _, err := h.connectForTask(t, stemOne, tokenAuditorPod1, taskToken(t, kp, nil)); err == nil {
+				t.Error("a valid task credential connected under an unusable lifetime setting")
+			}
+			h.connectAs(t, auditorPod1, tokenAuditorPod1)
+
+			svc := newTaskTestService(t, []string{pub}, 0)
+			svc.taskLifetimeErr, svc.taskMaxLifetime = nil, 0
+			// Rebuilt through NewService so the setting takes NewService's path.
+			svc2, err := NewService(svc.store, svc.validator, Config{
+				IssuerSeed:                       mustIssuerSeed(t),
+				ReservedPrincipals:               renderedFixtureAuthUsers(t),
+				ReservedAddressees:               renderedFixtureAddressees(t),
+				TaskSigningKeys:                  []string{pub},
+				TaskCredentialMaxLifetime:        d,
+				TaskCredentialMaxLifetimeInvalid: perr,
+			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if err != nil {
+				t.Fatalf("NewService stopped on an unusable lifetime setting: %v", err)
+			}
+			if _, err := authorizeWithTask(svc2, tokenAuditorPod1, taskToken(t, kp, nil)); err == nil || !strings.Contains(err.Error(), "A2A_TASK_CREDENTIAL_MAX_LIFETIME") {
+				t.Errorf("refusal %v does not name the setting", err)
+			}
+		})
+	}
+}
+
+func mustIssuerSeed(t *testing.T) string {
+	t.Helper()
+	kp, err := nkeys.CreateAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed, _ := kp.Seed()
+	return string(seed)
 }

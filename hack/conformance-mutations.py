@@ -2337,8 +2337,8 @@ Mutation(
     Mutation(
         "A3-profile-pod-writes-its-own-supervisor-subject",
         "a2a/authcallout/profile_narrowing.go",
-        ("\tg := executorTaskGrants(profile, task, pod)\n",
-         "\tg := executorTaskGrants(profile, task, pod)\n\tg.Publish = append(g.Publish, lib.TaskSupervisorSubject(profile, \"*\"))\n"),
+        ("\tg := executorTaskGrants(profile, task, stem)\n",
+         "\tg := executorTaskGrants(profile, task, stem)\n\tg.Publish = append(g.Publish, lib.TaskSupervisorSubject(profile, \"*\"))\n"),
         "test_A3_the_supervisor_subject_has_exactly_one_writer",
         "derive an AgentProfile's pods a grant on their profile's supervisor "
         "subject, the janitor's. A profile pod could then end its own task, or "
@@ -2347,8 +2347,8 @@ Mutation(
     Mutation(
         "A3-profile-pod-writes-its-own-in-subject",
         "a2a/authcallout/profile_narrowing.go",
-        ("\tg := executorTaskGrants(profile, task, pod)\n",
-         "\tg := executorTaskGrants(profile, task, pod)\n\tg.Publish = append(g.Publish, lib.TaskInSubject(profile, \"*\"))\n"),
+        ("\tg := executorTaskGrants(profile, task, stem)\n",
+         "\tg := executorTaskGrants(profile, task, stem)\n\tg.Publish = append(g.Publish, lib.TaskInSubject(profile, \"*\"))\n"),
         "test_A3_the_executors_grant_does_not_reach_its_own_in_subject",
         "derive an AgentProfile's pods a publish grant on their profile's in "
         "subject. Every pod of the profile could then steer or cancel any of "

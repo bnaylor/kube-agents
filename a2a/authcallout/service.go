@@ -67,6 +67,10 @@ const (
 	// issue time are allowed against this callout's clock: the dispatcher
 	// that signed it runs on another node.
 	taskCredentialSkew = 30 * time.Second
+
+	// defaultTaskCredentialMaxLifetime bounds how far out a task
+	// credential's expiry may be. See Config.TaskCredentialMaxLifetime.
+	defaultTaskCredentialMaxLifetime = 6 * time.Hour
 )
 
 // Config is what the callout needs to answer.
@@ -118,8 +122,55 @@ type Config struct {
 	// taskcred.MaxTrustedKeys of them.
 	TaskSigningKeys []string
 
+	// TaskCredentialMaxLifetime is the furthest a task credential's expiry
+	// may be from now; one further out is refused, not shortened. It is
+	// decoupled from GrantTTL on purpose: a task runs to its profile's
+	// deadline (spec.lifecycle.activeDeadlineSeconds, which has no CRD
+	// maximum), and the credential has to last that long. Revocation stays
+	// at GrantTTL anyway, because the connection JWT is still capped by it
+	// (see mint); a worker whose connection expires reconnects with the
+	// same credential until the credential's own expiry.
+	//
+	// Zero means the default, 6h, which matches the operator's. The
+	// operator doesn't render it in this PR; #4121 renders it from the
+	// PlatformAgent's spec.harness.tuning.profiles.maxTaskDeadlineSeconds,
+	// the same value it clamps profile deadlines to, so the dispatcher never
+	// signs an expiry the callout refuses.
+	TaskCredentialMaxLifetime time.Duration
+
+	// TaskCredentialMaxLifetimeInvalid, when set, says the configured
+	// lifetime could not be used (ParseTaskCredentialMaxLifetime's error).
+	// The callout then refuses every task credential, naming it, and serves
+	// every other connection as usual. It never falls back to the default:
+	// a cap someone set and got wrong is not a cap of 6h. A negative
+	// TaskCredentialMaxLifetime is treated the same way.
+	TaskCredentialMaxLifetimeInvalid error
+
 	// Now is injectable for tests.
 	Now func() time.Time
+}
+
+// envTaskCredentialMaxLifetimeName is the variable ParseTaskCredentialMaxLifetime
+// reads, named in its errors so a refusal says which setting to fix.
+const envTaskCredentialMaxLifetimeName = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
+
+// ParseTaskCredentialMaxLifetime reads the task credential lifetime the
+// operator renders (#4121, time.Duration.String, e.g. "6h0m0s"). Empty is
+// (0, nil): unset, the default. Anything that isn't a positive Go duration is
+// an error, which the caller passes on as Config.TaskCredentialMaxLifetimeInvalid
+// rather than stopping: see that field.
+func ParseTaskCredentialMaxLifetime(raw string) (time.Duration, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s=%q is not a Go duration: %w", envTaskCredentialMaxLifetimeName, raw, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s=%q is not positive", envTaskCredentialMaxLifetimeName, raw)
+	}
+	return d, nil
 }
 
 // taskSigningKeySeparator separates the keys in ParseTaskSigningKeys' input.
@@ -158,9 +209,15 @@ type Service struct {
 	xkey      nkeys.KeyPair
 	grantTTL  time.Duration
 	taskKeys  []string
-	reserved  map[string]reservedKind
-	now       func() time.Time
-	log       *slog.Logger
+	// taskMaxLifetime is Config.TaskCredentialMaxLifetime, defaulted.
+	taskMaxLifetime time.Duration
+	// taskLifetimeErr, when set, refuses every task credential: the
+	// configured lifetime was unusable. See
+	// Config.TaskCredentialMaxLifetimeInvalid.
+	taskLifetimeErr error
+	reserved        map[string]reservedKind
+	now             func() time.Time
+	log             *slog.Logger
 }
 
 // NewService builds the callout.
@@ -220,6 +277,23 @@ func NewService(store *Store, validator *TokenValidator, cfg Config, log *slog.L
 	}
 	if svc.grantTTL <= 0 {
 		svc.grantTTL = defaultGrantTTL
+	}
+	// Three explicit cases. An unusable setting refuses task credentials and
+	// nothing else; it is not a reason to take the callout down, which would
+	// refuse every connection on the bus, and it is not a reason to apply the
+	// default either. Unset is the default. Anything else is the setting.
+	switch {
+	case cfg.TaskCredentialMaxLifetimeInvalid != nil:
+		svc.taskLifetimeErr = cfg.TaskCredentialMaxLifetimeInvalid
+	case cfg.TaskCredentialMaxLifetime < 0:
+		svc.taskLifetimeErr = fmt.Errorf("the task credential max lifetime %s is negative", cfg.TaskCredentialMaxLifetime)
+	case cfg.TaskCredentialMaxLifetime == 0:
+		svc.taskMaxLifetime = defaultTaskCredentialMaxLifetime
+	default:
+		svc.taskMaxLifetime = cfg.TaskCredentialMaxLifetime
+	}
+	if svc.taskLifetimeErr != nil {
+		log.Error("every task credential will be refused; other connections are served as usual", "reason", svc.taskLifetimeErr)
 	}
 	if svc.now == nil {
 		svc.now = time.Now
@@ -524,7 +598,7 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 // verifyTaskCredential checks a task credential against the connection that
 // presented it. taskcred.Verify checks the credential itself: the signature,
 // a trusted task-signing key, the nats audience, an expiry no further out than
-// GrantTTL (refused, not shortened) and well-formed claims. What only the
+// TaskCredentialMaxLifetime (refused, not shortened) and well-formed claims. What only the
 // callout can check is that it is this connection's:
 //
 //   - the pod and its UID are the pod the cluster attested for the
@@ -537,11 +611,14 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 //     than quietly granting the entry's own; an entry naming no tier (an
 //     operator before #3655) matches no credential.
 func (s *Service) verifyTaskCredential(raw string, id Identity, att Attested) (taskcred.Claims, error) {
+	if s.taskLifetimeErr != nil {
+		return taskcred.Claims{}, fmt.Errorf("the callout's task credential lifetime setting is unusable, so every task credential is refused: %w", s.taskLifetimeErr)
+	}
 	if len(s.taskKeys) == 0 {
 		return taskcred.Claims{}, fmt.Errorf("this callout trusts no task-signing key")
 	}
 	now := s.now()
-	c, err := taskcred.Verify(raw, s.taskKeys, taskcred.AudienceNATS, now, s.grantTTL, taskCredentialSkew)
+	c, err := taskcred.Verify(raw, s.taskKeys, taskcred.AudienceNATS, now, s.taskMaxLifetime, taskCredentialSkew)
 	if err != nil {
 		return taskcred.Claims{}, err
 	}
@@ -625,6 +702,9 @@ func (s *Service) mint(req *jwt.AuthorizationRequestClaims, d decision) (string,
 	uc.Name = d.user
 	// A task connection ends with its task: the server closes a connection
 	// when its JWT expires, so the credential's expiry caps the grant's.
+	// GrantTTL still caps it too, so a credential that outlives GrantTTL
+	// (TaskCredentialMaxLifetime) means a reconnect, re-checked here, not a
+	// longer connection.
 	expiry := s.grantExpiry()
 	if !d.notAfter.IsZero() && d.notAfter.Before(expiry) {
 		expiry = d.notAfter

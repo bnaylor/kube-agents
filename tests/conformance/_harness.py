@@ -484,7 +484,7 @@ SOURCES: dict[str, Source] = {
     # directory), on the task connection a task credential opens (#3889).
     "a2a_profile_grants": Source(
         "a2a/authcallout/profile_narrowing.go",
-        ("func profileGrants", "func profileTaskGrants", "executorTaskGrants(profile, task, pod)"),
+        ("func profileGrants", "func profileTaskGrants", "executorTaskGrants(profile, task, stem)"),
     ),
     # What the server actually loads, as opposed to what the Go builders say.
     # The writer-set tests read both and assert they agree: the Go map is what

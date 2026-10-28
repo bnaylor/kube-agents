@@ -140,6 +140,10 @@ type harnessOptions struct {
 	taskKeys []string
 	// now, when set, is the callout's clock.
 	now func() time.Time
+	// taskLifetime and taskLifetimeErr are the callout's task credential
+	// lifetime settings (Config.TaskCredentialMaxLifetime and ...Invalid).
+	taskLifetime    time.Duration
+	taskLifetimeErr error
 }
 
 // withGrantTTL shortens every grant the callout issues.
@@ -151,6 +155,12 @@ func withGrantTTL(d time.Duration) harnessOption {
 // keys.
 func withTaskSigningKeys(keys ...string) harnessOption {
 	return func(o *harnessOptions) { o.taskKeys = keys }
+}
+
+// withTaskLifetime sets the callout's task credential lifetime, as
+// ParseTaskCredentialMaxLifetime returned it.
+func withTaskLifetime(d time.Duration, err error) harnessOption {
+	return func(o *harnessOptions) { o.taskLifetime, o.taskLifetimeErr = d, err }
 }
 
 // withNow sets the callout's clock.
@@ -273,6 +283,9 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 		GrantTTL:        options.grantTTL,
 		TaskSigningKeys: options.taskKeys,
 		Now:             options.now,
+
+		TaskCredentialMaxLifetime:        options.taskLifetime,
+		TaskCredentialMaxLifetimeInvalid: options.taskLifetimeErr,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("NewService: %v", err)

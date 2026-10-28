@@ -28,6 +28,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"time"
@@ -109,6 +110,26 @@ func ParseSigningKey(seed []byte) (nkeys.KeyPair, error) {
 		return nil, fmt.Errorf("task-signing seed is not a cluster seed (SC...)")
 	}
 	return nkeys.FromSeed(seed)
+}
+
+// ConsumerStem is the stem of a task connection's consumer names and inbox:
+// "<pod>_<task>". The worker names its three consumers
+// <stem>-origin, <stem>-in and <stem>-events, and its inbox prefix is
+// _INBOX.<stem>; the callout grants exactly those.
+//
+// The task is in the stem because a consumer's INFO, MSG.NEXT and DELETE
+// subjects carry only its name, not its filter (only CREATE pins one): with a
+// pod-only stem, task B's connection on a warm pod could pull from, or keep
+// alive, the consumer task A's connection made. The separator is "_" because
+// neither a pod name nor a task id (both DNS-1123 labels) can contain one, so
+// no other (pod, task), and no pod's own pod-connection names
+// (<pod>-<role>), can produce the same stem. Both halves are at most 63 bytes,
+// so a stem is at most 127 and a consumer name at most 134, inside
+// nats-server's 255 (JSMaxNameLen). It is not a lib.ValidSubjectToken (that
+// is a DNS-1123 label): it is a legal NATS consumer name and subject token,
+// with no ".", "*", ">" or whitespace.
+func ConsumerStem(pod, task string) string {
+	return pod + "_" + task
 }
 
 // ValidPublicKey reports whether pub is a task-signing public key.
@@ -225,7 +246,8 @@ func Mint(kp nkeys.KeyPair, c Claims) (string, error) {
 //   - exp must be after now-skew, and no further than maxLifetime+skew past
 //     now. A credential minted for longer than the verifier's ceiling is
 //     refused, not shortened.
-//   - iat may not be after now+skew or after exp.
+//   - iat may not be after now+skew or after exp, and exp-iat, the
+//     credential's own span, is held to maxLifetime+skew as well.
 //   - task, profile, tier and pod must be single subject tokens (dot-free
 //     DNS-1123 labels: no ".", "*", ">" or whitespace, at most 63 bytes), and
 //     pod_uid a bounded UID.
@@ -259,6 +281,9 @@ func Verify(token string, trusted []string, aud Audience, now time.Time, maxLife
 	if !ValidPublicKey(gc.Issuer) || !slices.Contains(trusted, gc.Issuer) {
 		return Claims{}, fmt.Errorf("task credential is signed by %q, which is not a trusted task-signing key", gc.Issuer)
 	}
+	if err := checkStrictClaims(token); err != nil {
+		return Claims{}, err
+	}
 
 	p, err := decodePayload(gc.Data)
 	if err != nil {
@@ -291,6 +316,13 @@ func Verify(token string, trusted []string, aud Audience, now time.Time, maxLife
 	iat := time.Unix(gc.IssuedAt, 0)
 	if iat.After(now.Add(skew)) || iat.After(exp) {
 		return Claims{}, fmt.Errorf("task credential was issued at %s, after now or after its expiry", iat.UTC().Format(time.RFC3339))
+	}
+	// The credential's own span, as well as what is left of it: a credential
+	// minted for longer than the ceiling is refused even once enough of it
+	// has passed that exp-now fits. The same skew as above, so a minter whose
+	// clock is ahead by less than the skew isn't refused for it.
+	if exp.Sub(iat) > maxLifetime+skew {
+		return Claims{}, fmt.Errorf("task credential spans %s from issue to expiry, past the %s ceiling; refused rather than shortened", exp.Sub(iat).Round(time.Second), maxLifetime)
 	}
 	if gc.NotBefore != 0 && time.Unix(gc.NotBefore, 0).After(now.Add(skew)) {
 		return Claims{}, fmt.Errorf("task credential is not valid yet")
@@ -371,6 +403,102 @@ func checkHeader(token string) error {
 		return fmt.Errorf("task credential header names %q/%q, want %q/%q", h.Type, h.Algorithm, jwt.TokenTypeJwt, jwt.AlgorithmNkey)
 	}
 	return nil
+}
+
+// The claim keys a credential may carry, exactly as spelled: the standard
+// claims jwt/v2's ClaimsData emits, the nats block's fields, and the target's.
+var (
+	topLevelClaims = map[string]bool{"jti": true, "iat": true, "iss": true, "name": true, "sub": true, "aud": true, "exp": true, "nbf": true, "nats": true}
+	natsClaims     = map[string]bool{"type": true, "version": true, "task": true, "profile": true, "tier": true, "pod": true, "pod_uid": true, "target": true}
+	targetClaims   = map[string]bool{"project": true, "location": true, "cluster": true}
+)
+
+// checkStrictClaims re-reads the raw payload segment before anything trusts
+// the decoded claims. encoding/json matches keys case-insensitively and lets
+// the last of two equal keys win, and jwt/v2 ignores keys it doesn't know, so
+// {"aud":"credential-proxy","AUD":"nats"} would decode as a nats credential
+// here while a verifier reading exact keys (the credential proxy's) read it as
+// a proxy one. So, at every level: no key twice, no key that is an allowed key
+// in another case; and at the top level no key outside the standard claims and
+// nats. Unknown keys inside nats are refused by decodePayload.
+func checkStrictClaims(token string) error {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return fmt.Errorf("task credential is not a JWT")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return fmt.Errorf("task credential payload: %w", err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if err := strictValue(dec, ""); err != nil {
+		return fmt.Errorf("task credential payload: %w", err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return fmt.Errorf("task credential payload: trailing data")
+	}
+	return nil
+}
+
+// strictValue walks one JSON value; path names the object it is in ("" for
+// the top level, "nats", "nats.target").
+func strictValue(dec *json.Decoder, path string) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	switch tok {
+	case json.Delim('{'):
+		allowed := map[string]map[string]bool{"": topLevelClaims, "nats": natsClaims, "nats.target": targetClaims}[path]
+		seen := map[string]bool{}
+		for dec.More() {
+			kt, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			key := kt.(string)
+			if seen[key] {
+				return fmt.Errorf("key %q appears twice", key)
+			}
+			seen[key] = true
+			if allowed != nil && !allowed[key] {
+				if foldsTo(allowed, key) {
+					return fmt.Errorf("key %q is an allowed key in the wrong case", key)
+				}
+				if path == "" {
+					return fmt.Errorf("unknown top-level claim %q", key)
+				}
+			}
+			child := key
+			if path != "" {
+				child = path + "." + key
+			}
+			if err := strictValue(dec, child); err != nil {
+				return err
+			}
+		}
+		_, err := dec.Token()
+		return err
+	case json.Delim('['):
+		for dec.More() {
+			if err := strictValue(dec, path+"[]"); err != nil {
+				return err
+			}
+		}
+		_, err := dec.Token()
+		return err
+	}
+	return nil
+}
+
+// foldsTo reports whether key equals an allowed key under case folding.
+func foldsTo(allowed map[string]bool, key string) bool {
+	for k := range allowed {
+		if strings.EqualFold(k, key) {
+			return true
+		}
+	}
+	return false
 }
 
 // decodePayload reads the nats claim block into payload, refusing unknown

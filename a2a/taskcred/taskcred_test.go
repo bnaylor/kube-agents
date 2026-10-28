@@ -3,6 +3,7 @@ package taskcred
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -175,9 +176,12 @@ func TestOnlyATaskSigningKeyCanIssue(t *testing.T) {
 func TestExpiryAndLifetimeAreRefusedNotClamped(t *testing.T) {
 	kp, pub := signingKey(t)
 	// Mint stamps iat with the wall clock, so the credential's expiry is
-	// fixed well after it and each case moves the verifier's clock instead:
-	// remaining is exp minus the verifier's now.
-	exp := time.Now().Add(48 * time.Hour)
+	// fixed and each case moves the verifier's clock instead: remaining is
+	// exp minus the verifier's now. The span is the ceiling plus skew, the
+	// most the span check allows, so "past the ceiling plus skew" puts the
+	// verifier's clock just behind iat (inside the skew) and is refused by
+	// the exp-now check alone.
+	exp := time.Unix(time.Now().Add(testLifetime+testSkew).Unix(), 0)
 	c := validClaims(time.Now())
 	c.Expires = exp
 	tok := mint(t, kp, c)
@@ -196,7 +200,7 @@ func TestExpiryAndLifetimeAreRefusedNotClamped(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			now := exp.Truncate(time.Second).Add(-tc.remaining)
+			now := exp.Add(-tc.remaining)
 			got, err := Verify(tok, []string{pub}, AudienceNATS, now, testLifetime, testSkew)
 			if tc.accept && err != nil {
 				t.Fatalf("refused: %v", err)
@@ -397,5 +401,106 @@ func TestATamperedPayloadIsRefused(t *testing.T) {
 		if _, err := Verify(junk, []string{pub}, AudienceNATS, now, testLifetime, testSkew); err == nil {
 			t.Errorf("%q was accepted", junk)
 		}
+	}
+}
+
+// signRaw signs a hand-written payload. v1 signs the payload segment alone,
+// the way jwt v1 did; v2 signs header.payload.
+func signRaw(t *testing.T, kp nkeys.KeyPair, alg, payload string) string {
+	t.Helper()
+	head, _ := json.Marshal(jwt.Header{Type: jwt.TokenTypeJwt, Algorithm: alg})
+	h := base64.RawURLEncoding.EncodeToString(head)
+	p := base64.RawURLEncoding.EncodeToString([]byte(payload))
+	input := h + "." + p
+	if alg == jwt.AlgorithmNkeyOld {
+		input = p
+	}
+	sig, err := kp.Sign([]byte(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h + "." + p + "." + base64.RawURLEncoding.EncodeToString(sig)
+}
+
+// A genuine v1 credential, signed the v1 way by a trusted key, so its
+// signature verifies: refused for its header alone.
+func TestARealV1CredentialIsRefused(t *testing.T) {
+	kp, pub := signingKey(t)
+	now := time.Now()
+	parts := strings.Split(mint(t, kp, validClaims(now)), ".")
+	raw, _ := base64.RawURLEncoding.DecodeString(parts[1])
+	v1 := signRaw(t, kp, jwt.AlgorithmNkeyOld, string(raw))
+	if _, err := jwt.DecodeGeneric(v1); err != nil {
+		t.Fatalf("the hand-made v1 token is not a valid v1 JWT, so this test proves nothing: %v", err)
+	}
+	if _, err := Verify(v1, []string{pub}, AudienceNATS, now, testLifetime, testSkew); err == nil || !strings.Contains(err.Error(), "header") {
+		t.Errorf("a validly signed v1 credential: %v, want a header refusal", err)
+	}
+}
+
+// The payload is read with exact keys: no duplicates, no case variants of an
+// allowed key, no unknown top-level claim. Each variant below is validly
+// signed by a trusted key and decodes under encoding/json to a credential that
+// would otherwise verify.
+func TestClaimKeysAreReadExactly(t *testing.T) {
+	kp, pub := signingKey(t)
+	now := time.Now()
+	base := fmt.Sprintf(`{"jti":"J","iat":%d,"iss":%q,"sub":"nonce","aud":"nats","exp":%d,`+
+		`"nats":{"type":"kube-agents-task","version":2,"task":"task-1","profile":"auditor","tier":"read","pod":"auditor-read-x7k2p","pod_uid":"uid-1"}}`,
+		now.Unix(), pub, now.Add(10*time.Minute).Unix())
+	if _, err := Verify(signRaw(t, kp, jwt.AlgorithmNkey, base), []string{pub}, AudienceNATS, now, testLifetime, testSkew); err != nil {
+		t.Fatalf("the base payload was refused, so the variants prove nothing: %v", err)
+	}
+	for name, edit := range map[string][2]string{
+		"a duplicate aud":             {`"aud":"nats"`, `"aud":"credential-proxy","aud":"nats"`},
+		"an AUD beside aud":           {`"aud":"nats"`, `"aud":"credential-proxy","AUD":"nats"`},
+		"a duplicate task":            {`"task":"task-1"`, `"task":"task-2","task":"task-1"`},
+		"a case-variant Task":         {`"task":"task-1"`, `"Task":"task-1"`},
+		"a case-variant TYPE":         {`"type":"kube-agents-task"`, `"TYPE":"kube-agents-task"`},
+		"a case-variant Exp":          {`"exp":`, `"Exp":`},
+		"an unknown top-level claim":  {`"sub":"nonce"`, `"sub":"nonce","grants":"a2a.>"`},
+		"an unknown top-level object": {`"sub":"nonce"`, `"sub":"nonce","perms":{"pub":">"}`},
+	} {
+		payload := strings.Replace(base, edit[0], edit[1], 1)
+		if payload == base {
+			t.Fatalf("%s: the edit did not apply", name)
+		}
+		if _, err := Verify(signRaw(t, kp, jwt.AlgorithmNkey, payload), []string{pub}, AudienceNATS, now, testLifetime, testSkew); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestTheConsumerStemIsUnambiguous(t *testing.T) {
+	if got := ConsumerStem("auditor-read-x7k2p", "task-1"); got != "auditor-read-x7k2p_task-1" {
+		t.Errorf("ConsumerStem = %q", got)
+	}
+	// "-" would let pod "a-b" with task "c" collide with pod "a" and task
+	// "b-c"; "_" is in neither half's alphabet.
+	if ConsumerStem("a-b", "c") == ConsumerStem("a", "b-c") {
+		t.Error("two (pod, task) pairs share a stem")
+	}
+	long := ConsumerStem(strings.Repeat("p", 63), strings.Repeat("t", 63))
+	if n := len(long + "-events"); n > 255 {
+		t.Errorf("the longest consumer name is %d bytes, past nats-server's 255", n)
+	}
+}
+
+// The credential's own span is held to the ceiling too: one minted for longer
+// is refused even once enough of it has passed that exp-now would fit.
+func TestACredentialSpanningMoreThanTheCeilingIsRefused(t *testing.T) {
+	kp, pub := signingKey(t)
+	minted := time.Now()
+	c := validClaims(minted)
+	c.Expires = minted.Add(testLifetime + testSkew + 5*time.Minute)
+	tok := mint(t, kp, c)
+	later := minted.Add(10 * time.Minute) // exp-now is now inside the ceiling
+	if _, err := Verify(tok, []string{pub}, AudienceNATS, later, testLifetime, testSkew); err == nil || !strings.Contains(err.Error(), "spans") {
+		t.Errorf("a credential spanning past the ceiling: %v, want a span refusal", err)
+	}
+	// Control: the same check passes a span inside the ceiling plus skew.
+	c.Expires = minted.Add(testLifetime + testSkew - time.Second)
+	if _, err := Verify(mint(t, kp, c), []string{pub}, AudienceNATS, later, testLifetime, testSkew); err != nil {
+		t.Errorf("a span inside the ceiling plus skew was refused: %v", err)
 	}
 }

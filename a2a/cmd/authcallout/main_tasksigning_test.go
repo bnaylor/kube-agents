@@ -47,3 +47,22 @@ func TestTheCalloutChecksItsTaskSigningKeysAtStartup(t *testing.T) {
 		})
 	}
 }
+
+// The task-credential lifetime never stops startup: a good value, an unset
+// one and a bad one all carry on to the in-cluster config. A bad one refuses
+// task credentials instead (authcallout's TestAnUnusableLifetimeSetting...).
+func TestTheTaskCredentialLifetimeNeverStopsStartup(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// "6h0m0s" and "1m0s" are how the operator renders it (time.Duration.String).
+	for _, value := range []string{"", "6h0m0s", "1m0s", "6h", "90m", "6", "six hours", "0s", "-1h"} {
+		t.Run("value "+value, func(t *testing.T) {
+			setEnvBeforeAddressees(t)
+			t.Setenv(envReservedAddressees, "platform")
+			t.Setenv(envTaskCredentialMaxLifetime, value)
+			err := run(log)
+			if err == nil || strings.Contains(err.Error(), envTaskCredentialMaxLifetime) || !strings.Contains(err.Error(), "in-cluster config") {
+				t.Fatalf("run() = %v, want it past the guard and stopped at the in-cluster config", err)
+			}
+		})
+	}
+}

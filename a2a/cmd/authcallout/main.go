@@ -59,6 +59,15 @@ const (
 	// authcallout.ParseTaskSigningKeys.
 	envTaskSigningKeys = "A2A_TASK_SIGNING_PUBLIC_KEYS"
 
+	// envTaskCredentialMaxLifetime is the furthest out a task credential's
+	// expiry may be, as a Go duration. The operator renders it with
+	// time.Duration.String ("6h0m0s" by default, 60s to 21600s) from the
+	// PlatformAgent's spec.harness.tuning.profiles.maxTaskDeadlineSeconds
+	// (#4121), the same value it clamps profile deadlines to. Optional; unset
+	// means the callout's 6h default, which matches the operator's. See
+	// authcallout.Config.TaskCredentialMaxLifetime.
+	envTaskCredentialMaxLifetime = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
+
 	defaultAuthMapKey  = "identities.json"
 	defaultStatusAddr  = ":8080"
 	defaultMapWait     = 60 * time.Second
@@ -154,6 +163,15 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("%s: %w", envTaskSigningKeys, err)
 	}
 
+	// The task credential lifetime. Unlike the variables above, a bad value
+	// does not stop startup: it refuses every task credential and nothing
+	// else (authcallout.Config.TaskCredentialMaxLifetimeInvalid says why),
+	// so the error is logged and handed on rather than returned.
+	taskMaxLifetime, taskLifetimeErr := authcallout.ParseTaskCredentialMaxLifetime(os.Getenv(envTaskCredentialMaxLifetime))
+	if taskLifetimeErr != nil {
+		log.Error("the task credential lifetime is unusable; task credentials will be refused", "error", taskLifetimeErr)
+	}
+
 	restCfg, err := rest.InClusterConfig()
 	if err != nil {
 		return fmt.Errorf("in-cluster config: %w", err)
@@ -185,6 +203,9 @@ func run(log *slog.Logger) error {
 		ReservedPrincipals: reserved,
 		ReservedAddressees: reservedAddressees,
 		TaskSigningKeys:    taskKeys,
+
+		TaskCredentialMaxLifetime:        taskMaxLifetime,
+		TaskCredentialMaxLifetimeInvalid: taskLifetimeErr,
 	}, log)
 	if err != nil {
 		return err

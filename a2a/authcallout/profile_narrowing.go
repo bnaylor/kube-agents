@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/taskcred"
 )
 
 // Profile narrowing: the map entry for an A2A AgentProfile's pods.
@@ -191,9 +192,15 @@ func profileWorkerGrants(profile, tier, pod string) Grants {
 // The task comes from a verified credential (Service.verifyTaskCredential) and
 // the profile from the attested identity's map entry, never from the
 // credential alone.
+//
+// The consumer names and inbox are the task's own, under
+// taskcred.ConsumerStem(pod, task), not the pod's: a consumer's INFO, MSG.NEXT
+// and DELETE carry only its name, so a pod-named consumer would be reachable
+// from the next task's connection on the same warm pod.
 func profileTaskGrants(profile, task, pod string) Grants {
-	g := executorTaskGrants(profile, task, pod)
-	g.Publish = append(g.Publish, "_INBOX."+pod+".>")
+	stem := taskcred.ConsumerStem(pod, task)
+	g := executorTaskGrants(profile, task, stem)
+	g.Publish = append(g.Publish, "_INBOX."+stem+".>")
 	return g
 }
 
