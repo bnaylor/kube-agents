@@ -2434,7 +2434,18 @@ class ScanGateTest(unittest.TestCase):
             self.assertEqual(self._orig(self.d), "t_real")
         self.assertEqual(len(filed), 1)
         self.assertIn("uncarded=3\n", (self.d / SCAN_FILED).read_text())
+        self.assertIn("cap=2\n", (self.d / SCAN_FILED).read_text())
         self.assertEqual(bootstrap_scan_gate.bootstrap_handoff.uncarded_agents(self.d / SCAN_FILED), len(ready) - 2)
+
+    def test_a_filed_sweep_keeps_the_cap_it_was_filed_under(self):
+        # #3702: the hand-off's roster holds to the marker's cap, so raising the
+        # file mid-sweep cannot card a cluster the sweep card gave its worker.
+        names = [self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(5)]
+        (self.d / bootstrap_scan_gate.bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("4")
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\nuncarded=3\ncap=2\n")
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), contextlib.redirect_stderr(io.StringIO()):
+            roster = bootstrap_scan_gate.cluster_agents()
+        self.assertEqual([a["name"] for a in roster], sorted(names)[:2])
 
     def test_a_roster_under_the_cap_is_listed_whole(self):
         names = [self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(3)]

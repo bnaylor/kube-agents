@@ -92,7 +92,8 @@ SECONDS_PER_MINUTE = 60
 # cluster with no ready Cluster Agent. Six is the board's worker concurrency in
 # that run, so the cards finish in one wave. The long-term value comes from the
 # sizing budget function (#3753); until then an operator can set it in this file
-# under the data dir. No model tool can write it: the file tools run in the
+# under the data dir. It is read when the sweep is filed, which records it in its
+# marker, and that value holds for the sweep (marker_cap). No model tool can write it: the file tools run in the
 # shell sandbox, which has its own volume, and it is read here in the agent pod. Absent, malformed, zero or negative means the default,
 # and the value is clamped to FIRST_RUN_CLUSTER_CARDS_MAX, so the file cannot
 # uncap the scan.
@@ -216,6 +217,30 @@ def uncarded_agents(marker: Path) -> int:
     except ValueError:
         return 0
     return min(value, FIRST_RUN_UNCARDED_MAX) if value > 0 else 0
+
+
+def marker_cap(marker: Path) -> int | None:
+    """The first-run cap the sweep was filed under (#3702), from the marker; None when it records none.
+
+    The gate records it when it files the sweep, and the hand-off holds to it
+    for that sweep: the sweep card already told its worker to audit the
+    clusters past it, so a cap raised mid-sweep would card them as well and
+    they would be audited twice. None for a sweep filed by an older build,
+    whose caller falls back to the file, or a marker that cannot be read. A
+    value is read the way the file's is: not a whole number or below one is
+    the default, and it is never more than FIRST_RUN_CLUSTER_CARDS_MAX.
+    """
+    try:
+        raw = _read_marker(marker).get("cap")
+    except ValueError:  # not UTF-8
+        return None
+    return None if raw is None else _clamp_cap(raw, f"{marker}'s cap=")
+
+
+def sweep_cluster_cards(data_dir: Path, marker: Path) -> int:
+    """The per-cluster card cap for a filed sweep: its marker's, else the data dir's file."""
+    cap = marker_cap(marker)
+    return first_run_cluster_cards(data_dir) if cap is None else cap
 
 
 def _metadata(conn: sqlite3.Connection, task_id: str) -> dict:
@@ -448,7 +473,7 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
     """``INVENTORY.raw.md`` for one sweep, from its cards' metadata.
 
     The sweep reports the clusters it audited itself (those with no Cluster
-    Agent) under ``metadata.clusters`` and the fleet it enumerated under
+    Agent, and those past the first-run cap) under ``metadata.clusters`` and the fleet it enumerated under
     ``metadata.fleet``; a fleet cluster nobody reported on is a gap, because a
     silent gap reads as a clean cluster.
     """
@@ -798,16 +823,21 @@ def first_run_cluster_cards(data_dir: Path) -> int:
         # A ValueError, not an OSError, so it needs its own branch.
         _log(f"{path} is not UTF-8 ({e}); using {FIRST_RUN_CLUSTER_CARDS}")
         return FIRST_RUN_CLUSTER_CARDS
+    return _clamp_cap(raw, str(path))
+
+
+def _clamp_cap(raw: str, source: str) -> int:
+    """A cap as written in ``source``: the default unless a whole number from one, at most the maximum."""
     try:
         value = int(raw)
     except ValueError:
-        _log(f"{path} holds {raw[:MAX_LOGGED_CHARS]!r}, not a number; using {FIRST_RUN_CLUSTER_CARDS}")
+        _log(f"{source} holds {raw[:MAX_LOGGED_CHARS]!r}, not a number; using {FIRST_RUN_CLUSTER_CARDS}")
         return FIRST_RUN_CLUSTER_CARDS
     if value < 1:
-        _log(f"{path} holds {value}; using {FIRST_RUN_CLUSTER_CARDS}")
+        _log(f"{source} holds {value}; using {FIRST_RUN_CLUSTER_CARDS}")
         return FIRST_RUN_CLUSTER_CARDS
     if value > FIRST_RUN_CLUSTER_CARDS_MAX:
-        _log(f"{path} holds {value}; capped at {FIRST_RUN_CLUSTER_CARDS_MAX}")
+        _log(f"{source} holds {value}; capped at {FIRST_RUN_CLUSTER_CARDS_MAX}")
         return FIRST_RUN_CLUSTER_CARDS_MAX
     return value
 
@@ -822,7 +852,7 @@ def file_cluster_cards(state: dict, roster: list, parse_task_id, cap: int | None
     failed is retried; the idempotency key keeps a retry from filing twice, and
     a card someone archived is not filed again. With ``cap``, it stops once the
     sweep has that many cluster cards, so a roster that changes between ticks
-    cannot file past the first-run cap (#3702); an agent it skips for the cap
+    cannot file past the first-run cap the sweep was filed under (#3702); an agent it skips for the cap
     is left to the sweep and is not counted as unfiled. Returns how many it
     filed and the agents still without a card.
     """
@@ -895,7 +925,7 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
         _log(f"sweep {sweep_id} or all of its cluster cards are archived; not handing off")
         return None
     agents = (roster() if callable(roster) else roster) or []
-    filed_now, unfiled = file_cluster_cards(state, agents, parse_task_id, cap=first_run_cluster_cards(data_dir))
+    filed_now, unfiled = file_cluster_cards(state, agents, parse_task_id, cap=sweep_cluster_cards(data_dir, scan_marker))
     if filed_now:
         # The cards just filed have not run; nothing is settled this tick.
         return None

@@ -903,7 +903,8 @@
 # eval fleet's roster so it binds. Cards for the first two Cluster Agents by
 # profile name only, and the raw report shows the rest audited by the sweep
 # itself. The bootstrap-discovery stack, as bootstrap-discovery-fanout runs it
-# plus the cap file; the onboarding lock, so main-a. Priced with the fan-out.
+# with a cap of 2 where the fan-out pins 24; the onboarding lock, so main-a.
+# Priced with the fan-out.
 ./tasks/bootstrap-discovery-capped/task.yaml
 
 # #3090: the first onboarding report opens with the scan counts and the line

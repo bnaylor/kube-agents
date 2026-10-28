@@ -646,6 +646,26 @@ class HandOffTest(unittest.TestCase):
         self.assertEqual(self._run(now=NOW - 60 + budgeted), "t_rank1")
         self.assertIn("stopped waiting", (self.d / "INVENTORY.raw.md").read_text())
 
+    def _mid_sweep(self, marker_cap):
+        # Six of the sweep's cluster cards are on the board, four more agents
+        # are ready, and the operator has since raised the file to 20.
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\nuncarded=4\n{marker_cap}")
+        _board(self.board, clusters=[(f"t_{i}", "running", None, "") for i in range(6)])
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("20\n")
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster([self._agent(f"t_{i}") for i in range(10)]))
+        return sent
+
+    def test_a_cap_raised_mid_sweep_files_no_more_cards(self):
+        # #3702: the sweep card told its worker to audit the four past cap 6;
+        # carding them now would audit them twice.
+        self.assertEqual(self._mid_sweep("cap=6\n"), [])
+
+    def test_a_sweep_marker_without_a_cap_falls_back_to_the_file(self):
+        # A sweep filed by an older build records no cap= and keeps the file's.
+        self.assertEqual(len(self._mid_sweep("")), 4)
+
     def test_a_roster_under_the_cap_files_every_card(self):
         _board(self.board, clusters=[])
         sent = []
@@ -901,6 +921,28 @@ class FirstRunClusterCardsTest(unittest.TestCase):
             with self.subTest(content=content):
                 marker.write_text(content)
                 self.assertEqual(h.uncarded_agents(marker), want)
+
+    def test_the_marker_cap_is_read_like_the_file(self):
+        marker = self.d / "scan_filed"
+        for content, want in (("task_id=t\nfiled_at=1\n", None), ("task_id=t\ncap=3\n", 3),
+                              ("task_id=t\ncap=0\n", h.FIRST_RUN_CLUSTER_CARDS),
+                              ("task_id=t\ncap=-2\n", h.FIRST_RUN_CLUSTER_CARDS),
+                              ("task_id=t\ncap=lots\n", h.FIRST_RUN_CLUSTER_CARDS),
+                              (f"task_id=t\ncap={h.FIRST_RUN_CLUSTER_CARDS_MAX + 1}\n", h.FIRST_RUN_CLUSTER_CARDS_MAX)):
+            with self.subTest(content=content), mock.patch.object(h, "_log"):
+                marker.write_text(content)
+                self.assertEqual(h.marker_cap(marker), want)
+
+    def test_a_sweep_uses_its_marker_cap_and_else_the_file(self):
+        marker = self.d / "scan_filed"
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("20")
+        marker.write_text("task_id=t\ncap=99\n")
+        with mock.patch.object(h, "_log"):
+            self.assertEqual(h.sweep_cluster_cards(self.d, marker), h.FIRST_RUN_CLUSTER_CARDS_MAX)
+            marker.write_text("task_id=t\n")
+            self.assertEqual(h.sweep_cluster_cards(self.d, marker), 20)
+            marker.write_bytes(b"\xff\xfecap=2\n")
+            self.assertEqual(h.sweep_cluster_cards(self.d, marker), 20)
 
     def test_a_marker_that_is_not_utf8_records_no_uncarded_agents(self):
         # _read_marker raises UnicodeDecodeError, a ValueError, which this read catches.

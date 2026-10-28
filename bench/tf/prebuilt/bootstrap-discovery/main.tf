@@ -29,12 +29,14 @@
 # With `first_run_cluster_cards` set, step 2 first writes it to the agent's
 # `.first_run_cluster_cards`, the gate's first-run cluster card cap (#3702), so
 # the sweep the re-arm brings on is filed under it, after a sentinel beside it
-# (`.first_run_cluster_cards.bench`) that marks the cap as this stack's. The
-# exit trap and the destroy remove the cap and then the sentinel; a cap whose
-# removal failed keeps its sentinel, and every run's step 2, capped or not,
-# removes a sentinel-marked cap first. A capped run refuses an install that
-# already has a cap file without the sentinel: that is an operator's setting,
-# and it is neither overwritten nor removed.
+# (`.first_run_cluster_cards.bench`) holding the same value, which marks the cap
+# as this stack's. The exit trap and the destroy remove the cap and then the
+# sentinel; a cap whose removal failed keeps its sentinel, and every run's step
+# 2, capped or not, first removes a cap its sentinel matches, and a sentinel
+# with no cap or beside a cap of another value on its own. A cap file without a
+# matching sentinel is an operator's setting, and it is neither overwritten nor
+# removed: a capped run refuses the install, and an uncapped run says its sweep
+# is bounded by that cap.
 #
 # It refuses an install where a person has connected (`.user_aligned`) or
 # onboarding already delivered (`.bootstrap_completed`): a fresh sweep there
@@ -358,34 +360,63 @@ resource "null_resource" "sweep" {
       PY
       )"
       # The first-run cap file: `bench` when an earlier run of this stack left
-      # its cap behind (the sentinel is there), `operator` when a cap file is
-      # there without it, `none` otherwise. A failed read stops the apply here.
+      # its cap behind (the sentinel is there and holds the cap's value);
+      # `orphan none` or `orphan operator` when the sentinel is there without
+      # its cap (its own removal failed), alone or beside a cap file of another
+      # value, which an operator wrote since; `operator` when a cap file is
+      # there without the sentinel; `none` otherwise. The sentinel alone is no
+      # proof: an orphaned one beside an operator's later cap would have that
+      # cap removed. An empty sentinel matches nothing. A failed read stops the
+      # apply here.
       cap="${local.cards_cap}"
-      cap_state="$(agent sh -c 'if [ -e "$1" ]; then echo bench; elif [ -e "$2" ]; then echo operator; else echo none; fi' \
+      cap_read="$(agent sh -c 'if [ -e "$1" ]; then
+          mark="$(cat "$1")" || exit 1
+          if [ ! -e "$2" ]; then echo orphan none
+          else
+            file="$(cat "$2")" || exit 1
+            if [ -n "$mark" ] && [ "$mark" = "$file" ]; then echo bench; else echo orphan operator; fi
+          fi
+        elif [ -e "$2" ]; then echo operator; else echo none; fi' \
         sh ${local.cap_mark} ${local.cap_file})"
       # Whatever this run's cap: a leftover cap would bound this sweep, the
       # next case's and the install's real onboarding. The cap goes first, so
       # a removal that fails part-way leaves it marked for the next run.
-      if [ "$cap_state" = bench ]; then
-        agent rm -f ${local.cap_file}
-        agent rm -f ${local.cap_mark}
-        echo "Removed the first-run cluster card cap an earlier run of this stack left in ${local.cap_file}."
-        cap_state=none
-      fi
+      case "$cap_read" in
+        bench)
+          agent rm -f ${local.cap_file}
+          agent rm -f ${local.cap_mark}
+          echo "Removed the first-run cluster card cap an earlier run of this stack left in ${local.cap_file}."
+          cap_state=none ;;
+        "orphan none"|"orphan operator")
+          agent rm -f ${local.cap_mark}
+          cap_state="$${cap_read#orphan }"
+          if [ "$cap_state" = none ]; then
+            echo "Removed ${local.cap_mark}, a sentinel an earlier run of this stack left without its cap."
+          else
+            echo "Removed ${local.cap_mark}, a sentinel an earlier run of this stack left without its cap; the ${local.cap_file} beside it holds another value, so it is an operator's."
+          fi ;;
+        operator|none) cap_state="$cap_read" ;;
+        *)
+          echo "ERROR: could not read ${local.cap_file} or ${local.cap_mark} on ${var.host_cluster_name} (got '$cap_read')." >&2
+          exit 1 ;;
+      esac
       if [ -n "$cap" ] && [ "$cap_state" != none ]; then
-        echo "ERROR: ${local.cap_file} exists on ${var.host_cluster_name} and this stack did not write it (no ${local.cap_mark}), so it is an operator's first-run cluster card cap (got '$cap_state'). This case would have to overwrite it to grade its own cap. Remove the file if nobody needs it, or run this case on another install." >&2
+        echo "ERROR: ${local.cap_file} exists on ${var.host_cluster_name} and this stack did not write it (no ${local.cap_mark} holding its value), so it is an operator's first-run cluster card cap. This case would have to overwrite it to grade its own cap. Remove the file if nobody needs it, or run this case on another install." >&2
         exit 1
+      fi
+      if [ "$cap_state" = operator ]; then
+        echo "Note: ${local.cap_file} exists on ${var.host_cluster_name} and this stack did not write it; the sweep this run files is bounded by that cap."
       fi
       rearmed=1
       # The cap goes in before anything the gate acts on changes, so whichever
       # gate run files the new sweep reads it: on an install whose gate was
       # open, that run can come before the markers are removed below. Marked
-      # first, in the trap's `capped` and then in the sentinel, so the trap
-      # also removes a write that failed part-way and a run after a failed
-      # removal knows the cap for this stack's.
+      # first, in the trap's `capped` and then in the sentinel, which holds the
+      # same value, so the trap also removes a write that failed part-way and a
+      # run after a failed removal knows the cap for this stack's.
       if [ -n "$cap" ]; then
         capped=1
-        agent sh -c ': > "$1"' sh ${local.cap_mark}
+        agent sh -c 'printf "%s\n" "$1" > "$2"' sh "$cap" ${local.cap_mark}
         agent sh -c 'printf "%s\n" "$1" > "$2"' sh "$cap" ${local.cap_file}
         echo "First-run cluster card cap set to $cap in ${local.cap_file}."
       fi
@@ -563,7 +594,8 @@ resource "null_resource" "sweep" {
       # an install that had an operator's file, so the file here is this
       # stack's. Left behind, the cap would bound the next sweep, the next
       # case's and the install's real onboarding, so the sentinel goes only once
-      # the cap has: the next run's step 2 removes a cap still marked.
+      # the cap has: the next run's step 2 removes a cap whose sentinel still
+      # holds its value, and a sentinel left without its cap.
       if [ -n "${self.triggers.cards_cap}" ]; then
         { kubectl exec -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
             rm -f ${self.triggers.cap_file} \

@@ -213,10 +213,12 @@ def cluster_agents(capped: bool = True) -> list[dict]:
     whose stat fails with EACCES or EIO fails ``list_profiles`` itself, below;
     ``list_profiles`` leaves out a dangling symlink.
 
-    At most ``bootstrap_handoff.first_run_cluster_cards`` entries, the first by
-    profile name (#3702): each entry is a model turn before the user has asked
-    anything, and a cluster past the cap is left to the sweep, the same as one
-    whose profile is not ready.
+    At most the first-run cap's entries, the first by profile name (#3702):
+    each entry is a model turn before the user has asked anything, and a
+    cluster past the cap is left to the sweep, the same as one whose profile is
+    not ready. Once the sweep is filed the cap is the one its marker recorded
+    (``bootstrap_handoff.sweep_cluster_cards``), so raising the file mid-sweep
+    cannot card a cluster the sweep card already gave its worker.
 
     Failing to list the profiles, or to import the readiness rule, returns an
     empty list, which files the solo sweep. Raising would fail the run before
@@ -271,7 +273,7 @@ def cluster_agents(capped: bool = True) -> list[dict]:
     agents.sort(key=lambda a: a["name"])
     if not capped:
         return agents
-    cap = bootstrap_handoff.first_run_cluster_cards(_data_dir())
+    cap = bootstrap_handoff.sweep_cluster_cards(_data_dir(), _data_dir() / SCAN_FILED_MARKER)
     if len(agents) > cap:
         sys.stderr.write(
             f"bootstrap_scan_gate: {len(agents)} Cluster Agents are ready; the first {cap} get audit cards "
@@ -582,7 +584,7 @@ def should_skip(data_dir: Path) -> bool:
     )
 
 
-def _task_body() -> str:
+def _task_body(cap: int | None = None) -> str:
     multi = _scope_has_other_projects(_data_dir())
     every_cluster = "every cluster the projects in scope have" if multi else "every cluster the project has"
     cannot_list = "a project's clusters" if multi else "the project's clusters"
@@ -590,7 +592,9 @@ def _task_body() -> str:
     instruction_list = "\n".join(f"  - {p}" for p in INSTRUCTIONS_PATHS)
     cluster_audit_list = "\n".join(f"  - {p}" for p in CLUSTER_AUDIT_INSTRUCTIONS_PATHS)
     ready = cluster_agents(capped=False)
-    kept = ready[: bootstrap_handoff.first_run_cluster_cards(_data_dir())]
+    if cap is None:
+        cap = bootstrap_handoff.first_run_cluster_cards(_data_dir())
+    kept = ready[:cap]
     roster = "\n".join(f"    - `{a['name']}`: {a['cluster_label']}" for a in kept) or "    (none)"
     past_cap = ready[len(kept):]
     past_cap_note = (
@@ -698,10 +702,12 @@ def file_scan_task(data_dir: Path) -> str | None:
         sys.stderr.write(f"bootstrap_scan_gate: kanban API unavailable: {e}\n")
         return None
 
+    # Read once, so the card's roster, the marker's count and the marker's cap agree.
+    cap = bootstrap_handoff.first_run_cluster_cards(data_dir)
     cmd = (
         f"create --json --assignee {shlex.quote(SCAN_ASSIGNEE)} "
         f"--idempotency-key {shlex.quote(SCAN_IDEMPOTENCY_KEY)} "
-        f"--body {shlex.quote(_task_body())} "
+        f"--body {shlex.quote(_task_body(cap))} "
         f"{shlex.quote(SCAN_TASK_TITLE)}"
     )
     try:
@@ -718,22 +724,26 @@ def file_scan_task(data_dir: Path) -> str | None:
         return None
 
     ready = cluster_agents(capped=False)
-    _mark_filed(data_dir, task_id, uncarded=max(0, len(ready) - bootstrap_handoff.first_run_cluster_cards(data_dir)))
+    _mark_filed(data_dir, task_id, uncarded=max(0, len(ready) - cap), cap=cap)
     sys.stderr.write(f"bootstrap_scan_gate: filed sweep card {task_id}\n")
     return task_id
 
 
-def _mark_filed(data_dir: Path, task_id: str, uncarded: int = 0) -> None:
+def _mark_filed(data_dir: Path, task_id: str, uncarded: int = 0, cap: int | None = None) -> None:
     """Record the filed card so no later tick files a second one.
 
     Written with the card id and timestamp rather than an empty touch file:
     when someone asks why onboarding is not progressing, this is the file that
-    tells them which card to go and look at.
+    tells them which card to go and look at. ``cap`` is the first-run cap the
+    sweep was filed under; later ticks hold to it rather than re-reading the
+    file (#3702).
     """
     marker = data_dir / SCAN_FILED_MARKER
     try:
         marker.write_text(
-            f"task_id={task_id}\nfiled_at={int(time.time())}\n" + (f"uncarded={uncarded}\n" if uncarded else ""),
+            f"task_id={task_id}\nfiled_at={int(time.time())}\n"
+            + (f"uncarded={uncarded}\n" if uncarded else "")
+            + (f"cap={cap}\n" if cap is not None else ""),
             encoding="utf-8",
         )
     except Exception as e:  # noqa: BLE001 - never fail the cron run

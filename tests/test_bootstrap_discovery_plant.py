@@ -89,7 +89,7 @@ _INTERPOLATIONS = {
     "local.settle_hold": "120",
     "local.cap_file": "/opt/data/.first_run_cluster_cards",
     "local.cap_mark": "/opt/data/.first_run_cluster_cards.bench",
-    # first_run_cluster_cards null, as bootstrap-discovery-fanout runs it.
+    # first_run_cluster_cards null, the stack's default; both bench cases set it.
     "local.cards_cap": "",
     "var.project_id": "kube-agents-evals",
     "var.host_cluster_name": "platform-agent-host",
@@ -618,8 +618,12 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertEqual(len(mark), 1, calls)
         self.assertLess(self._indices(calls, "[cap_state]")[0], mark[0])
         self.assertLess(mark[0], cap[0])
-        self.assertIn(" sh /opt/data/.first_run_cluster_cards.bench [mark]", calls[mark[0]])
+        # The sentinel holds the cap's value, so step 2 can tell it from an
+        # operator's cap written beside a sentinel orphaned later.
+        self.assertIn(" sh 2 /opt/data/.first_run_cluster_cards.bench [mark]", calls[mark[0]])
         self.assertIn(" sh 2 /opt/data/.first_run_cluster_cards [cap]", calls[cap[0]])
+        self.assertIn('printf "%s\\n" "$1" > "$2"', calls[mark[0]])
+        self.assertIn('printf "%s\\n" "$1" > "$2"', calls[cap[0]])
         # Before the gate can act: ahead of the card archive and the marker removal.
         self.assertLess(self._indices(calls, "[old_id]")[0], cap[0])
         self.assertLess(cap[0], self._indices(calls, "[open_cards]")[0])
@@ -671,8 +675,8 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertEqual([c for c in calls if "[clear " in c], [])
 
     def test_an_uncapped_run_removes_a_cap_an_earlier_run_left(self):
-        # The fanout case runs this stack with no cap; a capped run's leftover
-        # would otherwise bound its sweep.
+        # A run with no cap of its own; a capped run's leftover would
+        # otherwise bound its sweep.
         completed, calls = self._run_handoff(CAP_STATE="bench")
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self._assert_cap_then_sentinel_removed(calls)
@@ -699,6 +703,50 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         completed, calls = self._run_handoff(CAP_STATE="operator")
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual([c for c in calls if c.endswith(("[cap]", "[uncap]", "[mark]", "[unmark]"))], [])
+        # The run's sweep is bounded by that cap, so the log says so.
+        self.assertIn(
+            "Note: /opt/data/.first_run_cluster_cards exists on platform-agent-host and this stack did not write it; "
+            "the sweep this run files is bounded by that cap.",
+            completed.stdout,
+        )
+
+    def test_an_orphaned_sentinel_with_no_cap_is_removed_and_nothing_else(self):
+        completed, calls = self._run_handoff(CAP_STATE="orphan none")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual([c for c in calls if c.endswith(("[cap]", "[uncap]", "[mark]", "[unmark]"))],
+                         [c for c in calls if c.endswith("[unmark]")])
+        self.assertEqual(len(self._indices(calls, "[unmark]")), 1, calls)
+        self.assertIn("left without its cap.", completed.stdout)
+        self.assertNotIn("Note:", completed.stdout)
+
+    def test_an_orphaned_sentinel_beside_another_cap_leaves_that_cap_as_an_operators(self):
+        # The sentinel goes; the cap file it does not match is an operator's,
+        # so a capped run refuses and an uncapped one names it.
+        for capped in (True, False):
+            with self.subTest(capped=capped):
+                self._clear()
+                if capped:
+                    self._capped()
+                else:
+                    self._script.write_text(self._plant)
+                completed, calls = self._run_handoff(CAP_STATE="orphan operator")
+                self.assertEqual(len(self._indices(calls, "[unmark]")), 1, calls)
+                self.assertEqual(self._indices(calls, "[uncap]"), [])
+                self.assertIn("holds another value, so it is an operator's", completed.stdout)
+                if capped:
+                    self.assertEqual(completed.returncode, 1, completed.stderr)
+                    self.assertIn("operator's first-run cluster card cap", completed.stderr)
+                    for tag in ("[cap]", "[mark]", "[archive]", "[rearm]", "[open_cards]"):
+                        self.assertEqual(self._indices(calls, tag), [], tag)
+                else:
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertIn("Note: /opt/data/.first_run_cluster_cards exists", completed.stdout)
+
+    def test_an_unknown_cap_read_stops_the_apply_before_anything_changes(self):
+        completed, calls = self._run_handoff(CAP_STATE="bench operator")
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertIn("could not read /opt/data/.first_run_cluster_cards", completed.stderr)
+        self._nothing_changed(calls)
 
     def test_a_failed_read_of_the_cap_file_stops_the_apply_before_anything_changes(self):
         for capped in (False, True):
@@ -779,6 +827,42 @@ class SweepIdReadTest(unittest.TestCase):
 
     def test_a_marker_written_by_hand_reads_as_its_task_id(self):
         self.assertEqual(self._sweep_id("filed_at=1\n  task_id = t_2\n"), "t_2")
+
+
+class CapStateReadTest(unittest.TestCase):
+    """Step 2's classification of the cap file and its sentinel, run by sh against a data dir."""
+
+    def _cap_read(self, mark=None, cap=None):
+        with tempfile.TemporaryDirectory() as home:
+            paths = {"local.cap_mark": f"{home}/.first_run_cluster_cards.bench",
+                     "local.cap_file": f"{home}/.first_run_cluster_cards"}
+            for key, text in (("local.cap_mark", mark), ("local.cap_file", cap)):
+                if text is not None:
+                    pathlib.Path(paths[key]).write_text(text)
+            plant = _render_plant(**paths)
+            command = re.search(r"^cap_read=\"\$\(agent sh -c '(.*?)' \\\n", plant, re.S | re.M).group(1)
+            return subprocess.run(
+                ["sh", "-c", command, "sh", paths["local.cap_mark"], paths["local.cap_file"]],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+
+    def test_a_sentinel_holding_the_caps_value_reads_as_the_benchs(self):
+        self.assertEqual(self._cap_read(mark="2\n", cap="2\n"), "bench")
+        self.assertEqual(self._cap_read(mark="2\n", cap="2"), "bench")
+
+    def test_a_sentinel_without_its_cap_reads_as_an_orphan(self):
+        self.assertEqual(self._cap_read(mark="2\n"), "orphan none")
+
+    def test_a_sentinel_beside_a_cap_of_another_value_reads_as_an_orphan_and_an_operators_cap(self):
+        self.assertEqual(self._cap_read(mark="2\n", cap="10\n"), "orphan operator")
+        # An empty sentinel, as an older build of this stack wrote, proves nothing.
+        self.assertEqual(self._cap_read(mark="", cap=""), "orphan operator")
+
+    def test_a_cap_without_a_sentinel_is_an_operators(self):
+        self.assertEqual(self._cap_read(cap="4\n"), "operator")
+
+    def test_neither_file_reads_as_none(self):
+        self.assertEqual(self._cap_read(), "none")
 
 
 class Step2GateQueryTest(unittest.TestCase):
