@@ -57,7 +57,8 @@ func chainPools(t *testing.T, b *bus, spawn map[string]child, work time.Duration
 	return ti
 }
 
-// Ceiling 3: the child reserve is 1, so top-level work stops at 2. Three
+// Ceiling 3: reserves of 1 (child) and 1 (interactive) and one shared slot,
+// so top-level work stops at 2. Three
 // chains' parents ask for every slot; two get them and wait on children in
 // the other profile, the third waits in the queue. The children still run,
 // one at a time through the reserved slot, and every chain completes.

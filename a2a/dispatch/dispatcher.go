@@ -74,6 +74,12 @@ type renewal struct {
 
 type offerKey struct{ profile, tier, pod, taskID string }
 
+// bindBackoff is when a durable's bind is next tried, and the delay after.
+type bindBackoff struct {
+	next  time.Time
+	delay time.Duration
+}
+
 // waiting is a submission over a cap, remembered for the health line.
 type waiting struct {
 	durable  string
@@ -102,12 +108,19 @@ type Dispatcher struct {
 	subs      map[string]lib.HeldSubscription
 	binding   map[string]bool
 	draining  []lib.HeldSubscription
-	// granted is the durables the current connection's grants cover: the
-	// callout fixes a principal's grants per connection, from the config
-	// the operator rendered when it connected. A config listing a durable
-	// outside it needs a reconnect first.
-	granted    map[string]bool
-	reconnects atomic.Int64
+	// granted is the durables, and grantedProfiles the profiles (their
+	// `.events` publish), the current connection's grants cover: the callout
+	// fixes a principal's grants per connection, from the config the
+	// operator rendered when it connected. A config listing a durable or a
+	// profile outside them needs a reconnect first.
+	granted         map[string]bool
+	grantedProfiles map[string]bool
+	// bindRetry paces the retries of durables that failed to bind.
+	bindRetry map[string]bindBackoff
+	// regrantNotBefore holds off another round of reconnects after one
+	// that left a durable unbindable.
+	regrantNotBefore time.Time
+	reconnects       atomic.Int64
 }
 
 // New builds a dispatcher on bus. src is the install config, pool the
@@ -133,6 +146,9 @@ func New(cfg Config, bus *lib.Client, src Source, pool Pool, verifier Verifier, 
 		subs:      map[string]lib.HeldSubscription{},
 		binding:   map[string]bool{},
 		granted:   map[string]bool{},
+
+		grantedProfiles: map[string]bool{},
+		bindRetry:       map[string]bindBackoff{},
 	}, nil
 }
 
@@ -145,6 +161,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 	d.started = d.now()
 	// The connection was made against the config as it stands now.
 	for _, p := range d.src.Config().Profiles {
+		d.grantedProfiles[p.Name] = true
 		for _, dur := range p.Durables {
 			d.granted[dur.Name] = true
 		}
@@ -211,9 +228,12 @@ func (d *Dispatcher) syncBindings(ctx context.Context) {
 	cfg := d.src.Config()
 	want := map[string]string{} // durable name -> profile
 	durables := map[string]lib.DispatchDurable{}
-	var added []string
+	var added, addedProfiles []string
 	d.mu.Lock()
 	for _, p := range cfg.Profiles {
+		if !d.grantedProfiles[p.Name] {
+			addedProfiles = append(addedProfiles, p.Name)
+		}
 		for _, dur := range p.Durables {
 			want[dur.Name], durables[dur.Name] = p.Name, dur
 			if !d.granted[dur.Name] {
@@ -221,19 +241,26 @@ func (d *Dispatcher) syncBindings(ctx context.Context) {
 			}
 		}
 	}
+	cooling := d.now().Before(d.regrantNotBefore)
 	d.mu.Unlock()
-	if len(added) > 0 {
-		d.regrant(ctx, want, durables, added)
+	if (len(added) > 0 || len(addedProfiles) > 0) && !cooling {
+		d.regrant(ctx, want, durables, added, addedProfiles)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	for name := range d.grantedProfiles {
+		if _, ok := profileOf(cfg, name); !ok {
+			delete(d.grantedProfiles, name)
+		}
+	}
 	for name := range d.granted {
 		if want[name] == "" {
 			delete(d.granted, name)
 		}
 	}
+	now := d.now()
 	for name, profile := range want {
-		if !d.granted[name] || d.subs[name] != nil || d.binding[name] {
+		if !d.granted[name] || d.subs[name] != nil || d.binding[name] || now.Before(d.bindRetry[name].next) {
 			continue
 		}
 		d.binding[name] = true
@@ -250,11 +277,11 @@ func (d *Dispatcher) syncBindings(ctx context.Context) {
 }
 
 // regrant reconnects so the bus connection carries grants for the durables
-// the config added, then binds them. A bind still refused (the callout's
+// and profiles the config added, then binds the durables. A bind still refused (the callout's
 // watch lagging the config) gets another reconnect, with backoff, up to
 // RegrantAttempts; then it is logged as an error and left for the next
 // refresh. Held work is untouched throughout (lib.Client.Reconnect).
-func (d *Dispatcher) regrant(ctx context.Context, want map[string]string, durables map[string]lib.DispatchDurable, added []string) {
+func (d *Dispatcher) regrant(ctx context.Context, want map[string]string, durables map[string]lib.DispatchDurable, added, addedProfiles []string) {
 	backoff := d.cfg.RegrantBackoff
 	pending := added
 	for attempt := 1; attempt <= d.cfg.RegrantAttempts; attempt++ {
@@ -272,9 +299,23 @@ func (d *Dispatcher) regrant(ctx context.Context, want map[string]string, durabl
 			d.log.Warn("reconnect for new durables' grants", "attempt", attempt, "err", err)
 			continue
 		}
+		// A profile's `.events` grant can't be probed without publishing;
+		// the reconnect is what carries it.
+		d.mu.Lock()
+		for _, p := range addedProfiles {
+			d.grantedProfiles[p] = true
+		}
+		d.mu.Unlock()
 		var refused []string
 		for _, name := range pending {
-			if err := d.bindNow(ctx, want[name], durables[name]); err != nil {
+			err := d.bindNow(ctx, want[name], durables[name])
+			switch {
+			case err == nil:
+			case errors.Is(err, jetstream.ErrConsumerNotFound):
+				// The bus answered, so the grant is there: the durable
+				// just isn't yet, and the bind retries pick it up.
+				d.noteBindFailure(name, err)
+			default:
 				refused = append(refused, name)
 				d.log.Warn("bind refused after a reconnect; the grants may lag the config", "durable", name, "attempt", attempt, "err", err)
 			}
@@ -287,13 +328,32 @@ func (d *Dispatcher) regrant(ctx context.Context, want map[string]string, durabl
 		}
 		d.mu.Unlock()
 		if len(refused) == 0 {
-			d.log.Info("reconnected for new durables", "durables", added, "attempts", attempt)
+			d.log.Info("reconnected for new durables and profiles", "durables", added, "profiles", addedProfiles, "attempts", attempt)
 			return
 		}
 		pending = refused
 	}
-	d.log.Error("durables still not bindable after reconnecting; retrying on the next refresh",
-		"durables", pending, "attempts", d.cfg.RegrantAttempts)
+	d.mu.Lock()
+	d.regrantNotBefore = d.now().Add(d.cfg.RegrantCooldown)
+	d.mu.Unlock()
+	d.log.Error("durables still not bindable after reconnecting; trying again after the cooldown",
+		"durables", pending, "attempts", d.cfg.RegrantAttempts, "cooldown", d.cfg.RegrantCooldown)
+}
+
+// noteBindFailure backs a durable's next bind off, doubling to the max.
+// Callers don't hold d.mu.
+func (d *Dispatcher) noteBindFailure(name string, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	b := d.bindRetry[name]
+	b.delay = min(max(2*b.delay, d.cfg.BindRetryBase), d.cfg.BindRetryMax)
+	b.next = d.now().Add(b.delay)
+	d.bindRetry[name] = b
+	if errors.Is(err, jetstream.ErrConsumerNotFound) {
+		d.log.Info("durable not created yet; retrying", "durable", name, "in", b.delay)
+	} else {
+		d.log.Warn("durable bind failed; retrying", "durable", name, "in", b.delay, "err", err)
+	}
 }
 
 // bindNow binds one durable within BindAttemptTimeout.
@@ -311,6 +371,7 @@ func (d *Dispatcher) bindNow(ctx context.Context, profile string, dur lib.Dispat
 		d.draining = append(d.draining, old)
 	}
 	d.subs[dur.Name] = sub
+	delete(d.bindRetry, dur.Name)
 	return nil
 }
 
@@ -329,14 +390,20 @@ func (d *Dispatcher) Reconnects() int64 { return d.reconnects.Load() }
 
 func (d *Dispatcher) bind(ctx context.Context, profile string, dur lib.DispatchDurable) {
 	name := dur.Name
-	sub, err := d.subscribe(ctx, profile, dur)
+	bctx, cancel := context.WithTimeout(ctx, d.cfg.BindAttemptTimeout)
+	sub, err := d.subscribe(bctx, profile, dur)
+	cancel()
+	if err != nil {
+		d.noteBindFailure(name, err)
+		d.mu.Lock()
+		delete(d.binding, name)
+		d.mu.Unlock()
+		return
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	delete(d.binding, name)
-	if err != nil {
-		d.log.Error("bind a profile durable; retrying on the next refresh", "durable", name, "err", err)
-		return
-	}
+	delete(d.bindRetry, name)
 	if ctx.Err() != nil {
 		sub.Stop()
 		return
@@ -463,53 +530,58 @@ func (d *Dispatcher) reject(ctx context.Context, log *slog.Logger, del lib.Deliv
 // cap that doesn't. The counts are this process's live holdings, read under
 // the lock, so caps follow the config from one decision to the next.
 //
-// The caps, every kind counted against the install ceiling C:
+// The caps:
 //   - the profile's concurrency, for its top-level tasks and, as its own
 //     cap, for its children;
-//   - C itself;
-//   - the child reserve: top-level tasks may use at most C minus it, so
-//     parents waiting on children never hold every slot;
-//   - the interactive reserve: unattended work may use
-//     at most C minus it overall, and at most the top-level share minus it
-//     for top-level tasks, so it cannot starve people.
+//   - the install ceiling C, every kind counted, split into three disjoint
+//     shares: the child reserve, the interactive reserve, and the shared
+//     rest (at least one slot whenever C is; the config's Validate holds
+//     the reserves to C-1 together). A child fills the child reserve first,
+//     then the shared slots; an interactive top-level task the interactive
+//     reserve first, then the shared slots; unattended top-level work only
+//     the shared slots. So parents never hold the slots their children
+//     need, and unattended work never holds the slots people need.
 //
 // The reserves come resolved in the config. A task over a cap is never
 // failed for it: it stays queued.
 func (d *Dispatcher) reserve(snap lib.DispatchConfig, prof lib.DispatchProfile, tier, kind, taskID string) (*holding, string) {
 	unattended := d.cfg.unattended(tier)
-	c := snap.Ceiling
-	topShare := c - snap.ChildReserve
-	interactive := snap.InteractiveReserve
+	shared := snap.Ceiling - snap.ChildReserve - snap.InteractiveReserve
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	var total, top, unattendedAll, unattendedTop, profKind int
+	var total, children, interactiveTop, unattendedTop, profKind int
 	for _, h := range d.active {
 		total++
-		if h.kind == lib.SubmitKindTop {
-			top++
-		}
-		if h.unattended {
-			unattendedAll++
-			if h.kind == lib.SubmitKindTop {
-				unattendedTop++
-			}
+		switch {
+		case h.kind == lib.SubmitKindChild:
+			children++
+		case h.unattended:
+			unattendedTop++
+		default:
+			interactiveTop++
 		}
 		if h.profile == prof.Name && h.kind == kind {
 			profKind++
 		}
 	}
+	sharedUsed := max(0, children-snap.ChildReserve) + max(0, interactiveTop-snap.InteractiveReserve) + unattendedTop
+	var fits bool
+	switch {
+	case kind == lib.SubmitKindChild:
+		fits = children < snap.ChildReserve || sharedUsed < shared
+	case unattended:
+		fits = sharedUsed < shared
+	default:
+		fits = interactiveTop < snap.InteractiveReserve || sharedUsed < shared
+	}
 	switch {
 	case profKind >= prof.Concurrency:
 		return nil, "profile concurrency"
-	case total >= c:
+	case total >= snap.Ceiling:
 		return nil, "install ceiling"
-	case kind == lib.SubmitKindTop && top >= topShare:
-		return nil, "child reserve"
-	case unattended && unattendedAll >= c-interactive:
-		return nil, "interactive reserve"
-	case unattended && kind == lib.SubmitKindTop && unattendedTop >= topShare-interactive:
-		return nil, "interactive reserve"
+	case !fits:
+		return nil, "the free slots are reserved for other kinds"
 	}
 	h := &holding{profile: prof.Name, tier: tier, kind: kind, taskID: taskID, unattended: unattended,
 		renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}

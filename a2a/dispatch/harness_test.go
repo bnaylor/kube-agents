@@ -68,8 +68,13 @@ func testProfile(name string, concurrency int, tiers ...string) lib.DispatchProf
 // testDispatchConfig is the install at test speed. Lease and renewal ride
 // the offer as whole seconds, so they can go no lower.
 func testDispatchConfig(ceiling int, profiles ...lib.DispatchProfile) lib.DispatchConfig {
-	r := max(1, (ceiling+2)/3)
-	return lib.DispatchConfig{Version: "test", Namespace: "kube-agents", ProfileNamespace: "kube-agents-profiles", Ceiling: ceiling, InteractiveReserve: r, ChildReserve: r,
+	// The operator's shape: disjoint reserves of about a third each, child
+	// first, leaving at least one shared slot (ceiling 1: none, 2: child 1,
+	// 3: 1 and 1, 6: 2 and 2).
+	third := max(1, (ceiling+2)/3)
+	child := min(third, ceiling-1)
+	interactive := min(third, ceiling-1-child)
+	return lib.DispatchConfig{Version: "test", Namespace: "kube-agents", ProfileNamespace: "kube-agents-profiles", Ceiling: ceiling, InteractiveReserve: interactive, ChildReserve: child,
 		LeaseSeconds: 3, RenewSeconds: 1, RestartGraceSeconds: 2, AcceptTimeoutSeconds: 1, Profiles: profiles}
 }
 

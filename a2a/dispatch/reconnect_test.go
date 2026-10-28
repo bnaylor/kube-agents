@@ -12,9 +12,10 @@ import (
 )
 
 // The callout fixes the dispatcher's grants per connection, enumerating the
-// durables in the config it rendered against. Modelled here with two
-// users: "disp-old", which may not touch the durables of profile `tse2`,
-// and "disp-new", which may. The dispatcher's connection authenticates as
+// durables and the profiles' `.events` in the config it rendered against.
+// Modelled here with two users: "disp-old", which may not touch the
+// durables of profile `tse2` nor publish on its `.events`, and "disp-new",
+// which may. The dispatcher's connection authenticates as
 // whichever the test says, read at each dial, as a fresh token would be.
 
 const dispPass = "disp-pw"
@@ -25,6 +26,7 @@ func dispatcherUsers() []*natsserver.User {
 		name := lib.ProfileDurableName("tse2", "read", kind)
 		deny = append(deny, "$JS.API.CONSUMER.INFO.TASKS."+name, "$JS.API.CONSUMER.MSG.NEXT.TASKS."+name, "$JS.ACK.TASKS."+name+".>")
 	}
+	deny = append(deny, "a2a.tasks.tse2.*.events")
 	return []*natsserver.User{
 		{Username: "disp-old", Password: dispPass, Permissions: &natsserver.Permissions{
 			Publish: &natsserver.SubjectPermission{Allow: []string{">"}, Deny: deny}}},
@@ -84,6 +86,12 @@ func TestAnAddedDurableReconnectsOnceAndKeepsHeldWork(t *testing.T) {
 	if ts := b.waitTerminal("task-2", 15*time.Second); ts.state != lib.StateCompleted || ts.from != "tse2-0" {
 		t.Errorf("task-2 on the added profile: %+v", ts)
 	}
+	// The dispatcher's own `.events` publish for the new profile rides the
+	// new grants too: a refusal's terminal lands.
+	b.submitWith("tse2", "read", lib.SubmitKindTop, "task-refused", "", map[string]string{})
+	if ts := b.waitTerminal("task-refused", 15*time.Second); ts.state != lib.StateRejected || ts.from != selfSession {
+		t.Errorf("the dispatcher's terminal on the added profile: %+v", ts)
+	}
 	if ts := b.waitTerminal("task-1", 15*time.Second); ts.state != lib.StateCompleted || ts.from != "tse-0" {
 		t.Errorf("task-1 held across the reconnect: %+v", ts)
 	}
@@ -135,5 +143,52 @@ func TestARefusedBindAfterReconnectIsRetriedUntilGranted(t *testing.T) {
 	}
 	if n := d.Reconnects(); n < 2 || n > int64(fastRegrant().RegrantAttempts) {
 		t.Errorf("%d reconnects, want more than one and at most the bound", n)
+	}
+}
+
+// A durable the config lists that the bus doesn't have yet (the operator
+// creates durables asynchronously) is "not yet": the bind is retried with
+// backoff, nothing fails, and the queued submission runs once it appears.
+func TestADurableNotCreatedYetIsBoundWhenItAppears(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.worker("tse", "read", "tse-0", answerAccept, 300*time.Millisecond)
+	d, _ := b.runDispatcher(fastRegrant(), oneProfile("tse", 2, "tse-0"), &fakeVerifier{})
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	time.Sleep(2 * time.Second)
+	if ts := b.terminalsOf("task-1"); len(ts) != 0 {
+		t.Fatalf("terminal before the durable existed: %+v", ts)
+	}
+	b.ensure("tse", 2, 0, "read")
+	if ts := b.waitTerminal("task-1", 15*time.Second); ts.state != lib.StateCompleted {
+		t.Errorf("task-1: %+v", ts)
+	}
+	if n := d.Reconnects(); n != 0 {
+		t.Errorf("%d reconnects for a durable that was merely late, want 0", n)
+	}
+}
+
+// A profile added with grants in place but its durable not created yet
+// costs one reconnect (the bus answers "no such consumer", so the grant is
+// there), not a round of them; the durable binds when it appears.
+func TestAnAddedProfileWithALateDurableReconnectsOnce(t *testing.T) {
+	b := newBusWith(t, dispatcherUsers(), "tse2-0")
+	b.ensure("tse", 2, 0, "read")
+	b.worker("tse2", "read", "tse2-0", answerAccept, 300*time.Millisecond)
+	var g grantSwitch
+	g.set("disp-new")
+	ti := oneProfile("tse", 2)
+	d, _ := b.runDispatcherOn(b.connectAs(&g), fastRegrant(), ti, &fakeVerifier{})
+	time.Sleep(500 * time.Millisecond)
+	ti.pool.Set("tse2", "read", "tse2-0")
+	ti.update(func(c *lib.DispatchConfig) { c.Version = "v2"; c.Profiles = append(c.Profiles, testProfile("tse2", 2)) })
+	waitFor(t, 15*time.Second, "the reconnect", func() bool { return d.Reconnects() == 1 })
+	time.Sleep(2 * time.Second)
+	b.ensure("tse2", 2, 0, "read")
+	b.submit("tse2", "read", lib.SubmitKindTop, "task-1")
+	if ts := b.waitTerminal("task-1", 15*time.Second); ts.state != lib.StateCompleted {
+		t.Errorf("task-1: %+v", ts)
+	}
+	if n := d.Reconnects(); n != 1 {
+		t.Errorf("%d reconnects, want 1", n)
 	}
 }

@@ -38,37 +38,80 @@ func refused(d *Dispatcher, snap lib.DispatchConfig, profile, tier, kind string)
 	return why
 }
 
-// Unattended work leaves the interactive reserve free: with ceiling 9 the
-// reserves are 3 each, so unattended top-level work stops at 3 (the
-// top-level share of 6 less the reserve) and unattended work overall at 6,
-// while interactive work still gets its share.
-func TestTheInteractiveReserveHoldsUnderUnattendedLoad(t *testing.T) {
-	d := bareDispatcher()
-	snap := capsSnapshot(9)
-	fill(t, d, snap, "chat", "unattended", lib.SubmitKindTop, 3)
-	if why := refused(d, snap, "chat", "unattended", lib.SubmitKindTop); why != "interactive reserve" {
-		t.Fatalf("a fourth unattended top-level task: refused for %q, want the interactive reserve", why)
+func TestTheTestReservesMatchTheOperatorsExamples(t *testing.T) {
+	for _, tc := range []struct{ ceiling, child, interactive int }{{1, 0, 0}, {2, 1, 0}, {3, 1, 1}, {6, 2, 2}} {
+		c := capsSnapshot(tc.ceiling)
+		if c.ChildReserve != tc.child || c.InteractiveReserve != tc.interactive {
+			t.Errorf("ceiling %d: child %d interactive %d, want %d and %d", tc.ceiling, c.ChildReserve, c.InteractiveReserve, tc.child, tc.interactive)
+		}
+		if err := c.Validate(); err != nil {
+			t.Errorf("ceiling %d: %v", tc.ceiling, err)
+		}
 	}
-	fill(t, d, snap, "chat", "unattended", lib.SubmitKindChild, 3)
-	if why := refused(d, snap, "chat", "unattended", lib.SubmitKindChild); why != "interactive reserve" {
-		t.Fatalf("a seventh unattended task: refused for %q, want the interactive reserve", why)
-	}
-	fill(t, d, snap, "chat", "read", lib.SubmitKindTop, 3)
 }
 
-// Top-level work stops at the ceiling minus the child reserve, so children
-// always have a slot.
-func TestTheChildReserveIsLeftForChildren(t *testing.T) {
+// Ceiling 6 (child 2, interactive 2, shared 2). Unattended work gets the 2
+// shared slots and no more; interactive work still gets its 2 reserved, and
+// children their 2.
+func TestCeilingSixKeepsEachReserve(t *testing.T) {
 	d := bareDispatcher()
 	snap := capsSnapshot(6)
-	fill(t, d, snap, "chat", "read", lib.SubmitKindTop, 4)
-	if why := refused(d, snap, "chat", "read", lib.SubmitKindTop); why != "child reserve" {
-		t.Fatalf("a fifth top-level task: refused for %q, want the child reserve", why)
+	fill(t, d, snap, "chat", "unattended", lib.SubmitKindTop, 2)
+	if why := refused(d, snap, "chat", "unattended", lib.SubmitKindTop); why == "" {
+		t.Fatal("a third unattended top-level task took a reserved slot")
+	}
+	fill(t, d, snap, "chat", "read", lib.SubmitKindTop, 2)
+	if why := refused(d, snap, "chat", "read", lib.SubmitKindTop); why == "" {
+		t.Fatal("a third interactive top-level task took the child reserve")
 	}
 	fill(t, d, snap, "chat", "read", lib.SubmitKindChild, 2)
 	if why := refused(d, snap, "chat", "read", lib.SubmitKindChild); why != "install ceiling" {
-		t.Errorf("a child past the ceiling: refused for %q, want the install ceiling", why)
+		t.Errorf("a child past the ceiling: %q", why)
 	}
+}
+
+// Ceiling 6, children first: children fill their reserve, then the shared
+// slots, but never the interactive reserve.
+func TestChildrenOverflowIntoSharedNotInteractive(t *testing.T) {
+	d := bareDispatcher()
+	snap := capsSnapshot(6)
+	fill(t, d, snap, "chat", "read", lib.SubmitKindChild, 4)
+	if why := refused(d, snap, "chat", "read", lib.SubmitKindChild); why == "" {
+		t.Fatal("a fifth child took the interactive reserve")
+	}
+	if why := refused(d, snap, "chat", "unattended", lib.SubmitKindTop); why == "" {
+		t.Fatal("unattended work found a shared slot the children hold")
+	}
+	fill(t, d, snap, "chat", "read", lib.SubmitKindTop, 2)
+}
+
+// Ceiling 2 (child 1, interactive 0, shared 1): one top-level task of
+// either side, and its child still runs.
+func TestCeilingTwoLeavesAChildSlot(t *testing.T) {
+	for _, tier := range []string{"read", "unattended"} {
+		d := bareDispatcher()
+		snap := capsSnapshot(2)
+		fill(t, d, snap, "chat", tier, lib.SubmitKindTop, 1)
+		if why := refused(d, snap, "chat", "read", lib.SubmitKindTop); why == "" {
+			t.Fatalf("%s: a second top-level task took the child reserve", tier)
+		}
+		fill(t, d, snap, "chat", "read", lib.SubmitKindChild, 1)
+	}
+}
+
+// Ceiling 1 (no reserves, one shared slot): one task of any kind, so a
+// parent there can't start a child.
+func TestCeilingOneRunsOneTaskOfAnyKind(t *testing.T) {
+	for _, tier := range []string{"read", "unattended"} {
+		d := bareDispatcher()
+		snap := capsSnapshot(1)
+		fill(t, d, snap, "chat", tier, lib.SubmitKindTop, 1)
+		if why := refused(d, snap, "chat", "read", lib.SubmitKindChild); why != "install ceiling" {
+			t.Errorf("%s: a child beside the one task: %q", tier, why)
+		}
+	}
+	d := bareDispatcher()
+	fill(t, d, capsSnapshot(1), "chat", "read", lib.SubmitKindChild, 1)
 }
 
 // A profile's concurrency caps its top-level tasks and, separately, its
@@ -92,7 +135,7 @@ func TestCapsFollowTheConfig(t *testing.T) {
 	snap := capsSnapshot(3)
 	fill(t, d, snap, "chat", "read", lib.SubmitKindTop, 2)
 	if refused(d, snap, "chat", "read", lib.SubmitKindTop) == "" {
-		t.Fatal("ceiling 3 admitted a third top-level task")
+		t.Fatal("ceiling 3 admitted a third top-level task into the child reserve")
 	}
 	if why := refused(d, capsSnapshot(30), "chat", "read", lib.SubmitKindTop); why != "" {
 		t.Errorf("after the ceiling rose: refused for %q", why)

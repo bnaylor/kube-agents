@@ -45,6 +45,15 @@ const (
 	// DefaultReconnectTimeout bounds one reconnect, well inside the held
 	// durables' 2m AckWait, so no held task is redelivered by it.
 	DefaultReconnectTimeout = 30 * time.Second
+	// DefaultRegrantCooldown is how long the dispatcher waits, after a
+	// config change's reconnects all left a durable unbindable, before it
+	// tries again: loud, bounded, never a reconnect loop.
+	DefaultRegrantCooldown = 2 * time.Minute
+	// DefaultBindRetryBase and DefaultBindRetryMax pace the retries of a
+	// durable the config lists that the bus doesn't have yet (the operator
+	// creates durables asynchronously): not a failure, just not yet.
+	DefaultBindRetryBase = time.Second
+	DefaultBindRetryMax  = time.Minute
 	// DefaultSubmitter is the one principal whose submissions are held.
 	DefaultSubmitter = "gateway"
 	// DefaultStream is the stream the durables are on.
@@ -72,8 +81,12 @@ type Config struct {
 	RegrantBackoff     time.Duration
 	BindAttemptTimeout time.Duration
 	ReconnectTimeout   time.Duration
-	Submitter          string
-	Stream             string
+	RegrantCooldown    time.Duration
+	// BindRetryBase and BindRetryMax pace a durable's bind retries.
+	BindRetryBase time.Duration
+	BindRetryMax  time.Duration
+	Submitter     string
+	Stream        string
 	// UnattendedTiers are the tiers on the unattended side of the
 	// interactive reserve.
 	UnattendedTiers []string
@@ -91,6 +104,9 @@ func DefaultConfig() Config {
 		RegrantBackoff:     DefaultRegrantBackoff,
 		BindAttemptTimeout: DefaultBindAttemptTimeout,
 		ReconnectTimeout:   DefaultReconnectTimeout,
+		RegrantCooldown:    DefaultRegrantCooldown,
+		BindRetryBase:      DefaultBindRetryBase,
+		BindRetryMax:       DefaultBindRetryMax,
 		Submitter:          DefaultSubmitter,
 		Stream:             DefaultStream,
 		UnattendedTiers:    []string{DefaultUnattendedTier},
@@ -102,8 +118,10 @@ func (c Config) Validate() error {
 	switch {
 	case c.RetryDelay <= 0 || c.HealthInterval <= 0 || c.StallAfter <= 0 || c.RefreshInterval <= 0:
 		return fmt.Errorf("dispatch config: retry delay, health interval, stall threshold and refresh interval must be positive")
-	case c.RegrantAttempts < 1 || c.RegrantBackoff <= 0 || c.BindAttemptTimeout <= 0 || c.ReconnectTimeout <= 0:
-		return fmt.Errorf("dispatch config: regrant attempts, backoff, bind timeout and reconnect timeout must be positive")
+	case c.RegrantAttempts < 1 || c.RegrantBackoff <= 0 || c.BindAttemptTimeout <= 0 || c.ReconnectTimeout <= 0 || c.RegrantCooldown <= 0:
+		return fmt.Errorf("dispatch config: regrant attempts, backoff, cooldown, bind timeout and reconnect timeout must be positive")
+	case c.BindRetryBase <= 0 || c.BindRetryMax < c.BindRetryBase:
+		return fmt.Errorf("dispatch config: bind retry base must be positive and at most the max")
 	case c.Submitter == "" || c.Stream == "":
 		return fmt.Errorf("dispatch config: submitter and stream are required")
 	}
