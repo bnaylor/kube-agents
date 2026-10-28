@@ -44,9 +44,18 @@ class RetentionTest(unittest.TestCase):
         modules = patch.dict(sys.modules, {"hermes_state": fake})
         modules.start()
         self.addCleanup(modules.stop)
-        env = patch.dict(os.environ, {session_retention.RETENTION_ENV: "7"})
-        env.start()
-        self.addCleanup(env.stop)
+        self.config = {"sessions": {"auto_prune": True, "retention_days": 7}}
+        self.use_config(lambda: self.config)
+
+    def use_config(self, load_config):
+        """Hermes' merged config (managed scope included) is faked at the import too."""
+        config = types.ModuleType("hermes_cli.config")
+        config.load_config = load_config
+        package = types.ModuleType("hermes_cli")
+        package.config = config
+        modules = patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.config": config})
+        modules.start()
+        self.addCleanup(modules.stop)
 
     def store(self, *parts):
         home = self.home.joinpath(*parts)
@@ -71,11 +80,12 @@ class EveryStoreIsPruned(RetentionTest):
         self.store("profiles", "cluster-a")
         self.assertEqual([], session_retention.tick(self.home))
         pruned = [(c[0].parent, c[1], c[2]) for c in FakeSessionDB.calls]
-        # A daily tick must not trip Hermes' own 24-hour throttle; the live gateway's
-        # store (the machine home) is never VACUUMed from here.
+        # A daily tick must not trip Hermes' own 24-hour throttle, and no store is
+        # VACUUMed from here: the gateway serves from the machine home or, as the
+        # front door, from profiles/platform, and workers hold the rest.
         for path, _, _, kwargs in FakeSessionDB.calls:
             self.assertLess(kwargs["min_interval_hours"], 24)
-            self.assertEqual(path.parent != self.home, kwargs["vacuum"], path)
+            self.assertIs(False, kwargs["vacuum"], path)
         self.assertEqual(
             [
                 (self.home, 7, self.home / "sessions"),
@@ -91,45 +101,30 @@ class EveryStoreIsPruned(RetentionTest):
         self.assertEqual([], session_retention.tick(self.home))
         self.assertEqual([self.home], [c[0].parent for c in FakeSessionDB.calls])
 
-    def test_the_period_comes_from_the_override_or_the_config(self):
-        self.store()
-        with patch.dict(os.environ, {session_retention.RETENTION_ENV: "30"}):
-            session_retention.tick(self.home)
-        self.assertEqual(30, FakeSessionDB.calls[-1][1])
-
     def test_the_tick_reads_the_period_from_hermes_merged_config(self):
         self.store()
-        config = types.ModuleType("hermes_cli.config")
-        config.load_config = lambda: {"sessions": {"auto_prune": True, "retention_days": 12}}
-        package = types.ModuleType("hermes_cli")
-        package.config = config
-        env = {k: v for k, v in os.environ.items() if k != session_retention.RETENTION_ENV}
-        with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.config": config}), \
-                patch.dict(os.environ, env, clear=True):
+        self.config["sessions"]["retention_days"] = 12
+        # An environment variable is not a second source: only the managed scope sets it.
+        with patch.dict(os.environ, {"SESSION_RETENTION_DAYS": "1"}):
             self.assertEqual([], session_retention.tick(self.home))
         self.assertEqual(12, FakeSessionDB.calls[-1][1])
 
     def test_an_unreadable_config_prunes_nothing_and_says_so(self):
         self.store()
-        config = types.ModuleType("hermes_cli.config")
 
         def broken():
             raise OSError("managed scope unreadable")
 
-        config.load_config = broken
-        package = types.ModuleType("hermes_cli")
-        package.config = config
-        env = {k: v for k, v in os.environ.items() if k != session_retention.RETENTION_ENV}
-        with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.config": config}), \
-                patch.dict(os.environ, env, clear=True):
-            lines = session_retention.tick(self.home)
+        self.use_config(broken)
+        lines = session_retention.tick(self.home)
         self.assertEqual([], FakeSessionDB.calls)
         self.assertEqual(1, len(lines))
 
     def test_no_usable_period_prunes_nothing_and_says_so(self):
         self.store()
-        for bad in ("0", "-3", "seven"):
-            with self.subTest(value=bad), patch.dict(os.environ, {session_retention.RETENTION_ENV: bad}):
+        for bad in (0, -3, "seven", None):
+            with self.subTest(value=bad):
+                self.config["sessions"]["retention_days"] = bad
                 FakeSessionDB.calls = []
                 lines = session_retention.tick(self.home)
                 self.assertEqual([], FakeSessionDB.calls)
@@ -157,6 +152,18 @@ class FailuresAreSaidAndContained(RetentionTest):
         self.assertIn("the machine home", lines[0])
         self.assertEqual(2, lines[0].count("`"), lines[0])
 
+    def test_a_log_that_cannot_be_removed_is_not_a_failed_prune(self):
+        now = time.time()
+        home = self.store("profiles", "cluster-a")
+        self.log(home, "agent.log.2", 10, now)
+        self.store("profiles", "cluster-b")
+        with patch.object(Path, "unlink", side_effect=PermissionError("read-only")):
+            lines = session_retention.tick(self.home, now=now)
+        self.assertEqual(2, len(FakeSessionDB.calls))
+        self.assertEqual(1, len(lines))
+        self.assertIn("removing rotated logs for profile `cluster-a` failed: `PermissionError`", lines[0])
+        self.assertNotIn("pruning", lines[0])
+
     def test_a_clean_run_prints_nothing(self):
         self.store()
         self.assertEqual([], session_retention.tick(self.home))
@@ -176,6 +183,23 @@ class RotatedLogs(RetentionTest):
         self.assertFalse(old_rotated.exists())
         for kept in (new_rotated, live, audit_rotated, audit, other):
             self.assertTrue(kept.exists(), kept.name)
+
+    def test_a_log_rotated_away_under_the_scan_does_not_stop_the_sweep(self):
+        now = time.time()
+        home = self.store()
+        gone = self.log(home, "agent.log.2", 10, now)
+        other = self.log(home, "errors.log.3", 10, now)
+        real_unlink = Path.unlink
+
+        def unlink(path, *args, **kwargs):
+            if path == gone:
+                raise FileNotFoundError(path)  # Hermes renamed it between the scan and here
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", unlink):
+            removed = session_retention.remove_old_rotated_logs(home, 7, now)
+        self.assertFalse(other.exists())
+        self.assertEqual(1, removed)
 
     def test_a_symlinked_rotated_log_is_not_followed(self):
         now = time.time()

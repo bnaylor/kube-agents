@@ -10,7 +10,7 @@ that start:
 - the machine home's, which only the long-lived gateway opens, at construction;
 - a profile that has not run a process since its history aged out.
 
-So their history grew without bound (#3704): a Cluster Agent profile on a quiet
+So their history grew without bound: a Cluster Agent profile on a quiet
 dev install reached 16.5 MB, most of it ``state.db`` and its WAL.
 
 This is a ``no_agent`` entry on the Platform Agent's roster. Each daily tick it
@@ -22,9 +22,8 @@ period, so it inherits Hermes' guarantees rather than restating them:
 - one maintenance lock and a throttle per store, so a worker starting at the same
   moment cannot double-run it (20 hours here rather than Hermes' 24, so a daily tick
   never skips a day);
-- VACUUM only after a prune that freed more than a quarter of the file, at most every
-  30 days, and never here for the machine home, which the live gateway holds (Hermes
-  VACUUMs that store at gateway start instead).
+- no VACUUM from here: the gateway and workers hold these stores while it runs, and
+  Hermes VACUUMs each one when a process starts on it.
 
 The period is the managed scope's ``sessions.retention_days``, which the operator
 renders from ``spec.harness.retention.sessionDays``. A blocked kanban card needs
@@ -61,7 +60,8 @@ ROTATED_LOG_RE = re.compile(r"^[A-Za-z0-9_.-]+\.log\.[0-9]+$")
 SECONDS_PER_DAY = 86400
 WATCH_NAME = "Session retention"
 FAILED_PREFIX = f"⚠️ **{WATCH_NAME}:**"
-RETENTION_ENV = "SESSION_RETENTION_DAYS"  # tests and a hand run; the tick reads the managed scope
+# Hermes' error text goes inside one inline code span in chat; this bounds it.
+ERROR_SPAN_CHARS = 300
 # Hermes skips a store pruned less than min_interval_hours ago, timed from the
 # previous pass's start. At its own 24 a daily tick that starts a few seconds
 # earlier than yesterday's would skip, and the deletion would slip a day.
@@ -69,15 +69,13 @@ MIN_INTERVAL_HOURS = 20
 
 
 def retention_days() -> int | None:
-    """The period from the environment override, else Hermes' merged config (managed scope)."""
-    raw = os.environ.get(RETENTION_ENV)
-    if raw is None:
-        try:
-            from hermes_cli.config import load_config  # the managed scope is merged in here
+    """The period from Hermes' merged config, where the managed scope wins."""
+    try:
+        from hermes_cli.config import load_config  # the managed scope is merged in here
 
-            raw = (load_config().get("sessions") or {}).get("retention_days")
-        except Exception:  # noqa: BLE001 - an unreadable config is "no usable period"
-            return None
+        raw = (load_config().get("sessions") or {}).get("retention_days")
+    except Exception:  # noqa: BLE001 - an unreadable config is "no usable period"
+        return None
     try:
         days = int(raw)
     except (TypeError, ValueError):
@@ -94,12 +92,15 @@ def homes(agent_home: Path) -> list[Path]:
     return found
 
 
-def prune_store(home: Path, days: int, *, vacuum: bool = True) -> dict:
-    """Hermes' own maintenance on ``home``'s state.db; {} when the home has none.
+def prune_store(home: Path, days: int) -> dict:
+    """Hermes' own prune on ``home``'s state.db, never a VACUUM; {} when the home has none.
 
-    ``vacuum=False`` for the machine home: only the gateway opens that store, and
-    Hermes VACUUMs it at gateway start, before it serves traffic. A rewrite from
-    here would hold up the live gateway's writes for as long as it took.
+    The gateway serves from the machine home or, with the Platform Agent as front
+    door, from profiles/platform, and workers write to their profiles' stores
+    while this runs; a VACUUM rewrites the whole file and holds every writer up
+    for as long as it takes. Hermes VACUUMs each store when a process starts on
+    it, and SQLite reuses the pages a prune frees, so skipping it here costs
+    space that is not lost.
     """
     db_path = home / STATE_DB
     if not db_path.is_file():
@@ -112,7 +113,7 @@ def prune_store(home: Path, days: int, *, vacuum: bool = True) -> dict:
             retention_days=days,
             sessions_dir=home / SESSIONS_DIR,
             min_interval_hours=MIN_INTERVAL_HOURS,
-            vacuum=vacuum,
+            vacuum=False,
         )
     finally:
         close = getattr(db, "close", None)
@@ -130,9 +131,12 @@ def remove_old_rotated_logs(home: Path, days: int, now: float) -> int:
     for entry in logs.iterdir():
         if not ROTATED_LOG_RE.match(entry.name) or not entry.is_file() or entry.is_symlink():
             continue
-        if entry.stat().st_mtime < cutoff:
-            entry.unlink()
-            removed += 1
+        try:
+            if entry.stat().st_mtime < cutoff:
+                entry.unlink()
+                removed += 1
+        except FileNotFoundError:
+            continue  # Hermes rotated it away under the scan
     return removed
 
 
@@ -142,7 +146,7 @@ def label(home: Path, agent_home: Path) -> str:
 
 def span_safe(text: object) -> str:
     """One line, no backticks, bounded, so it stays inside its code span."""
-    return " ".join(str(text).split()).replace("`", "'")[:300]
+    return " ".join(str(text).split()).replace("`", "'")[:ERROR_SPAN_CHARS]
 
 
 def tick(agent_home: Path, *, now: float | None = None) -> list[str]:
@@ -152,13 +156,20 @@ def tick(agent_home: Path, *, now: float | None = None) -> list[str]:
         return [f"{FAILED_PREFIX} no usable `sessions.retention_days` in the config; nothing was pruned."]
     lines: list[str] = []
     for home in homes(agent_home):
+        # Separate tries: one store's failure must not stop the rest, and a log
+        # that cannot be removed is not a failed prune.
         try:
-            result = prune_store(home, days, vacuum=home != agent_home)
+            result = prune_store(home, days)
             if result.get("error"):
                 lines.append(f"{FAILED_PREFIX} pruning {label(home, agent_home)} failed: `{span_safe(result['error'])}`")
-            remove_old_rotated_logs(home, days, now)
-        except Exception as exc:  # noqa: BLE001 - one store's failure must not stop the rest
+        except Exception as exc:  # noqa: BLE001
             lines.append(f"{FAILED_PREFIX} pruning {label(home, agent_home)} failed: `{type(exc).__name__}`")
+        try:
+            remove_old_rotated_logs(home, days, now)
+        except Exception as exc:  # noqa: BLE001
+            lines.append(
+                f"{FAILED_PREFIX} removing rotated logs for {label(home, agent_home)} failed: `{type(exc).__name__}`"
+            )
     return lines
 
 

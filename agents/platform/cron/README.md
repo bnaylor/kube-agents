@@ -434,14 +434,16 @@ file (`SessionDB.maybe_auto_prune_and_vacuum`). It does so when a CLI or the
 gateway starts, at most once a day per `state.db`. Two stores never get that
 start. One is the machine home's, which only the long-lived gateway opens, at
 construction. The other is a profile that has not run a process since its
-history aged out. So their history grew without bound (#3704).
+history aged out. So their history grew without bound.
 `session_retention.py` calls the same Hermes method on every profile's store
 once a day, so it keeps Hermes' guarantees: open, pinned and mid-turn sessions
-are never deleted, one maintenance lock and a 24-hour throttle per store, and
-the VACUUM gate (more than a quarter freed, at most every 30 days). Its throttle is
+are never deleted, and there is one maintenance lock per store. Its throttle is
 20 hours rather than Hermes' 24, so a tick starting a few seconds earlier than
-yesterday's still runs, and it never VACUUMs the machine home's store, which the
-live gateway holds; Hermes does that one at gateway start. It also removes rotated
+yesterday's still runs. It never VACUUMs: the gateway (on the machine home, or on
+`profiles/platform` when the Platform Agent is the front door) and the workers
+hold these stores while it runs, and a VACUUM rewrites the whole file under them.
+Hermes VACUUMs each store when a process starts on it, and SQLite reuses the pages
+a prune frees in the meantime. It also removes rotated
 Hermes log backups (`<name>.log.<n>`) older than the period; the live log files keep Hermes' size cap, and
 `audit.jsonl` and its rotations are never touched.
 
