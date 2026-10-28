@@ -64,8 +64,8 @@ monitoring-alert-policy-read
 # and upgrades-rollout-family-held-by-canary-gate) share one stack that seeds
 # the retrospective's report store, priced at 600s each; each run applies and
 # tears it down, so the halves may split them. One here, the family case in
-# main-a: the halves read 13300s (main-a) against 12800s; both here they would
-# read 12700s against 13400s, also inside the 1800s the balance test allows.
+# main-a. (The totals quoted when they were placed have since moved with the
+# list; the balance test is the check.)
 upgrades-retrospective-log-volume-gate
 
 # Moved by measured time, not by hint (#3384): on the 2026-10-27 and -28 nights
