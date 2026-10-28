@@ -13,17 +13,14 @@ func bareDispatcher() *Dispatcher {
 		lastAdmit: map[string]time.Time{}, released: map[string]bool{}}
 }
 
-func capsSnapshot(ceiling int) Snapshot {
-	return Snapshot{Ceiling: ceiling, Profiles: []Profile{
-		{Name: "chat", Concurrency: 100, AllowedTiers: []string{"read", "unattended"}},
-		{Name: "tse", Concurrency: 2, AllowedTiers: []string{"read"}},
-	}}
+func capsSnapshot(ceiling int) lib.DispatchConfig {
+	return testDispatchConfig(ceiling, testProfile("chat", 100, "read", "unattended"), testProfile("tse", 2))
 }
 
 // fill reserves n tasks of one shape, failing if any is refused.
-func fill(t *testing.T, d *Dispatcher, snap Snapshot, profile, tier, kind string, n int) {
+func fill(t *testing.T, d *Dispatcher, snap lib.DispatchConfig, profile, tier, kind string, n int) {
 	t.Helper()
-	p, _ := snap.Profile(profile)
+	p, _ := profileOf(snap, profile)
 	for i := 0; i < n; i++ {
 		if h, why := d.reserve(snap, p, tier, kind, fmt.Sprintf("%s-%s-%s-%d-%d", profile, tier, kind, i, len(d.active))); h == nil {
 			t.Fatalf("reserve %s/%s/%s #%d refused: %s", profile, tier, kind, i, why)
@@ -31,32 +28,14 @@ func fill(t *testing.T, d *Dispatcher, snap Snapshot, profile, tier, kind string
 	}
 }
 
-func refused(d *Dispatcher, snap Snapshot, profile, tier, kind string) string {
-	p, _ := snap.Profile(profile)
+func refused(d *Dispatcher, snap lib.DispatchConfig, profile, tier, kind string) string {
+	p, _ := profileOf(snap, profile)
 	h, why := d.reserve(snap, p, tier, kind, "probe")
 	if h != nil {
 		d.release(h)
 		return ""
 	}
 	return why
-}
-
-func TestReserves(t *testing.T) {
-	for _, tc := range []struct{ ceiling, reserve int }{{1, 1}, {3, 1}, {4, 2}, {6, 2}, {8, 3}, {9, 3}, {10, 4}} {
-		s := capsSnapshot(tc.ceiling)
-		if s.InteractiveReserve() != tc.reserve || s.EffectiveChildReserve() != tc.reserve {
-			t.Errorf("ceiling %d: reserves %d/%d, want %d", tc.ceiling, s.InteractiveReserve(), s.EffectiveChildReserve(), tc.reserve)
-		}
-	}
-	zero := 0
-	s := capsSnapshot(6)
-	s.ChildReserve = &zero
-	if s.EffectiveChildReserve() != 0 {
-		t.Error("an explicit child reserve was not taken")
-	}
-	if (Snapshot{}).EffectiveCeiling() != DefaultCeiling {
-		t.Error("no ceiling is not the default")
-	}
 }
 
 // Unattended work leaves the interactive reserve free: with ceiling 9 the
@@ -127,7 +106,7 @@ func TestOverCapStaysQueuedAndRunsLater(t *testing.T) {
 	b.ensure("tse", 4, 0, "read")
 	w0 := b.worker("tse", "read", "tse-0", answerAccept, 3*time.Second)
 	w1 := b.worker("tse", "read", "tse-1", answerAccept, 3*time.Second)
-	d, _ := b.runDispatcher(testConfig(), NewStaticSource(oneProfile("tse", 1, "tse-0", "tse-1")), &fakeVerifier{})
+	d, _ := b.runDispatcher(testConfig(), oneProfile("tse", 1, "tse-0", "tse-1"), &fakeVerifier{})
 
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
 	waitFor(t, 10*time.Second, "the first offer", func() bool { return w0.offerCount()+w1.offerCount() == 1 })

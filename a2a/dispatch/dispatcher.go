@@ -53,6 +53,9 @@ var submitKinds = []string{lib.SubmitKindTop, lib.SubmitKindChild}
 type holding struct {
 	profile, tier, kind, taskID string
 	unattended                  bool
+	// lease and renew are what the task was offered (or, re-adopted, what
+	// its record shows): a config change never moves them.
+	lease, renew time.Duration
 
 	// Guarded by Dispatcher.mu.
 	pod string
@@ -82,6 +85,7 @@ type Dispatcher struct {
 	cfg      Config
 	bus      *lib.Client
 	src      Source
+	pool     Pool
 	verifier Verifier
 	log      *slog.Logger
 	now      func() time.Time
@@ -95,22 +99,24 @@ type Dispatcher struct {
 	released  map[string]bool
 	subs      map[string]lib.HeldSubscription
 	binding   map[string]bool
+	draining  []lib.HeldSubscription
 }
 
-// New builds a dispatcher on bus. verifier answers profile.run; a nil one
-// refuses every submission.
-func New(cfg Config, bus *lib.Client, src Source, verifier Verifier, log *slog.Logger) (*Dispatcher, error) {
+// New builds a dispatcher on bus. src is the install config, pool the
+// workers it may offer to, verifier the profile.run check (a nil one refuses
+// every submission).
+func New(cfg Config, bus *lib.Client, src Source, pool Pool, verifier Verifier, log *slog.Logger) (*Dispatcher, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	if bus == nil || src == nil {
-		return nil, errors.New("dispatch.New: bus and source are required")
+	if bus == nil || src == nil || pool == nil {
+		return nil, errors.New("dispatch.New: bus, source and pool are required")
 	}
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Dispatcher{
-		cfg: cfg, bus: bus, src: src, verifier: verifier, log: log, now: time.Now,
+		cfg: cfg, bus: bus, src: src, pool: pool, verifier: verifier, log: log, now: time.Now,
 		active:    map[string]*holding{},
 		offers:    map[offerKey]chan lib.DispatchAccept{},
 		waiting:   map[string]waiting{},
@@ -160,7 +166,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 
 func (d *Dispatcher) shutdown() {
 	d.mu.Lock()
-	subs := make([]lib.HeldSubscription, 0, len(d.subs))
+	subs := append([]lib.HeldSubscription(nil), d.draining...)
 	for _, s := range d.subs {
 		subs = append(subs, s)
 	}
@@ -177,35 +183,47 @@ func (d *Dispatcher) shutdown() {
 	}
 }
 
-// syncBindings binds every durable the snapshot names that isn't bound yet,
+// syncBindings binds every durable the config lists that isn't bound yet,
 // each on its own goroutine (a durable the operator hasn't created yet
-// retries for the lib's bind window, and must not hold up the rest).
+// retries for the lib's bind window, and must not hold up the rest), and
+// stops intake on any bound durable the config no longer lists: a profile
+// absent from the config has no durables to read. Tasks already held from an
+// unbound durable keep running to their end.
 func (d *Dispatcher) syncBindings(ctx context.Context) {
-	snap := d.src.Snapshot()
-	for _, p := range snap.Profiles {
-		for _, tier := range p.Tiers() {
-			for _, kind := range submitKinds {
-				name := lib.ProfileDurableName(p.Name, tier, kind)
-				d.mu.Lock()
-				skip := d.subs[name] != nil || d.binding[name]
-				if !skip {
-					d.binding[name] = true
-				}
-				d.mu.Unlock()
-				if skip {
-					continue
-				}
-				go d.bind(ctx, p.Name, tier, kind, name)
+	cfg := d.src.Config()
+	want := map[string]bool{}
+	for _, p := range cfg.Profiles {
+		for _, dur := range p.Durables {
+			want[dur.Name] = true
+			d.mu.Lock()
+			skip := d.subs[dur.Name] != nil || d.binding[dur.Name]
+			if !skip {
+				d.binding[dur.Name] = true
 			}
+			d.mu.Unlock()
+			if !skip {
+				go d.bind(ctx, p.Name, dur)
+			}
+		}
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for name, sub := range d.subs {
+		if !want[name] {
+			sub.StopIntake()
+			d.draining = append(d.draining, sub)
+			delete(d.subs, name)
+			d.log.Info("unbound a durable the config no longer lists", "durable", name)
 		}
 	}
 }
 
-func (d *Dispatcher) bind(ctx context.Context, profile, tier, kind, name string) {
+func (d *Dispatcher) bind(ctx context.Context, profile string, dur lib.DispatchDurable) {
+	name := dur.Name
 	sub, err := d.bus.SubscribeHeld(ctx, lib.SubscribeConfig{
 		Stream:    d.cfg.Stream,
 		Durable:   name,
-		Subject:   lib.ProfileDurableFilter(profile, tier, kind),
+		Subject:   lib.ProfileDurableFilter(profile, dur.Tier, dur.Kind),
 		Session:   profile,
 		Agreement: &lib.AgreementPolicy{Submitter: d.cfg.Submitter},
 	}, d.handle)
@@ -250,8 +268,8 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	}
 	d.mu.Unlock()
 
-	snap := d.src.Snapshot()
-	prof, ok := snap.Profile(profile)
+	snap := d.src.Config()
+	prof, ok := profileOf(snap, profile)
 	if !ok {
 		// A durable for a profile the config doesn't know yet (or any
 		// more): the config lags the operator, so the task stays held.
@@ -295,7 +313,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	}
 	d.clearWaiting(taskID)
 
-	rec, key, deadline, err := d.handOff(ctx, log, del, prof, h)
+	rec, key, deadline, err := d.handOff(ctx, log, del, snap, prof, h)
 	if err != nil || key == "" {
 		d.release(h)
 		if err != nil {
@@ -348,16 +366,17 @@ func (d *Dispatcher) reject(ctx context.Context, log *slog.Logger, del lib.Deliv
 //   - C itself;
 //   - the child reserve: top-level tasks may use at most C minus it, so
 //     parents waiting on children never hold every slot;
-//   - the interactive reserve, max(1, ceil(C/3)): unattended work may use
+//   - the interactive reserve: unattended work may use
 //     at most C minus it overall, and at most the top-level share minus it
 //     for top-level tasks, so it cannot starve people.
 //
-// A task over a cap is never failed for it: it stays queued.
-func (d *Dispatcher) reserve(snap Snapshot, prof Profile, tier, kind, taskID string) (*holding, string) {
-	unattended := snap.Unattended(tier)
-	c := snap.EffectiveCeiling()
-	topShare := c - snap.EffectiveChildReserve()
-	interactive := snap.InteractiveReserve()
+// The reserves come resolved in the config. A task over a cap is never
+// failed for it: it stays queued.
+func (d *Dispatcher) reserve(snap lib.DispatchConfig, prof lib.DispatchProfile, tier, kind, taskID string) (*holding, string) {
+	unattended := d.cfg.unattended(tier)
+	c := snap.Ceiling
+	topShare := c - snap.ChildReserve
+	interactive := snap.InteractiveReserve
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -411,15 +430,26 @@ func (d *Dispatcher) release(h *holding) {
 // ever offered a task the bucket doesn't show as started: after a crash
 // mid-offer the task is re-adopted (and failed if nobody renews it), never
 // offered a second time. An empty key with a nil error means no pod took it.
-func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Delivery, prof Profile, h *holding) (lib.LeaseRecord, string, time.Time, error) {
+func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Delivery, snap lib.DispatchConfig,
+	prof lib.DispatchProfile, h *holding) (lib.LeaseRecord, string, time.Time, error) {
 	envelope, err := json.Marshal(del.Envelope())
 	if err != nil {
 		return lib.LeaseRecord{}, "", time.Time{}, err
 	}
-	tried := map[string]bool{}
+	// The intervals this task is offered with, kept for its life.
+	h.lease, h.renew = seconds(snap.LeaseSeconds), seconds(snap.RenewSeconds)
+	acceptTimeout := seconds(snap.AcceptTimeoutSeconds)
+	pods := d.pool.Pods(h.profile, h.tier)
+	// A pod holding a lease in the bucket is busy even if this process
+	// doesn't hold its task yet (a restart's redeliveries come up to an
+	// AckWait later): each worker runs one task at a time.
+	tried, err := d.leasedPods(ctx, h.profile, h.tier)
+	if err != nil {
+		return lib.LeaseRecord{}, "", time.Time{}, fmt.Errorf("read which pods hold leases: %w", err)
+	}
 	for {
 		d.mu.Lock()
-		pod := d.freePodLocked(prof, h.tier, tried)
+		pod := d.freePodLocked(pods, h.profile, h.tier, tried)
 		var ch chan lib.DispatchAccept
 		var ok offerKey
 		if pod != "" {
@@ -442,21 +472,21 @@ func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Deli
 		now := d.now()
 		key := lib.ProfileLeaseKey(h.profile, h.tier, pod, h.taskID)
 		rec := lib.LeaseRecord{TaskID: h.taskID, Pod: pod, Kind: h.kind,
-			RenewedAt: now, ExpiresAt: now.Add(d.cfg.AcceptTimeout + d.cfg.Lease)}
+			RenewedAt: now, ExpiresAt: now.Add(acceptTimeout + h.lease)}
 		if err := d.putLease(ctx, key, rec); err != nil {
 			withdraw()
 			return lib.LeaseRecord{}, "", time.Time{}, fmt.Errorf("write the lease before the offer: %w", err)
 		}
-		deadline := now.Add(prof.ActiveDeadline())
+		deadline := now.Add(seconds(prof.ActiveDeadlineSeconds))
 		msg := lib.DispatchMessage{Type: lib.DispatchOffer, TaskID: h.taskID, Kind: h.kind, Envelope: envelope,
-			Deadline: deadline, LeaseSeconds: int(d.cfg.Lease / time.Second), RenewSeconds: int(d.cfg.Renew / time.Second)}
+			Deadline: deadline, LeaseSeconds: snap.LeaseSeconds, RenewSeconds: snap.RenewSeconds}
 		if err := d.send(lib.DispatchSubject(h.profile, h.tier, pod), msg); err != nil {
 			withdraw()
 			d.deleteLease(log, key)
 			log.Warn("offer not sent", "pod", pod, "err", err)
 			continue
 		}
-		timer := time.NewTimer(d.cfg.AcceptTimeout)
+		timer := time.NewTimer(acceptTimeout)
 		var acc lib.DispatchAccept
 		var answered bool
 		select {
@@ -474,7 +504,7 @@ func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Deli
 		withdraw()
 		if answered && acc.Accepted {
 			now := d.now()
-			rec.AcceptedAt, rec.RenewedAt, rec.ExpiresAt = now, now, now.Add(d.cfg.Lease)
+			rec.AcceptedAt, rec.RenewedAt, rec.ExpiresAt = now, now, now.Add(h.lease)
 			if err := d.putLease(ctx, key, rec); err != nil {
 				log.Warn("record the accept; the next renewal writes it", "err", err)
 			}
@@ -483,7 +513,7 @@ func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Deli
 		if answered {
 			log.Info("offer declined", "pod", pod, "reason", acc.Reason)
 		} else {
-			log.Info("offer not accepted in time", "pod", pod, "timeout", d.cfg.AcceptTimeout)
+			log.Info("offer not accepted in time", "pod", pod, "timeout", acceptTimeout)
 		}
 		d.deleteLease(log, key)
 		d.mu.Lock()
@@ -494,14 +524,14 @@ func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Deli
 
 // freePodLocked is a pod of the (profile, tier) pool that holds no task
 // here and hasn't been tried for this one. Callers hold d.mu.
-func (d *Dispatcher) freePodLocked(prof Profile, tier string, tried map[string]bool) string {
+func (d *Dispatcher) freePodLocked(pods []string, profile, tier string, tried map[string]bool) string {
 	busy := map[string]bool{}
 	for _, h := range d.active {
-		if h.profile == prof.Name && h.tier == tier && h.pod != "" {
+		if h.profile == profile && h.tier == tier && h.pod != "" {
 			busy[h.pod] = true
 		}
 	}
-	for _, pod := range prof.Pods[tier] {
+	for _, pod := range pods {
 		if !busy[pod] && !tried[pod] {
 			return pod
 		}
@@ -514,15 +544,16 @@ func (d *Dispatcher) freePodLocked(prof Profile, tier string, tried map[string]b
 // It is never offered again. It is failed lease-expired only once its
 // record has expired and the restart grace, counted from this dispatcher's
 // start, has passed without a renewal.
-func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delivery, snap Snapshot, prof Profile,
+func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile,
 	tier, kind string, rec lib.LeaseRecord, key string) {
 	pod := keyPod(key)
-	h := &holding{profile: prof.Name, tier: tier, kind: kind, taskID: rec.TaskID, unattended: snap.Unattended(tier),
+	h := &holding{profile: prof.Name, tier: tier, kind: kind, taskID: rec.TaskID, unattended: d.cfg.unattended(tier),
+		lease: recordLease(rec, seconds(snap.LeaseSeconds)), renew: seconds(snap.RenewSeconds),
 		pod: pod, renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}
 	d.mu.Lock()
 	d.active[rec.TaskID] = h
 	released := d.released[rec.TaskID]
-	graceUntil := d.started.Add(d.cfg.RestartGrace)
+	graceUntil := d.started.Add(seconds(snap.RestartGraceSeconds))
 	d.mu.Unlock()
 	if released {
 		log.Info("re-adopted a task its worker had already finished; settling it", "pod", pod)
@@ -533,7 +564,7 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 	if started.IsZero() {
 		started = rec.RenewedAt
 	}
-	deadline := started.Add(prof.ActiveDeadline())
+	deadline := started.Add(seconds(prof.ActiveDeadlineSeconds))
 	log.Info("re-adopted a started task", "pod", pod, "expiresAt", rec.ExpiresAt, "graceUntil", graceUntil)
 	d.hold(ctx, log, del, h, rec, key, deadline, graceUntil)
 }
@@ -544,7 +575,7 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 // re-adoption, keeps an expired record from failing the task before then.
 func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, rec lib.LeaseRecord,
 	key string, deadline, graceUntil time.Time) {
-	tick := time.NewTicker(max(d.cfg.Renew/ticksPerRenewal, minTick))
+	tick := time.NewTicker(max(h.renew/ticksPerRenewal, minTick))
 	defer tick.Stop()
 	for {
 		select {
@@ -565,7 +596,7 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 			if rec.AcceptedAt.IsZero() {
 				rec.AcceptedAt = now
 			}
-			rec.RenewedAt, rec.ExpiresAt = now, now.Add(d.cfg.Lease)
+			rec.RenewedAt, rec.ExpiresAt = now, now.Add(h.lease)
 			graceUntil = time.Time{}
 			if err := d.putLease(ctx, key, rec); err != nil {
 				log.Warn("record a renewal", "err", err)
@@ -589,6 +620,16 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 			}
 		}
 	}
+}
+
+// recordLease is the lease a record was written with (its expiry less its
+// last renewal), which is what the task was offered; fallback when the
+// record can't say.
+func recordLease(rec lib.LeaseRecord, fallback time.Duration) time.Duration {
+	if span := rec.ExpiresAt.Sub(rec.RenewedAt); span > 0 {
+		return span
+	}
+	return fallback
 }
 
 func deadlineLimit(deadline time.Time, rec lib.LeaseRecord) time.Duration {
@@ -751,7 +792,7 @@ func (d *Dispatcher) renewOrphan(profile, tier, pod string, r lib.LeaseRenewal) 
 	if rec.AcceptedAt.IsZero() {
 		rec.AcceptedAt = now
 	}
-	rec.RenewedAt, rec.ExpiresAt = now, now.Add(d.cfg.Lease)
+	rec.RenewedAt, rec.ExpiresAt = now, now.Add(recordLease(rec, seconds(d.src.Config().LeaseSeconds)))
 	data, err := json.Marshal(rec)
 	if err != nil {
 		return
@@ -850,6 +891,30 @@ func (d *Dispatcher) findLease(ctx context.Context, profile, tier, taskID string
 	best.TaskID = taskID
 	best.Pod = keyPod(bestKey)
 	return best, bestKey, true, nil
+}
+
+// leasedPods is the pods that hold a lease record in a (profile, tier).
+func (d *Dispatcher) leasedPods(ctx context.Context, profile, tier string) (map[string]bool, error) {
+	kctx, cancel := context.WithTimeout(ctx, kvOpTimeout)
+	defer cancel()
+	kv, err := d.bus.KV(kctx, lib.ProfileLeaseBucket)
+	if err != nil {
+		return nil, err
+	}
+	lister, err := kv.ListKeysFiltered(kctx, lib.ProfileLeaseKeyFilter(profile, tier, "*"))
+	if err != nil {
+		return nil, err
+	}
+	pods := map[string]bool{}
+	for k := range lister.Keys() {
+		if pod := keyPod(k); pod != "" {
+			pods[pod] = true
+		}
+	}
+	if kctx.Err() != nil {
+		return nil, kctx.Err()
+	}
+	return pods, nil
 }
 
 func (d *Dispatcher) putLease(ctx context.Context, key string, rec lib.LeaseRecord) error {

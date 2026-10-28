@@ -18,7 +18,7 @@ func TestATaskRunsToCompletion(t *testing.T) {
 	b.ensure("tse", 2, 0, "read")
 	w := b.worker("tse", "read", "tse-0", answerAccept, 2500*time.Millisecond)
 	v := &fakeVerifier{}
-	b.runDispatcher(testConfig(), NewStaticSource(oneProfile("tse", 2, "tse-0")), v)
+	b.runDispatcher(testConfig(), oneProfile("tse", 2, "tse-0"), v)
 
 	b.submitWith("tse", "read", lib.SubmitKindTop, "task-1", "cap-ok",
 		map[string]string{"project": "p1", "location": "us-central1", "cluster": "c1"})
@@ -68,8 +68,8 @@ func TestNoAcceptPutsTheTaskBackOnTheQueue(t *testing.T) {
 	b.ensure("tse", 2, 0, "read")
 	silent := b.worker("tse", "read", "tse-0", answerSilent, 0)
 	decline := b.worker("tse", "read", "tse-1", answerDecline, 0)
-	src := NewStaticSource(oneProfile("tse", 2, "tse-0", "tse-1"))
-	b.runDispatcher(testConfig(), src, &fakeVerifier{})
+	ti := oneProfile("tse", 2, "tse-0", "tse-1")
+	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
 	waitFor(t, 10*time.Second, "offers to both pods, twice", func() bool {
@@ -86,7 +86,7 @@ func TestNoAcceptPutsTheTaskBackOnTheQueue(t *testing.T) {
 		}
 	}
 	good := b.worker("tse", "read", "tse-2", answerAccept, 500*time.Millisecond)
-	src.Set(oneProfile("tse", 2, "tse-0", "tse-1", "tse-2"))
+	ti.pool.Set("tse", "read", "tse-0", "tse-1", "tse-2")
 	if ts := b.waitTerminal("task-1", 15*time.Second); ts.state != lib.StateCompleted || ts.from != "tse-2" {
 		t.Errorf("terminal %+v, want tse-2's completed", ts)
 	}
@@ -103,7 +103,7 @@ func TestAnAcceptFromAnotherPodIsNotTaken(t *testing.T) {
 	b.ensure("tse", 2, 0, "read")
 	target := b.worker("tse", "read", "tse-0", answerSilent, 0)
 	intruder := b.worker("tse", "read", "intruder", answerSilent, 0)
-	b.runDispatcher(testConfig(), NewStaticSource(oneProfile("tse", 2, "tse-0")), &fakeVerifier{})
+	b.runDispatcher(testConfig(), oneProfile("tse", 2, "tse-0"), &fakeVerifier{})
 
 	stop := make(chan struct{})
 	defer close(stop)
@@ -143,7 +143,7 @@ func TestARenewalFromAnotherPodIsIgnored(t *testing.T) {
 	w := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
 	w.noRenew = true
 	intruder := b.worker("tse", "read", "intruder", answerSilent, 0)
-	b.runDispatcher(testConfig(), NewStaticSource(oneProfile("tse", 2, "tse-0")), &fakeVerifier{})
+	b.runDispatcher(testConfig(), oneProfile("tse", 2, "tse-0"), &fakeVerifier{})
 
 	stop := make(chan struct{})
 	defer close(stop)
@@ -171,7 +171,7 @@ func TestAnExpiredLeaseIsTerminalAndNeverReRun(t *testing.T) {
 	b.ensure("tse", 2, 0, "read")
 	w0 := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
 	w1 := b.worker("tse", "read", "tse-1", answerAccept, time.Hour)
-	b.runDispatcher(testConfig(), NewStaticSource(oneProfile("tse", 2, "tse-0", "tse-1")), &fakeVerifier{})
+	b.runDispatcher(testConfig(), oneProfile("tse", 2, "tse-0", "tse-1"), &fakeVerifier{})
 
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
 	waitFor(t, 10*time.Second, "the offer", func() bool { return w0.offerCount()+w1.offerCount() == 1 })
@@ -203,9 +203,9 @@ func TestAPassedDeadlineIsTerminal(t *testing.T) {
 	b := newBus(t, "tse-0")
 	b.ensure("tse", 2, 0, "read")
 	w := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
-	snap := oneProfile("tse", 2, "tse-0")
-	snap.Profiles[0].ActiveDeadlineSeconds = 2
-	b.runDispatcher(testConfig(), NewStaticSource(snap), &fakeVerifier{})
+	ti := oneProfile("tse", 2, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) { c.Profiles[0].ActiveDeadlineSeconds = 2 })
+	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
 	ts := b.waitTerminal("task-1", 10*time.Second)
@@ -233,7 +233,7 @@ func TestAWorkersTerminalSurvivesALateLeaseExpiry(t *testing.T) {
 		case <-ctx.Done():
 		}
 	}
-	b.runDispatcher(testConfig(), NewStaticSource(oneProfile("tse", 2, "tse-0")), &fakeVerifier{})
+	b.runDispatcher(testConfig(), oneProfile("tse", 2, "tse-0"), &fakeVerifier{})
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
 	waitFor(t, 10*time.Second, "the worker's terminal", func() bool { return w.completed.Load() == 1 })
 	w.kill()
@@ -255,7 +255,7 @@ func TestOnlyTheDispatcherWritesLeases(t *testing.T) {
 	b := newBus(t, "tse-0")
 	b.ensure("tse", 2, 0, "read")
 	w := b.worker("tse", "read", "tse-0", answerAccept, 5*time.Second)
-	b.runDispatcher(testConfig(), NewStaticSource(oneProfile("tse", 2, "tse-0")), &fakeVerifier{})
+	b.runDispatcher(testConfig(), oneProfile("tse", 2, "tse-0"), &fakeVerifier{})
 
 	// The worker can't write the bucket at all.
 	if err := w.nc.Publish(lib.ProfileLeaseSubject(lib.ProfileLeaseKey("tse", "read", "tse-0", "task-x")), []byte("{}")); err != nil {
@@ -279,5 +279,91 @@ func TestOnlyTheDispatcherWritesLeases(t *testing.T) {
 	})
 	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateCompleted {
 		t.Errorf("terminal %+v", ts)
+	}
+}
+
+// A pod holding a lease in the bucket is busy even when this dispatcher
+// doesn't hold its task (a previous instance handed it out and the
+// redelivery hasn't come): a new task goes to a pod with no lease.
+func TestAPodHoldingALeaseIsNotOffered(t *testing.T) {
+	b := newBus(t, "tse-0", "tse-1")
+	b.ensure("tse", 2, 0, "read")
+	busy := b.worker("tse", "read", "tse-0", answerAccept, time.Second)
+	free := b.worker("tse", "read", "tse-1", answerAccept, time.Second)
+	kv, err := b.js.KeyValue(b.ctx, lib.ProfileLeaseBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	rec, _ := json.Marshal(lib.LeaseRecord{TaskID: "task-old", Pod: "tse-0", Kind: lib.SubmitKindTop,
+		AcceptedAt: now, RenewedAt: now, ExpiresAt: now.Add(time.Hour)})
+	if _, err := kv.Put(b.ctx, lib.ProfileLeaseKey("tse", "read", "tse-0", "task-old"), rec); err != nil {
+		t.Fatal(err)
+	}
+	b.runDispatcher(testConfig(), oneProfile("tse", 2, "tse-0", "tse-1"), &fakeVerifier{})
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	if ts := b.waitTerminal("task-1", 10*time.Second); ts.from != "tse-1" {
+		t.Errorf("terminal %+v, want tse-1's", ts)
+	}
+	if busy.offerCount() != 0 || free.offerCount() != 1 {
+		t.Errorf("offers: leased pod %d, free pod %d", busy.offerCount(), free.offerCount())
+	}
+}
+
+// A config change applies to new offers only: a task already handed out
+// keeps the lease and renewal its offer carried.
+func TestAConfigChangeAppliesToNewOffersOnly(t *testing.T) {
+	b := newBus(t, "tse-0", "tse-1")
+	b.ensure("tse", 2, 0, "read")
+	w0 := b.worker("tse", "read", "tse-0", answerAccept, 6*time.Second)
+	w1 := b.worker("tse", "read", "tse-1", answerAccept, time.Second)
+	ti := oneProfile("tse", 2, "tse-0")
+	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "task-1 handed to tse-0", func() bool { return w0.offerCount() == 1 })
+	ti.update(func(c *lib.DispatchConfig) { c.RenewSeconds, c.LeaseSeconds, c.RestartGraceSeconds = 2, 9, 4 })
+	ti.pool.Set("tse", "read", "tse-0", "tse-1")
+	b.submit("tse", "read", lib.SubmitKindTop, "task-2")
+	waitFor(t, 10*time.Second, "task-2 handed to tse-1", func() bool { return w1.offerCount() == 1 })
+	time.Sleep(1500 * time.Millisecond)
+	rec := b.leases()[lib.ProfileLeaseKey("tse", "read", "tse-0", "task-1")]
+	if span := rec.ExpiresAt.Sub(rec.RenewedAt); span != 3*time.Second {
+		t.Errorf("task-1's lease is now %v, want the 3s it was offered", span)
+	}
+	w1.mu.Lock()
+	offer := w1.offers[0]
+	w1.mu.Unlock()
+	if offer.LeaseSeconds != 9 || offer.RenewSeconds != 2 {
+		t.Errorf("task-2 offered lease %d renew %d, want the new 9 and 2", offer.LeaseSeconds, offer.RenewSeconds)
+	}
+	if ts := b.waitTerminal("task-1", 15*time.Second); ts.state != lib.StateCompleted {
+		t.Errorf("task-1: %+v", ts)
+	}
+}
+
+// A profile the config drops has its durables unbound: its new submissions
+// stay on the stream, while a task already held runs to its end.
+func TestADroppedProfileIsUnbound(t *testing.T) {
+	b := newBus(t, "tse-0", "tse-1")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, 3*time.Second)
+	other := b.worker("tse", "read", "tse-1", answerAccept, time.Second)
+	ti := oneProfile("tse", 2, "tse-0")
+	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "task-1 handed out", func() bool { return w.offerCount() == 1 })
+	ti.update(func(c *lib.DispatchConfig) { c.Profiles = nil })
+	ti.pool.Set("tse", "read", "tse-0", "tse-1")
+	time.Sleep(time.Second) // more than a refresh
+	b.submit("tse", "read", lib.SubmitKindTop, "task-2")
+	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateCompleted {
+		t.Errorf("the held task: %+v", ts)
+	}
+	time.Sleep(time.Second)
+	if other.offerCount() != 0 || len(b.terminalsOf("task-2")) != 0 {
+		t.Errorf("a dropped profile's submission was dispatched")
+	}
+	if _, num := b.pending(lib.ProfileDurableName("tse", "read", lib.SubmitKindTop)); num != 1 {
+		t.Errorf("%d submissions queued, want task-2", num)
 	}
 }

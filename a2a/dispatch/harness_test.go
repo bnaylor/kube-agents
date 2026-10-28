@@ -33,19 +33,62 @@ const (
 	workerPW  = "worker-pw"
 )
 
-// testConfig is the dispatcher's timing at test speed. Lease and renewal
-// ride the offer as whole seconds, so they can go no lower.
+// testConfig is the dispatcher's process settings at test speed.
 func testConfig() Config {
 	c := DefaultConfig()
-	c.Renew = time.Second
-	c.Lease = 3 * time.Second
-	c.RestartGrace = 2 * time.Second
-	c.AcceptTimeout = time.Second
 	c.RetryDelay = 200 * time.Millisecond
 	c.HealthInterval = 200 * time.Millisecond
 	c.StallAfter = time.Second
 	c.RefreshInterval = 200 * time.Millisecond
 	return c
+}
+
+// testInstall is the config source and the pool a test drives.
+type testInstall struct {
+	src  *StaticSource
+	pool *StaticPool
+}
+
+// testProfile is a profile allowing tiers (read when none), with a durable
+// per (tier, kind).
+func testProfile(name string, concurrency int, tiers ...string) lib.DispatchProfile {
+	if len(tiers) == 0 {
+		tiers = []string{"read"}
+	}
+	p := lib.DispatchProfile{Name: name, Tiers: tiers, Concurrency: concurrency,
+		QueueTimeoutSeconds: 3600, ActiveDeadlineSeconds: 60}
+	for _, tier := range tiers {
+		for _, kind := range submitKinds {
+			p.Durables = append(p.Durables, lib.DispatchDurable{Tier: tier, Kind: kind, Name: lib.ProfileDurableName(name, tier, kind)})
+		}
+	}
+	return p
+}
+
+// testDispatchConfig is the install at test speed. Lease and renewal ride
+// the offer as whole seconds, so they can go no lower.
+func testDispatchConfig(ceiling int, profiles ...lib.DispatchProfile) lib.DispatchConfig {
+	r := max(1, (ceiling+2)/3)
+	return lib.DispatchConfig{Version: "test", Namespace: "kube-agents", ProfileNamespace: "kube-agents-profiles", Ceiling: ceiling, InteractiveReserve: r, ChildReserve: r,
+		LeaseSeconds: 3, RenewSeconds: 1, RestartGraceSeconds: 2, AcceptTimeoutSeconds: 1, Profiles: profiles}
+}
+
+// oneProfile is an install with one profile whose read pool is pods.
+func oneProfile(name string, concurrency int, pods ...string) *testInstall {
+	ti := &testInstall{src: NewStaticSource(testDispatchConfig(6, testProfile(name, concurrency))), pool: NewStaticPool()}
+	ti.pool.Set(name, "read", pods...)
+	return ti
+}
+
+// update edits the install config in place.
+func (ti *testInstall) update(edit func(*lib.DispatchConfig)) {
+	cfg := ti.src.Config()
+	cfg.Profiles = append([]lib.DispatchProfile(nil), cfg.Profiles...)
+	edit(&cfg)
+	if err := cfg.Validate(); err != nil {
+		panic(err)
+	}
+	ti.src.Set(cfg)
 }
 
 type bus struct {
@@ -297,16 +340,16 @@ func (v *fakeVerifier) callList() []string {
 
 // runDispatcher starts a dispatcher on its own connection and returns a
 // stop that waits for Run to return.
-func (b *bus) runDispatcher(cfg Config, src Source, v Verifier) (*Dispatcher, func()) {
+func (b *bus) runDispatcher(cfg Config, ti *testInstall, v Verifier) (*Dispatcher, func()) {
 	b.t.Helper()
-	return b.runDispatcherOn(b.connect("dispatcher"), cfg, src, v)
+	return b.runDispatcherOn(b.connect("dispatcher"), cfg, ti, v)
 }
 
 // runDispatcherOn is runDispatcher on a connection the caller holds, so a
 // test can kill it.
-func (b *bus) runDispatcherOn(c *lib.Client, cfg Config, src Source, v Verifier) (*Dispatcher, func()) {
+func (b *bus) runDispatcherOn(c *lib.Client, cfg Config, ti *testInstall, v Verifier) (*Dispatcher, func()) {
 	b.t.Helper()
-	d, err := New(cfg, c, src, v, quietLog())
+	d, err := New(cfg, c, ti.src, ti.pool, v, quietLog())
 	if err != nil {
 		b.t.Fatal(err)
 	}
@@ -521,14 +564,6 @@ func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("timed out after %v waiting for %s", d, what)
-}
-
-// oneProfile is a snapshot with one profile and its pods at read.
-func oneProfile(name string, concurrency int, pods ...string) Snapshot {
-	return Snapshot{Namespace: "kube-agents", Ceiling: 6, Profiles: []Profile{{
-		Name: name, Concurrency: concurrency, ActiveDeadlineSeconds: 60,
-		Pods: map[string][]string{"read": pods},
-	}}}
 }
 
 func hasReason(ts terminalSeen, reason string) bool {

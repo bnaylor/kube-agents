@@ -15,8 +15,8 @@ func TestARestartReadoptsALiveTask(t *testing.T) {
 	b := newBus(t, "tse-0")
 	b.ensure("tse", 2, 0, "read")
 	w := b.worker("tse", "read", "tse-0", answerAccept, 12*time.Second)
-	src := NewStaticSource(oneProfile("tse", 2, "tse-0"))
-	_, stop1 := b.runDispatcher(testConfig(), src, &fakeVerifier{})
+	ti := oneProfile("tse", 2, "tse-0")
+	_, stop1 := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
 	waitFor(t, 10*time.Second, "the offer", func() bool { return w.offerCount() == 1 })
 	time.Sleep(1500 * time.Millisecond)
@@ -27,7 +27,7 @@ func TestARestartReadoptsALiveTask(t *testing.T) {
 			t.Fatalf("the record is still live after the outage (%v); the test proves nothing", rec.ExpiresAt)
 		}
 	}
-	b.runDispatcher(testConfig(), src, &fakeVerifier{})
+	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 	ts := b.waitTerminal("task-1", 20*time.Second)
 	if ts.state != lib.StateCompleted || ts.from != "tse-0" {
 		t.Errorf("terminal %+v, want the worker's completed", ts)
@@ -50,15 +50,15 @@ func TestACrashReadoptsALiveTaskAfterAckWait(t *testing.T) {
 	b := newBus(t, "tse-0")
 	b.ensure("tse", 2, 6*time.Second, "read")
 	w := b.worker("tse", "read", "tse-0", answerAccept, 16*time.Second)
-	src := NewStaticSource(oneProfile("tse", 2, "tse-0"))
+	ti := oneProfile("tse", 2, "tse-0")
 	c1 := b.connect("dispatcher-1")
-	_, stop1 := b.runDispatcherOn(c1, testConfig(), src, &fakeVerifier{})
+	_, stop1 := b.runDispatcherOn(c1, testConfig(), ti, &fakeVerifier{})
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
 	waitFor(t, 10*time.Second, "the offer", func() bool { return w.offerCount() == 1 })
 	time.Sleep(1500 * time.Millisecond)
 	c1.Close() // no Nak reaches the server
 	stop1()
-	b.runDispatcher(testConfig(), src, &fakeVerifier{})
+	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 	ts := b.waitTerminal("task-1", 30*time.Second)
 	if ts.state != lib.StateCompleted || ts.from != "tse-0" {
 		t.Errorf("terminal %+v, want the worker's completed", ts)
@@ -75,24 +75,24 @@ func TestARestartFailsADeadTaskAfterTheGrace(t *testing.T) {
 	b := newBus(t, "tse-0")
 	b.ensure("tse", 2, 0, "read")
 	w := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
-	src := NewStaticSource(oneProfile("tse", 2, "tse-0"))
-	_, stop1 := b.runDispatcher(testConfig(), src, &fakeVerifier{})
+	ti := oneProfile("tse", 2, "tse-0")
+	_, stop1 := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
 	waitFor(t, 10*time.Second, "the offer", func() bool { return w.offerCount() == 1 })
 	time.Sleep(1500 * time.Millisecond)
 	stop1()
 	w.kill()
 	time.Sleep(4 * time.Second)
-	cfg := testConfig()
-	cfg.RestartGrace = 3 * time.Second
+	ti.update(func(c *lib.DispatchConfig) { c.RestartGraceSeconds = 3 })
+	grace := 3 * time.Second
 	started := time.Now()
-	b.runDispatcher(cfg, src, &fakeVerifier{})
+	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 	ts := b.waitTerminal("task-1", 15*time.Second)
 	if ts.state != lib.StateFailed || !hasReason(ts, ReasonLeaseExpired) {
 		t.Errorf("terminal %+v, want failed lease-expired", ts)
 	}
-	if waited := time.Since(started); waited < cfg.RestartGrace {
-		t.Errorf("failed %v after the restart, inside the %v grace", waited, cfg.RestartGrace)
+	if waited := time.Since(started); waited < grace {
+		t.Errorf("failed %v after the restart, inside the %v grace", waited, grace)
 	}
 	time.Sleep(2 * time.Second)
 	if n := w.offerCount(); n != 1 {
@@ -108,7 +108,8 @@ func TestARestartFailsADeadTaskAfterTheGrace(t *testing.T) {
 func TestARestartDispatchesAnUnstartedTask(t *testing.T) {
 	b := newBus(t, "tse-0")
 	b.ensure("tse", 2, 0, "read")
-	_, stop1 := b.runDispatcher(testConfig(), NewStaticSource(oneProfile("tse", 2)), &fakeVerifier{})
+	ti := oneProfile("tse", 2)
+	_, stop1 := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
 	time.Sleep(1500 * time.Millisecond)
 	stop1()
@@ -116,7 +117,8 @@ func TestARestartDispatchesAnUnstartedTask(t *testing.T) {
 		t.Fatalf("an unstarted task has a lease: %v", l)
 	}
 	w := b.worker("tse", "read", "tse-0", answerAccept, 500*time.Millisecond)
-	b.runDispatcher(testConfig(), NewStaticSource(oneProfile("tse", 2, "tse-0")), &fakeVerifier{})
+	ti.pool.Set("tse", "read", "tse-0")
+	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 	if ts := b.waitTerminal("task-1", 15*time.Second); ts.state != lib.StateCompleted {
 		t.Errorf("terminal %+v, want completed", ts)
 	}
@@ -133,14 +135,14 @@ func TestAnInterruptedOfferIsNeverOfferedAgain(t *testing.T) {
 	b := newBus(t, "tse-0")
 	b.ensure("tse", 2, 0, "read")
 	w := b.worker("tse", "read", "tse-0", answerSilent, 0)
-	cfg := testConfig()
-	cfg.AcceptTimeout = 5 * time.Second
-	src := NewStaticSource(oneProfile("tse", 2, "tse-0"))
-	_, stop1 := b.runDispatcher(cfg, src, &fakeVerifier{})
+	ti := oneProfile("tse", 2, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) { c.AcceptTimeoutSeconds = 5 })
+	_, stop1 := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
 	waitFor(t, 10*time.Second, "the offer", func() bool { return w.offerCount() == 1 })
 	stop1()
-	b.runDispatcher(testConfig(), src, &fakeVerifier{})
+	ti.update(func(c *lib.DispatchConfig) { c.AcceptTimeoutSeconds = 1 })
+	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 	ts := b.waitTerminal("task-1", 20*time.Second)
 	if ts.state != lib.StateFailed || !hasReason(ts, ReasonLeaseExpired) {
 		t.Errorf("terminal %+v, want failed lease-expired", ts)
@@ -158,14 +160,14 @@ func TestAFinishBetweenHoldersIsSettledNotFailed(t *testing.T) {
 	b := newBus(t, "tse-0")
 	b.ensure("tse", 2, 6*time.Second, "read")
 	w := b.worker("tse", "read", "tse-0", answerAccept, 3*time.Second)
-	src := NewStaticSource(oneProfile("tse", 2, "tse-0"))
+	ti := oneProfile("tse", 2, "tse-0")
 	c1 := b.connect("dispatcher-1")
-	_, stop1 := b.runDispatcherOn(c1, testConfig(), src, &fakeVerifier{})
+	_, stop1 := b.runDispatcherOn(c1, testConfig(), ti, &fakeVerifier{})
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
 	waitFor(t, 10*time.Second, "the offer", func() bool { return w.offerCount() == 1 })
 	c1.Close()
 	stop1()
-	b.runDispatcher(testConfig(), src, &fakeVerifier{})
+	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 	waitFor(t, 20*time.Second, "the submission settled", func() bool {
 		ack, num := b.pending(lib.ProfileDurableName("tse", "read", lib.SubmitKindTop))
 		return w.completed.Load() == 1 && ack == 0 && num == 0 && len(b.leases()) == 0

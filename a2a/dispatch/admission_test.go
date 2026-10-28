@@ -14,25 +14,23 @@ func TestAdmissionRefusalsAreVisibleAndTerminal(t *testing.T) {
 	b := newBus(t, "tse-0")
 	b.ensure("tse", 4, 0, "read", "unattended")
 	w := b.worker("tse", "read", "tse-0", answerAccept, 200*time.Millisecond)
-	snap := oneProfile("tse", 4, "tse-0")
-	snap.Profiles[0].AllowedTiers = []string{"read", "unattended"}
-	snap.Profiles[0].Parameters = []Parameter{{Name: "repo", Required: true}, {Name: "note"}}
-	snap.Profiles[0].QueueTimeoutSeconds = 2
-	src := NewStaticSource(snap)
+	ti := oneProfile("tse", 4, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) {
+		c.Profiles[0] = testProfile("tse", 4, "read", "unattended")
+		c.Profiles[0].Parameters = []lib.ProfileParameter{{Name: "repo", Required: true}, {Name: "note"}}
+		c.Profiles[0].QueueTimeoutSeconds = 2
+	})
 
 	// Queued before the dispatcher starts, and older than the timeout by
 	// the time it does.
 	b.submitWith("tse", "read", lib.SubmitKindTop, "task-stale", "cap-ok", map[string]string{"repo": "r"})
 	time.Sleep(2500 * time.Millisecond)
 	v := &fakeVerifier{refuse: map[string]bool{"cap-bad": true}}
-	b.runDispatcher(testConfig(), src, v)
-	// Bound to both tiers; then the profile drops unattended (the config
-	// moved under a bound durable).
+	b.runDispatcher(testConfig(), ti, v)
+	// The profile drops unattended from its tiers while the operator still
+	// lists the durable (the config moved under a bound durable).
 	waitFor(t, 10*time.Second, "the stale task refused", func() bool { return len(b.terminalsOf("task-stale")) == 1 })
-	next := snap
-	next.Profiles = []Profile{snap.Profiles[0]}
-	next.Profiles[0].AllowedTiers = []string{"read"}
-	src.Set(next)
+	ti.update(func(c *lib.DispatchConfig) { c.Profiles[0].Tiers = []string{"read"} })
 
 	b.submitWith("tse", "unattended", lib.SubmitKindTop, "task-tier", "cap-ok", map[string]string{"repo": "r"})
 	b.submitWith("tse", "read", lib.SubmitKindTop, "task-refused", "cap-bad", map[string]string{"repo": "r"})

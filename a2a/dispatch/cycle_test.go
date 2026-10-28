@@ -20,9 +20,9 @@ type child struct{ profile, taskID string }
 // chainPools starts pods worker pods for each profile, each running its
 // task by starting the child spawn names (if any), waiting for the child's
 // terminal, then finishing after work.
-func chainPools(t *testing.T, b *bus, spawn map[string]child, work time.Duration, pods int, profiles ...string) Snapshot {
+func chainPools(t *testing.T, b *bus, spawn map[string]child, work time.Duration, pods int, profiles ...string) *testInstall {
 	t.Helper()
-	snap := Snapshot{Namespace: "kube-agents", Ceiling: 3}
+	ti := &testInstall{src: NewStaticSource(testDispatchConfig(3)), pool: NewStaticPool()}
 	for _, p := range profiles {
 		var names []string
 		for i := 0; i < pods; i++ {
@@ -47,10 +47,14 @@ func chainPools(t *testing.T, b *bus, spawn map[string]child, work time.Duration
 			}
 		}
 		b.ensure(p, 4, 0, "read")
-		snap.Profiles = append(snap.Profiles, Profile{Name: p, Concurrency: 4, ActiveDeadlineSeconds: 20,
-			Pods: map[string][]string{"read": names}})
+		ti.pool.Set(p, "read", names...)
+		ti.update(func(c *lib.DispatchConfig) {
+			prof := testProfile(p, 4)
+			prof.ActiveDeadlineSeconds = 20
+			c.Profiles = append(c.Profiles, prof)
+		})
 	}
-	return snap
+	return ti
 }
 
 // Ceiling 3: the child reserve is 1, so top-level work stops at 2. Three
@@ -70,8 +74,8 @@ func TestChildrenRunThroughTheChildReserve(t *testing.T) {
 		"parent-2": {"px", "child-2"},
 		"parent-3": {"py", "child-3"},
 	}
-	snap := chainPools(t, b, spawn, 300*time.Millisecond, 4, "px", "py")
-	b.runDispatcher(testConfig(), NewStaticSource(snap), &fakeVerifier{})
+	ti := chainPools(t, b, spawn, 300*time.Millisecond, 4, "px", "py")
+	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 	b.submit("px", "read", lib.SubmitKindTop, "parent-1")
 	b.submit("py", "read", lib.SubmitKindTop, "parent-2")
 	b.submit("px", "read", lib.SubmitKindTop, "parent-3")
@@ -100,11 +104,13 @@ func TestACrossChainCycleSurfaces(t *testing.T) {
 		"parent-a": {"py", "child-a"}, "child-a": {"px", "grand-a"},
 		"parent-b": {"px", "child-b"}, "child-b": {"py", "grand-b"},
 	}
-	snap := chainPools(t, b, spawn, 200*time.Millisecond, 4, "px", "py")
-	for i := range snap.Profiles {
-		snap.Profiles[i].ActiveDeadlineSeconds = 5
-	}
-	d, _ := b.runDispatcher(testConfig(), NewStaticSource(snap), &fakeVerifier{})
+	ti := chainPools(t, b, spawn, 200*time.Millisecond, 4, "px", "py")
+	ti.update(func(c *lib.DispatchConfig) {
+		for i := range c.Profiles {
+			c.Profiles[i].ActiveDeadlineSeconds = 5
+		}
+	})
+	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 	b.submit("px", "read", lib.SubmitKindTop, "parent-a")
 	b.submit("py", "read", lib.SubmitKindTop, "parent-b")
 

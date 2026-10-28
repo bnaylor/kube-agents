@@ -43,17 +43,17 @@ type refusal struct {
 
 // admit runs the admission checks in order, cheapest first: the tier, the
 // queue age, the parameters, then the verifier. A nil refusal admits.
-func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap Snapshot, prof Profile, tier string, now time.Time) (*refusal, error) {
+func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile, tier string, now time.Time) (*refusal, error) {
 	env := del.Envelope()
-	if !prof.AllowsTier(tier) {
+	if !allowsTier(prof, tier) {
 		return &refusal{ReasonTierNotAllowed, fmt.Sprintf("profile %s does not allow tier %s", prof.Name, tier)}, nil
 	}
 	if rec := del.Received(); !rec.IsZero() {
-		if age := now.Sub(rec); age > prof.QueueTimeout() {
-			return &refusal{ReasonQueueTimeout, fmt.Sprintf("queued %s, over the profile's %s", age.Round(time.Second), prof.QueueTimeout())}, nil
+		if age, limit := now.Sub(rec), queueTimeout(prof); age > limit {
+			return &refusal{ReasonQueueTimeout, fmt.Sprintf("queued %s, over the profile's %s", age.Round(time.Second), limit)}, nil
 		}
 	}
-	target, bad := taskTarget(env, prof, snap)
+	target, bad := taskTarget(env, prof, snap.Namespace)
 	if bad != "" {
 		return &refusal{ReasonParametersInvalid, bad}, nil
 	}
@@ -79,7 +79,7 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap Snapshot,
 // the profile's declared ones, and builds the verifier's target: the cluster
 // path when the task names a cluster, the install's namespace otherwise. A
 // non-empty bad is the parameters-invalid detail.
-func taskTarget(env *lib.Envelope, prof Profile, snap Snapshot) (target capability.Scope, bad string) {
+func taskTarget(env *lib.Envelope, prof lib.DispatchProfile, namespace string) (target capability.Scope, bad string) {
 	var msg lib.Message
 	if err := json.Unmarshal(env.Payload, &msg); err != nil {
 		return "", "the submission's message does not parse"
@@ -106,8 +106,8 @@ func taskTarget(env *lib.Envelope, prof Profile, snap Snapshot) (target capabili
 		return capability.Scope(fmt.Sprintf(clusterTargetForm, project, location, cluster)), ""
 	case hasProject || hasLocation || hasCluster:
 		return "", "a cluster target needs all of project, location and cluster"
-	case snap.Namespace == "":
+	case namespace == "":
 		return "", "the task names no cluster and the dispatcher has no namespace to scope it to"
 	}
-	return capability.Scope(namespaceTarget + snap.Namespace), ""
+	return capability.Scope(namespaceTarget + namespace), ""
 }
