@@ -174,8 +174,7 @@ MAX_RAW_BYTES = 1 << 22
 COVERAGE_HEADING = "## Coverage"
 GAPS_HEADING = "## Gaps"
 COVERAGE_COLUMNS = ("Cluster", "Project", "Location", "Card")
-# compose()'s wording since #3702, and before it, so a report from either reads.
-SWEEP_AUDITED_RE = r"^- (?P<cluster>[^()]+?) \((?P<project>[^()]+?)\): no Cluster Agent(?: card)?, so the sweep audited it itself$"
+SWEEP_AUDITED_RE = r"^- (?P<cluster>[^()]+?) \((?P<project>[^()]+?)\): no Cluster Agent card, so the sweep audited it itself$"
 UNREPORTED_RE = r"^- (?P<cluster>[^()]+?) \((?P<project>[^(),]+?), [^()]*\): listed in the fleet but no audit reported on it$"
 
 # The worker's scores (inventory_findings.py: DEFAULT_SCORES_PATH) and the report

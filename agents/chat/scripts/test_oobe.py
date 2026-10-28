@@ -318,6 +318,21 @@ class StageTest(unittest.TestCase):
         self._main(now=NOW_PAST_FALLBACK + 10 * oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS)
         self.assertEqual(self._started_ids(), FIRST)
 
+    def test_a_fleet_past_the_first_run_cap_waits_for_its_uncarded_clusters(self):
+        # #3702: the marker's uncarded= agents have no card but are still in the hand-off's deadline.
+        per_card = oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS
+        clusters = [(f"t_c{i}", "running", f"bootstrap-inventory-cluster-c{i}", SWEEP_CREATED_AT + 1) for i in range(6)]
+        (self.d / oobe.SCAN_FILED_MARKER).write_text(
+            f"task_id={SWEEP_ID}\nfiled_at={FILED_AT}\nuncarded=4\n", encoding="utf-8"
+        )
+        _board(self.board, clusters)
+        self._main(now=NOW_PAST_FALLBACK + 6 * per_card)
+        self.assertEqual(self.started, [])
+        self._main(now=NOW_PAST_FALLBACK + 10 * per_card - 1)
+        self.assertEqual(self.started, [])
+        self._main(now=NOW_PAST_FALLBACK + 10 * per_card)
+        self.assertEqual(self._started_ids(), FIRST)
+
     def test_the_fallback_is_the_hand_offs_deadline_for_the_cards_it_counts(self):
         # An archived cluster card is not one the hand-off waits for, so the stage does not either.
         per_card = oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS

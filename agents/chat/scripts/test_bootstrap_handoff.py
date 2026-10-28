@@ -619,6 +619,33 @@ class HandOffTest(unittest.TestCase):
             self.assertIsNone(self._run_roster(roster))
         self.assertEqual(len(sent), 1)
 
+    def test_an_agent_past_the_cap_is_not_a_card_the_gate_could_not_file(self):
+        # #3702: the cap's worth of cards are on the board and done and the sweep
+        # finished, so the hand-off goes ahead; the agents past the cap were left
+        # to the sweep, so the raw report has no unfiled-card gap for them.
+        _board(self.board, clusters=_all_done())
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_text(str(len(_all_done())))
+        roster = [self._agent(tid) for tid, _, _, _ in _all_done()] + [self._agent(f"t_past{i}") for i in range(3)]
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertEqual(self._run_roster(roster), "t_rank1")
+        self.assertEqual(sent, [])
+        self.assertNotIn("could not file this Cluster Agent's card", (self.d / "INVENTORY.raw.md").read_text())
+
+    def test_the_deadline_budgets_for_the_agents_the_marker_left_uncarded(self):
+        # #3702: the gate's marker records the agents past the cap, and the
+        # hand-off waits five more minutes for each before it stops waiting.
+        uncarded = 4
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\nuncarded={uncarded}\n")
+        _board(self.board, clusters=_all_done() + [("t_stuck", "running", None, "")])
+        unbudgeted = h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * (len(_all_done()) + 1)
+        budgeted = unbudgeted + h.DEADLINE_PER_CARD_SECONDS * uncarded
+        self.assertIsNone(self._run(now=NOW - 60 + unbudgeted))
+        self.assertIsNone(self._run(now=NOW - 60 + budgeted - 1))
+        self.assertFalse((self.d / "INVENTORY.raw.md").exists())
+        self.assertEqual(self._run(now=NOW - 60 + budgeted), "t_rank1")
+        self.assertIn("stopped waiting", (self.d / "INVENTORY.raw.md").read_text())
+
     def test_a_roster_under_the_cap_files_every_card(self):
         _board(self.board, clusters=[])
         sent = []
@@ -827,10 +854,6 @@ class HandOffTest(unittest.TestCase):
         self.assertFalse((self.d / "INVENTORY.raw.md").exists())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class FirstRunClusterCardsTest(unittest.TestCase):
     """The cap file's clamp (#3702): it can lower or raise the cap within
     bounds, and nothing in it uncaps the scan."""
@@ -865,17 +888,31 @@ class FirstRunClusterCardsTest(unittest.TestCase):
         (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).mkdir()
         self.assertEqual(self._cap(), h.FIRST_RUN_CLUSTER_CARDS)
 
+    def test_a_file_that_is_not_utf8_is_the_default(self):
+        # UnicodeDecodeError is a ValueError, not an OSError.
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_bytes(b"\xff\xfe6\x00")
+        self.assertEqual(self._cap(), h.FIRST_RUN_CLUSTER_CARDS)
+
     def test_the_marker_count_of_uncarded_agents_is_clamped(self):
         marker = self.d / "scan_filed"
         for content, want in (("task_id=t\nfiled_at=1\n", 0), ("task_id=t\nuncarded=194\n", 194),
                               ("task_id=t\nuncarded=-4\n", 0), ("task_id=t\nuncarded=lots\n", 0),
-                              (f"task_id=t\nuncarded={h.FIRST_RUN_UNCARDED_MAX + 1}\n", 0)):
+                              (f"task_id=t\nuncarded={h.FIRST_RUN_UNCARDED_MAX + 1}\n", h.FIRST_RUN_UNCARDED_MAX)):
             with self.subTest(content=content):
                 marker.write_text(content)
                 self.assertEqual(h.uncarded_agents(marker), want)
+
+    def test_a_marker_that_is_not_utf8_records_no_uncarded_agents(self):
+        # _read_marker raises UnicodeDecodeError, a ValueError, which this read catches.
+        marker = self.d / "scan_filed"
+        marker.write_bytes(b"\xff\xfe6\x00")
+        self.assertEqual(h.uncarded_agents(marker), 0)
 
     def test_the_deadline_budgets_for_clusters_left_to_the_sweep(self):
         state = {"clusters": [{}] * 6, "uncarded": 194}
         self.assertEqual(h.deadline(state), h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * 200)
         self.assertEqual(h.deadline({"clusters": [{}] * 6}), h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * 6)
 
+
+if __name__ == "__main__":
+    unittest.main()

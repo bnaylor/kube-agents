@@ -2419,6 +2419,23 @@ class ScanGateTest(unittest.TestCase):
             )
         self.assertEqual(bootstrap_scan_gate.bootstrap_handoff.uncarded_agents(self.d / SCAN_FILED), 3)
 
+    def test_filing_the_sweep_records_the_agents_past_the_cap(self):
+        # The real file_scan_task, so the count it writes is the one under test.
+        [self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(5)]
+        (self.d / bootstrap_scan_gate.bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("2")
+        filed = []
+        kanban = types.ModuleType("hermes_cli.kanban")
+        kanban.run_slash = lambda cmd: filed.append(cmd) or '{"id": "t_real"}'
+        modules = {"hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.kanban": kanban}
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), \
+                mock.patch.dict(sys.modules, modules), \
+                contextlib.redirect_stderr(io.StringIO()):
+            ready = bootstrap_scan_gate.cluster_agents(capped=False)
+            self.assertEqual(self._orig(self.d), "t_real")
+        self.assertEqual(len(filed), 1)
+        self.assertIn("uncarded=3\n", (self.d / SCAN_FILED).read_text())
+        self.assertEqual(bootstrap_scan_gate.bootstrap_handoff.uncarded_agents(self.d / SCAN_FILED), len(ready) - 2)
+
     def test_a_roster_under_the_cap_is_listed_whole(self):
         names = [self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(3)]
         self.assertEqual([a["name"] for a in bootstrap_scan_gate.cluster_agents()], sorted(names))

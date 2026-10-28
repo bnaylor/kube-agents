@@ -12,8 +12,10 @@
 # Cluster Agents, so the default never binds there and a run at it cannot tell
 # a capped build from one without the cap. The stack writes 2 to the agent's
 # `.first_run_cluster_cards` (bootstrap_handoff.first_run_cluster_cards reads
-# it) before it re-arms the gate, and the destroy removes it again. The verifier
-# errors rather than passes on a roster of 2 or fewer, where 2 binds nothing.
+# it) before it re-arms the gate, and the destroy removes it again; it refuses
+# an install that already has an operator's cap file rather than overwrite it.
+# The verifier errors rather than passes on a roster of 2 or fewer, where 2
+# binds nothing.
 #
 # Red on main: main's gate does not read the cap file and files a card for
 # every Cluster Agent, so `cards-for-first-two-profiles` fails on the cards

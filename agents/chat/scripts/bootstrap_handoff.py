@@ -7,7 +7,7 @@ Agent, waits for those cards and the sweep to settle, writes
 ``bootstrap-inventory-prioritize`` card that ranks it into the report the user
 receives — or, when no cluster's audit reached the raw file, writes that report
 itself, saying so, and files no ranking card. The sweep's worker only lists the fleet and audits any cluster with
-no Cluster Agent.
+no Cluster Agent, and the clusters past the first-run cap (#3702).
 
 It is code rather than SOP text because each of these steps is mechanical
 and the worker could not do them reliably: it has no tool that waits
@@ -99,8 +99,11 @@ SECONDS_PER_MINUTE = 60
 FIRST_RUN_CLUSTER_CARDS = 6
 FIRST_RUN_CLUSTER_CARDS_MAX = 24
 FIRST_RUN_CLUSTER_CARDS_FILE = ".first_run_cluster_cards"
-# The most uncarded agents the deadline will budget for, so a hand-edited marker
-# cannot hold the hand-off open for days.
+# How much of a malformed cap file the log line quotes.
+MAX_LOGGED_CHARS = 40
+# The most uncarded agents the deadline will budget for: it bounds how much
+# time a hand-edited marker can add to the hand-off's wait. A larger count is
+# read as this many.
 FIRST_RUN_UNCARDED_MAX = 1000
 
 SANDBOX_TIMEOUT_SECONDS = 30
@@ -205,13 +208,14 @@ def uncarded_agents(marker: Path) -> int:
 
     The gate records it when it files the sweep, so the hand-off's time limit
     still budgets for those clusters, which the sweep's worker now audits
-    itself. Zero when the marker does not say, or says something else.
+    itself. Zero when the marker does not say, or says something that is not
+    a positive whole number; never more than FIRST_RUN_UNCARDED_MAX.
     """
     try:
         value = int(_read_marker(marker).get("uncarded", "0"))
     except ValueError:
         return 0
-    return value if 0 < value <= FIRST_RUN_UNCARDED_MAX else 0
+    return min(value, FIRST_RUN_UNCARDED_MAX) if value > 0 else 0
 
 
 def _metadata(conn: sqlite3.Connection, task_id: str) -> dict:
@@ -784,16 +788,20 @@ def first_run_cluster_cards(data_dir: Path) -> int:
     """
     path = data_dir / FIRST_RUN_CLUSTER_CARDS_FILE
     try:
-        raw = path.read_text().strip()
+        raw = path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         return FIRST_RUN_CLUSTER_CARDS
     except OSError as e:
         _log(f"could not read {path}: {e}; using {FIRST_RUN_CLUSTER_CARDS}")
         return FIRST_RUN_CLUSTER_CARDS
+    except UnicodeDecodeError as e:
+        # A ValueError, not an OSError, so it needs its own branch.
+        _log(f"{path} is not UTF-8 ({e}); using {FIRST_RUN_CLUSTER_CARDS}")
+        return FIRST_RUN_CLUSTER_CARDS
     try:
         value = int(raw)
     except ValueError:
-        _log(f"{path} holds {raw[:40]!r}, not a number; using {FIRST_RUN_CLUSTER_CARDS}")
+        _log(f"{path} holds {raw[:MAX_LOGGED_CHARS]!r}, not a number; using {FIRST_RUN_CLUSTER_CARDS}")
         return FIRST_RUN_CLUSTER_CARDS
     if value < 1:
         _log(f"{path} holds {value}; using {FIRST_RUN_CLUSTER_CARDS}")

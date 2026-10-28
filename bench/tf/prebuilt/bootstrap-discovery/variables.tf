@@ -70,7 +70,8 @@ variable "sandbox_container" {
 # reads it from .first_run_cluster_cards in the agent's data dir, defaults to 6
 # and clamps to 1..24 (FIRST_RUN_CLUSTER_CARDS_MAX). The eval fleet has fewer
 # Cluster Agents than the default, so a case that grades the cap sets it lower
-# here. Null writes no file and leaves one already there alone.
+# here. Null writes no file and leaves an operator's alone; either way, a cap an
+# earlier run of this stack left behind is removed (main.tf, step 2).
 variable "first_run_cluster_cards" {
   type        = number
   description = "Cluster Agent cards one first-run sweep files, written to the agent's .first_run_cluster_cards before the re-arm; null writes nothing"

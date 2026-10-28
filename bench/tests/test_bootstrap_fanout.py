@@ -580,12 +580,6 @@ def test_an_unreadable_sandbox_is_an_error(capped, monkeypatch: pytest.MonkeyPat
     assert "could not be read" in result.reason
 
 
-def test_the_pre_3702_gap_wording_still_reads_as_audited() -> None:
-    text = _compose(FIRST, PAST).replace("no Cluster Agent card, so", "no Cluster Agent, so")
-    parsed = onboarding.parse_raw_coverage(text)
-    assert sorted(parsed["sweep_audited"]) == sorted([["c2", "proj"], ["c3", "proj"], ["c4", "proj"]])
-
-
 def test_cap_is_required_by_the_capped_requirements_and_refused_elsewhere() -> None:
     with pytest.raises(Exception):
         parse_node({"type": "bootstrap_fanout", "require": "cards_for_first_cap_profiles"})

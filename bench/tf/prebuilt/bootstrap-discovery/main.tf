@@ -28,8 +28,13 @@
 #
 # With `first_run_cluster_cards` set, step 2 first writes it to the agent's
 # `.first_run_cluster_cards`, the gate's first-run cluster card cap (#3702), so
-# the sweep the re-arm brings on is filed under it. The exit trap and the
-# destroy remove that file again.
+# the sweep the re-arm brings on is filed under it, after a sentinel beside it
+# (`.first_run_cluster_cards.bench`) that marks the cap as this stack's. The
+# exit trap and the destroy remove the cap and then the sentinel; a cap whose
+# removal failed keeps its sentinel, and every run's step 2, capped or not,
+# removes a sentinel-marked cap first. A capped run refuses an install that
+# already has a cap file without the sentinel: that is an operator's setting,
+# and it is neither overwritten nor removed.
 #
 # It refuses an install where a person has connected (`.user_aligned`) or
 # onboarding already delivered (`.bootstrap_completed`): a fresh sweep there
@@ -93,6 +98,9 @@ locals {
   # writes there: empty when first_run_cluster_cards is null, so no file.
   cap_file  = "${local.home}/.first_run_cluster_cards"
   cards_cap = var.first_run_cluster_cards == null ? "" : tostring(var.first_run_cluster_cards)
+  # Present whenever the cap file is one this stack wrote, so a later run can
+  # tell its own leftover from an operator's setting.
+  cap_mark = "${local.home}/.first_run_cluster_cards.bench"
 }
 
 resource "null_resource" "sweep" {
@@ -113,6 +121,7 @@ resource "null_resource" "sweep" {
     inventory         = local.inventory
     cap_file          = local.cap_file
     cards_cap         = local.cards_cap
+    cap_mark          = local.cap_mark
   }
 
   provisioner "local-exec" {
@@ -182,12 +191,14 @@ resource "null_resource" "sweep" {
           done
           clear_inventory || failed="$failed, remove the INVENTORY files"
           # Terraform skips the destroy after a failed create, so this is the
-          # only removal the cap step 2 wrote gets.
+          # only removal the cap step 2 wrote gets. The sentinel goes only once
+          # the cap has, so a cap left behind is still marked as this stack's.
           if [ -n "$capped" ]; then
-            agent rm -f ${local.cap_file} >&2 || failed="$failed, remove ${local.cap_file}"
+            { agent rm -f ${local.cap_file} >&2 && agent rm -f ${local.cap_mark} >&2; } \
+              || failed="$failed, remove ${local.cap_file} and ${local.cap_mark}"
           fi
           if [ -n "$failed" ]; then
-            echo "Cleanup incomplete: could not$${failed#,}. The next run's step 2 archives the cards and removes the files left behind." >&2
+            echo "Cleanup incomplete: could not$${failed#,}. The next run's step 2, capped or not, archives the cards and removes the files left behind, a first-run cluster card cap this stack wrote included." >&2
           fi
         fi
         rm -rf "$kubeconfig_dir"
@@ -346,14 +357,35 @@ resource "null_resource" "sweep" {
               print("none")
       PY
       )"
+      # The first-run cap file: `bench` when an earlier run of this stack left
+      # its cap behind (the sentinel is there), `operator` when a cap file is
+      # there without it, `none` otherwise. A failed read stops the apply here.
+      cap="${local.cards_cap}"
+      cap_state="$(agent sh -c 'if [ -e "$1" ]; then echo bench; elif [ -e "$2" ]; then echo operator; else echo none; fi' \
+        sh ${local.cap_mark} ${local.cap_file})"
+      # Whatever this run's cap: a leftover cap would bound this sweep, the
+      # next case's and the install's real onboarding. The cap goes first, so
+      # a removal that fails part-way leaves it marked for the next run.
+      if [ "$cap_state" = bench ]; then
+        agent rm -f ${local.cap_file}
+        agent rm -f ${local.cap_mark}
+        echo "Removed the first-run cluster card cap an earlier run of this stack left in ${local.cap_file}."
+        cap_state=none
+      fi
+      if [ -n "$cap" ] && [ "$cap_state" != none ]; then
+        echo "ERROR: ${local.cap_file} exists on ${var.host_cluster_name} and this stack did not write it (no ${local.cap_mark}), so it is an operator's first-run cluster card cap (got '$cap_state'). This case would have to overwrite it to grade its own cap. Remove the file if nobody needs it, or run this case on another install." >&2
+        exit 1
+      fi
       rearmed=1
       # The cap goes in before anything the gate acts on changes, so whichever
       # gate run files the new sweep reads it: on an install whose gate was
       # open, that run can come before the markers are removed below. Marked
-      # first, so the trap also removes a write that failed part-way.
-      cap="${local.cards_cap}"
+      # first, in the trap's `capped` and then in the sentinel, so the trap
+      # also removes a write that failed part-way and a run after a failed
+      # removal knows the cap for this stack's.
       if [ -n "$cap" ]; then
         capped=1
+        agent sh -c ': > "$1"' sh ${local.cap_mark}
         agent sh -c 'printf "%s\n" "$1" > "$2"' sh "$cap" ${local.cap_file}
         echo "First-run cluster card cap set to $cap in ${local.cap_file}."
       fi
@@ -527,14 +559,20 @@ resource "null_resource" "sweep" {
       # The cap goes only where this stack wrote it. With first_run_cluster_cards
       # null nothing was written, and a file there is an operator's setting on
       # that install, which the gate honours on every first run; removing it
-      # would undo a choice this case never made. Left behind, the cap would
-      # bound the next sweep, the next case's and the install's real onboarding.
+      # would undo a choice this case never made. With it set, step 2 refused
+      # an install that had an operator's file, so the file here is this
+      # stack's. Left behind, the cap would bound the next sweep, the next
+      # case's and the install's real onboarding, so the sentinel goes only once
+      # the cap has: the next run's step 2 removes a cap still marked.
       if [ -n "${self.triggers.cards_cap}" ]; then
-        kubectl exec -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
-          rm -f ${self.triggers.cap_file} || failed="$failed, remove ${self.triggers.cap_file}"
+        { kubectl exec -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
+            rm -f ${self.triggers.cap_file} \
+          && kubectl exec -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
+            rm -f ${self.triggers.cap_mark}; } \
+          || failed="$failed, remove ${self.triggers.cap_file} and ${self.triggers.cap_mark}"
       fi
       if [ -n "$failed" ]; then
-        echo "Cleanup incomplete: could not$${failed#,}. The next run's step 2 archives the cards and removes the files left behind." >&2
+        echo "Cleanup incomplete: could not$${failed#,}. The next run's step 2, capped or not, archives the cards and removes the files left behind, a first-run cluster card cap this stack wrote included." >&2
         exit 1
       fi
     EOT
