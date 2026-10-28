@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/nats-io/jwt/v2"
+	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nkeys"
 )
 
@@ -480,9 +481,16 @@ func TestTheConsumerStemIsUnambiguous(t *testing.T) {
 	if ConsumerStem("a-b", "c") == ConsumerStem("a", "b-c") {
 		t.Error("two (pod, task) pairs share a stem")
 	}
+	// The longest inputs: a pod name and a task id are each a DNS-1123
+	// label, at most 63 bytes.
 	long := ConsumerStem(strings.Repeat("p", 63), strings.Repeat("t", 63))
-	if n := len(long + "-events"); n > 255 {
-		t.Errorf("the longest consumer name is %d bytes, past nats-server's 255", n)
+	if len(long) != 127 {
+		t.Errorf("the longest stem is %d bytes, want 127", len(long))
+	}
+	for _, role := range []string{"origin", "in", "events"} {
+		if n := len(long + "-" + role); n > natsserver.JSMaxNameLen {
+			t.Errorf("the longest %s consumer name is %d bytes, past nats-server's JSMaxNameLen (%d)", role, n, natsserver.JSMaxNameLen)
+		}
 	}
 }
 

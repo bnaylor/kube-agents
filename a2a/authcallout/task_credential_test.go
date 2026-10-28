@@ -692,3 +692,80 @@ func mustIssuerSeed(t *testing.T) string {
 	seed, _ := kp.Seed()
 	return string(seed)
 }
+
+// The longest stem a task connection can have: a 63-byte pod name and a
+// 63-byte task id, so a 127-byte stem and consumer names up to 134 bytes. The
+// server accepts all three consumers with their exact filters, and the
+// connection can INFO and pull from them under its grants.
+func TestTheLongestStemWorksOnARealServer(t *testing.T) {
+	kp, pub := taskSigningKey(t)
+	longPod := "auditor-read-" + strings.Repeat("p", 63-len("auditor-read-"))
+	longTask := "task-" + strings.Repeat("t", 63-len("task-"))
+	const longPodToken = "token-for-the-auditor-profile-sa-bound-to-the-longest-pod-name-padded"
+	tokens := profileTokens()
+	tokens[longPodToken] = Attested{ServiceAccount: auditorSA, PodName: longPod, PodUID: "uid-long"}
+	if len(longPod) != 63 || len(longTask) != 63 || !lib.ValidSubjectToken(longPod) || !lib.ValidSubjectToken(longTask) {
+		t.Fatalf("the inputs are not 63-byte DNS-1123 labels: %d %d", len(longPod), len(longTask))
+	}
+	stem := taskcred.ConsumerStem(longPod, longTask)
+	if len(stem) != 127 {
+		t.Fatalf("stem is %d bytes, want 127", len(stem))
+	}
+
+	h := startHarness(t, profileMap, tokens, withTaskSigningKeys(pub))
+	provisionTasksStream(t, h)
+	// One submission on the task's .in, so the pull below has something
+	// to deliver on the two .in consumers.
+	submitAs(t, h, auditor, longTask, "the longest stem", nil)
+	nc, violations, err := h.connectForTask(t, stem, longPodToken, taskToken(t, kp, func(c *taskcred.Claims) {
+		c.Task, c.Pod, c.PodUID = longTask, longPod, "uid-long"
+	}))
+	if err != nil {
+		t.Fatalf("the longest-stem task connection was refused: %v", err)
+	}
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for _, role := range lib.SessionConsumerRoles {
+		name := lib.SessionConsumerName(stem, role)
+		filter := lib.TaskInSubject(auditor, longTask)
+		if role == lib.SessionConsumerEvents {
+			filter = lib.TaskEventsSubject(auditor, longTask)
+		}
+		c, err := js.CreateOrUpdateConsumer(ctx, lib.TasksStream, jetstream.ConsumerConfig{
+			Name: name, FilterSubject: filter, AckPolicy: jetstream.AckNonePolicy, InactiveThreshold: time.Minute, MemoryStorage: true,
+		})
+		if err != nil {
+			t.Fatalf("CREATE %s (%d bytes) was refused: %v", name, len(name), err)
+		}
+		info, err := c.Info(ctx)
+		if err != nil {
+			t.Fatalf("INFO %s: %v", name, err)
+		}
+		if info.Config.FilterSubject != filter {
+			t.Errorf("%s filters %q, want %q", name, info.Config.FilterSubject, filter)
+		}
+		// MSG.NEXT: the .in consumers deliver the submission; the .events
+		// one has nothing to deliver and times out, which is not a refusal
+		// (a refusal arrives on violations, checked below).
+		batch, err := c.Fetch(1, jetstream.FetchMaxWait(2*time.Second))
+		if err != nil {
+			t.Fatalf("MSG.NEXT %s: %v", name, err)
+		}
+		got := 0
+		for range batch.Messages() {
+			got++
+		}
+		if want := map[bool]int{true: 0, false: 1}[role == lib.SessionConsumerEvents]; got != want {
+			t.Errorf("MSG.NEXT %s delivered %d messages, want %d (err %v)", name, got, want, batch.Error())
+		}
+	}
+	select {
+	case v := <-violations:
+		t.Errorf("the longest-stem connection hit a permissions error: %v", v)
+	default:
+	}
+}
