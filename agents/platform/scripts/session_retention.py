@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""session_retention.py - run Hermes' own session pruning daily for every profile on the volume.
+
+Hermes deletes ended sessions inactive for ``sessions.retention_days`` (their
+messages, transcript files and unreferenced system prompts) whenever a CLI or the
+gateway starts: ``SessionDB.maybe_auto_prune_and_vacuum``, called from ``cli.py``
+and ``gateway/run.py``, at most once a day per ``state.db``. Two stores never get
+that start:
+
+- the machine home's, which only the long-lived gateway opens, at construction;
+- a profile that has not run a process since its history aged out.
+
+So their history grew without bound (#3704): a Cluster Agent profile on a quiet
+dev install reached 16.5 MB, most of it ``state.db`` and its WAL.
+
+This is a ``no_agent`` entry on the Platform Agent's roster. Each daily tick it
+calls the same Hermes method on every profile's ``state.db`` with the same
+period, so it inherits Hermes' guarantees rather than restating them:
+
+- open, pinned and mid-turn sessions are never deleted;
+- dead automation sessions are closed first and get a full period before removal;
+- one maintenance lock and a 24-hour throttle per store, so a worker starting at
+  the same moment cannot double-run it;
+- VACUUM only after a prune that freed more than a quarter of the file.
+
+The period is the managed scope's ``sessions.retention_days``, which the operator
+renders from ``spec.harness.retention.sessionDays``. A blocked kanban card needs
+no exemption: its worker starts a fresh session on every run
+(``hermes_cli/kanban_db_dispatch.py``, ``chat -q "work kanban task <id>"``, with
+no resume) and reads its context from the card.
+
+It also removes rotated Hermes log backups (``<name>.log.<n>``) older than the
+period. The live log files keep Hermes' own size cap. ``audit.jsonl`` and its
+rotations are never touched: the audit ledger has its own retention.
+
+Prints nothing on a clean run. A store it could not maintain prints one line, so
+the failure reaches chat.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gitops_workspace  # noqa: E402
+
+PROFILES_DIR = "profiles"
+STATE_DB = "state.db"
+SESSIONS_DIR = "sessions"
+LOGS_DIR = "logs"
+# Only Hermes' rotated log backups (agent.log.1, errors.log.3, ...). Not
+# audit.jsonl.<n>, not the live <name>.log, not anything else under logs/.
+ROTATED_LOG_RE = re.compile(r"^[A-Za-z0-9_.-]+\.log\.[0-9]+$")
+SECONDS_PER_DAY = 86400
+WATCH_NAME = "Session retention"
+FAILED_PREFIX = f"⚠️ **{WATCH_NAME}:**"
+RETENTION_ENV = "SESSION_RETENTION_DAYS"  # tests and a hand run; the tick reads the managed scope
+
+
+def retention_days() -> int | None:
+    """The period from the environment override, else Hermes' merged config (managed scope)."""
+    raw = os.environ.get(RETENTION_ENV)
+    if raw is None:
+        from hermes_cli.config import load_config  # the managed scope is merged in here
+
+        raw = (load_config().get("sessions") or {}).get("retention_days")
+    try:
+        days = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return days if days >= 1 else None
+
+
+def homes(agent_home: Path) -> list[Path]:
+    """The machine home, then every profile directory, sorted."""
+    found = [agent_home]
+    profiles = agent_home / PROFILES_DIR
+    if profiles.is_dir():
+        found += sorted(p for p in profiles.iterdir() if p.is_dir() and not p.name.startswith("."))
+    return found
+
+
+def prune_store(home: Path, days: int) -> dict:
+    """Hermes' own maintenance on ``home``'s state.db; {} when the home has none."""
+    db_path = home / STATE_DB
+    if not db_path.is_file():
+        return {}
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=db_path)
+    try:
+        return db.maybe_auto_prune_and_vacuum(retention_days=days, sessions_dir=home / SESSIONS_DIR)
+    finally:
+        close = getattr(db, "close", None)
+        if callable(close):
+            close()
+
+
+def remove_old_rotated_logs(home: Path, days: int, now: float) -> int:
+    """Delete ``<name>.log.<n>`` under home/logs older than ``days``; return how many went."""
+    logs = home / LOGS_DIR
+    if not logs.is_dir():
+        return 0
+    cutoff = now - days * SECONDS_PER_DAY
+    removed = 0
+    for entry in logs.iterdir():
+        if not ROTATED_LOG_RE.match(entry.name) or not entry.is_file() or entry.is_symlink():
+            continue
+        if entry.stat().st_mtime < cutoff:
+            entry.unlink()
+            removed += 1
+    return removed
+
+
+def label(home: Path, agent_home: Path) -> str:
+    return "the machine home" if home == agent_home else f"profile `{home.name}`"
+
+
+def span_safe(text: object) -> str:
+    """One line, no backticks, bounded, so it stays inside its code span."""
+    return " ".join(str(text).split()).replace("`", "'")[:300]
+
+
+def tick(agent_home: Path, *, now: float | None = None) -> list[str]:
+    now = time.time() if now is None else now
+    days = retention_days()
+    if days is None:
+        return [f"{FAILED_PREFIX} no usable `sessions.retention_days` in the config; nothing was pruned."]
+    lines: list[str] = []
+    for home in homes(agent_home):
+        try:
+            result = prune_store(home, days)
+            if result.get("error"):
+                lines.append(f"{FAILED_PREFIX} pruning {label(home, agent_home)} failed: `{span_safe(result['error'])}`")
+            remove_old_rotated_logs(home, days, now)
+        except Exception as exc:  # noqa: BLE001 - one store's failure must not stop the rest
+            lines.append(f"{FAILED_PREFIX} pruning {label(home, agent_home)} failed: `{type(exc).__name__}`")
+    return lines
+
+
+def main() -> int:
+    lines = tick(Path(gitops_workspace.agent_home()))
+    if lines:
+        print("\n".join(lines))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
