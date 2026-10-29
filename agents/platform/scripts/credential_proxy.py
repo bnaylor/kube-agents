@@ -329,9 +329,10 @@ ENV_SESSION_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_C
 # How it sits beside the global cap (CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS,
 # 8 by default and shared by every caller; #4082 redesigns it):
 #   * Profile work cannot starve the shell. At serve() the share is clamped to
-#     the pool minus the session share minus one, so even with every profile
-#     and session slot taken the platform agent's shell keeps at least one
-#     slot; with the defaults (8, 2, 4) it keeps two. The child-memory budget
+#     the pool minus the session share minus one (but never below one), so
+#     given a pool larger than the session share plus one, even with every
+#     profile and session slot taken the platform agent's shell keeps at least
+#     one slot; with the defaults (8, 2, 4) it keeps two. The child-memory budget
 #     can admit fewer than the slot count, and then the guarantee is in slots,
 #     not in admissions: a budget-bound pool can still queue the shell behind
 #     running profile commands until one finishes.
@@ -341,8 +342,8 @@ ENV_SESSION_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_C
 #     hold at most their own share. That is the intended priority: the
 #     platform agent first.
 # Operator-unset: the broker default applies, and spec.deployment.env can set
-# it, as it can the session share; the clamp holds the shell's slot whatever
-# value arrives.
+# it, as it can the session share; on such a pool the clamp holds the shell's
+# slot whatever value arrives.
 DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS = 4
 ENV_PROFILE_SLOTS = "CREDENTIAL_PROXY_PROFILE_SLOTS"
 # How long a request waits for admission -- a slot under the slot cap and room
@@ -2129,8 +2130,10 @@ def profile_slot_limit_from_env(pool: int, session_limit: int) -> int:
 
     Read like the session's (a non-positive or non-integer value is the
     default, with a warning), then held to ``pool - session_limit - 1`` so the
-    shell always keeps a slot (DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS says
-    why). At least one, so a pool too small to share still serves profiles.
+    shell keeps a slot, given a pool larger than the session share plus one
+    (DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS says why). At least one, so a pool
+    too small to share still serves profiles, and then the shell's slot is not
+    guaranteed.
     """
     raw = os.getenv(ENV_PROFILE_SLOTS, "").strip()
     value = DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS
@@ -2546,8 +2549,9 @@ class ServiceAccountAuthenticator:
         )
 
 
-# The profile role's configuration (#3889). All four are rendered by the
-# operator and reserved against spec.deployment.env (mergeCredentialProxyEnv).
+# The profile role's configuration (#3889). All four are reserved against
+# spec.deployment.env (mergeCredentialProxyEnv). The operator renders the first
+# three; it doesn't render the max lifetime yet, so the 6h default holds.
 PROFILE_AUDIENCE_ENV = "CREDENTIAL_PROXY_PROFILE_AUDIENCE"
 # JSON: {"system:serviceaccount:<ns>:<sa>": {"profile": ..., "tier": ...}}.
 PROFILE_IDENTITIES_ENV = "CREDENTIAL_PROXY_PROFILE_IDENTITIES"

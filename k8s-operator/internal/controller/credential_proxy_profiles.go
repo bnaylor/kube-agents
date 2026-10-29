@@ -151,8 +151,10 @@ func credentialProxyProfileEnv(c credentialProxyProfileConfig) []corev1.EnvVar {
 		{Name: credentialProxyProfileAudienceEnvVar, Value: credentialProxyProfileAudience},
 		{Name: credentialProxyProfileIdentitiesEnvVar, Value: c.identitiesJSON()},
 	}
-	// Absent until the A2A stack has made the key; the broker then refuses
-	// every task credential and its profile callers run local-only commands.
+	// Defensive: credentialProxyProfileConfigFor ensures the key or errors,
+	// so an enabled config carries it. Were it empty, the broker would refuse
+	// every task credential and its profile callers would run local-only
+	// commands.
 	if c.TaskSigningPublic != "" {
 		env = append(env, corev1.EnvVar{Name: credentialProxyTaskSigningKeysEnvVar, Value: c.TaskSigningPublic})
 	}

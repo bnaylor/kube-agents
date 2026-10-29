@@ -184,7 +184,7 @@ above and the platform worked profile below are design sketches from before the 
 
 ## How a profile becomes a pod
 
-**Amended 10/22 (#3655, #3660):** profile pods and their ServiceAccounts run in their own namespace, `<agent-ns>-profiles`, not the CR's, so profile work never takes a session slot. The chart creates it, and the operator renders its pod quota (the warm workers, a surge pod per warm pool, and `spec.harness.tuning.profiles.ceiling` for Jobs) and a fence that lets its pods reach DNS, the bus and LiteLLM only. The rest of this section describes the Job-per-task path and changes with the dispatcher PRs, as #3660's "Changes to companion specs" lists.
+**Amended 10/22 (#3655, #3660):** profile pods and their ServiceAccounts run in their own namespace, `<agent-ns>-profiles`, not the CR's, so profile work never takes a session slot. The chart creates it, and the operator renders its pod quota (the warm workers, a surge pod per warm pool, and `spec.harness.tuning.profiles.ceiling` for Jobs) and a fence that lets its pods reach DNS, the bus, LiteLLM and the credential broker's credentialed port only. The rest of this section describes the Job-per-task path and changes with the dispatcher PRs, as #3660's "Changes to companion specs" lists.
 
 **Submission is a message, not an API call.** An orchestrator delegates by publishing a
 `kind: message` envelope to `a2a.tasks.{profile}.{taskId}.in` - the profile is the
@@ -349,8 +349,11 @@ What the operator renders per profile, as built (amended 10/6):
   The operator renders the audience, an identity map from each tier's ServiceAccount to its
   (profile, tier) (`CREDENTIAL_PROXY_PROFILE_IDENTITIES`, from the callout map's profile
   entries), those ServiceAccounts on the broker's callers, and the task-signing public key
-  (`A2A_TASK_SIGNING_PUBLIC_KEYS`). All four, and `A2A_TASK_CREDENTIAL_MAX_LIFETIME`, are
-  reserved against `spec.deployment.env`. The broker's fence admits the profile namespace and
+  (`A2A_TASK_SIGNING_PUBLIC_KEYS`). It newly reserves four names against `spec.deployment.env`:
+  `CREDENTIAL_PROXY_PROFILE_AUDIENCE`, `CREDENTIAL_PROXY_PROFILE_IDENTITIES`,
+  `A2A_TASK_SIGNING_PUBLIC_KEYS` and `A2A_TASK_CREDENTIAL_MAX_LIFETIME`;
+  `CREDENTIAL_PROXY_ALLOWED_CALLERS` was reserved already. The operator doesn't render the
+  max lifetime yet. The broker's fence admits the profile namespace and
   the profile namespace's fence lets it out to the broker's credentialed port.
   - The shim reads the dispatcher's `proxyToken` from `CREDENTIAL_PROXY_TASK_TOKEN_FILE` on
     every call and sends it in `X-Kube-Agents-Task-Credential`, never in the body. The
@@ -358,9 +361,11 @@ What the operator renders per profile, as built (amended 10/6):
     fixtures in `a2a/taskcred/testdata`) and binds it: its pod and pod UID must be the ones
     the TokenReview attests, and its profile and tier the ServiceAccount's map entry. It logs
     the credential's `jti`, never the token. A credential that fails refuses the request. No
-    credential leaves the caller local-only commands, run against no kubeconfig: `version`,
-    `--help`, `kubectl config view`. `gcloud config` and `gcloud auth` are refused whole,
-    since even their reads print the broker's own account and default project.
+    credential leaves the caller local-only commands, run against no kubeconfig:
+    `gcloud version`, `kubectl version --client`, `--help`, and the `kubectl config` reads
+    (`view`, `get-contexts`, `current-context`, `get-clusters`, `get-users`). `gcloud config`
+    and `gcloud auth` are refused whole, since even their reads print the broker's own
+    account and default project.
   - With a credential, every call is held to its target (`task_confinement.py`). Every
     `kubectl --context`, `--kubeconfig` and `kubeconfigContext` must name the target, and a
     call naming none gets the target, not the host cluster; `--cluster`, `--server`, `--user`
@@ -376,8 +381,9 @@ What the operator renders per profile, as built (amended 10/6):
     `gcr.io/<project>` image path), and a read the policy admits but the table doesn't name is
     refused, so a later addition to the read list fails closed. The shim honours no
     `KUBECONFIG` or `CLOUDSDK_*` override for a task, and says so. Profile calls hold at most
-    `CREDENTIAL_PROXY_PROFILE_SLOTS` (default 4) of the broker's command slots, clamped so the
-    platform agent's shell always keeps one.
+    `CREDENTIAL_PROXY_PROFILE_SLOTS` (default 4) of the broker's command slots, clamped to the pool
+    less the session share and one (never below one), so the platform agent's shell keeps a
+    slot given a pool larger than the session share plus one.
   - Nothing may change what a later bare command targets. `gcloud config set`, `unset` and
     `configurations`, and every `kubectl config` write (`use-context`, `set-context`,
     `set-cluster`, `set-credentials` and the rest) are refused with or without a credential.

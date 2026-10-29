@@ -31,9 +31,10 @@ to it before the broker runs anything:
     Registry or Container Registry image path. A read-list entry missing
     here is refused for a profile caller, so a command added to the read list
     later fails closed until someone says how it names a project.
-  * **Local-only commands** (ruling (d), as narrowed): ``version``,
-    ``--help``, ``kubectl version --client``, ``kubectl config view``. They
-    run with or without a target. ``gcloud config`` and ``gcloud auth`` are
+  * **Local-only commands** (ruling (d), as narrowed): ``gcloud version``,
+    ``--help``, ``kubectl version --client``, and the ``kubectl config``
+    reads (``view``, ``get-contexts``, ``current-context``, ``get-clusters``,
+    ``get-users``). They run with or without a target. ``gcloud config`` and ``gcloud auth`` are
     refused whole, with or without one: ``config list``, ``config get-value``
     and ``auth list`` print the broker's own account and default project, and
     ``config set``/``unset``/``configurations`` and every ``kubectl config``
@@ -46,7 +47,7 @@ to it before the broker runs anything:
     stored default changed by some path this module missed (a gcloud property,
     a kubeconfig's ``current-context``) still can't redirect a call: an
     explicit flag beats both.
-  * **No target** (no valid ``proxyToken``): local-only commands and nothing
+  * **No target** (no ``proxyToken``): local-only commands and nothing
     else, run against no kubeconfig at all.
 
 This is a confinement layer over IAM, not a sandbox. What it cannot parse it
@@ -87,8 +88,7 @@ from credential_proxy_client import (
     parse_gke_context,
 )
 
-# The refusal rule id the broker reports for every confinement refusal, and
-# the one for a profile call with no usable task credential.
+# The refusal rule id the broker reports for every confinement refusal.
 RULE_TASK_TARGET = "caller.task-target"
 
 # kubectl flags that redirect the credential (to another server or cluster
@@ -406,7 +406,8 @@ def _confine_kubectl(argv: list[str], kubeconfig_context: str | None, target: Cl
     if words[:1] == ["config"] and len(words) > 1 and words[1] not in KUBECTL_CONFIG_READ_VERBS:
         raise ConfinementRefusal(
             f"kubectl config {words[1][:32]} changes the kubeconfig a later command reads, so it is refused "
-            "for a profile task; kubectl config view, get-contexts and current-context still run"
+            "for a profile task; kubectl config view, get-contexts, current-context, get-clusters and "
+            "get-users still run"
         )
     contexts = [value for name, value in flags if name == CONTEXT_FLAG]
     kubeconfigs = [value for name, value in flags if name == KUBECONFIG_FLAG]
@@ -414,7 +415,8 @@ def _confine_kubectl(argv: list[str], kubeconfig_context: str | None, target: Cl
         if not _kubectl_is_local(flags, words):
             raise ConfinementRefusal(
                 "this profile task has no target cluster (no valid task credential), so only local-only "
-                "commands run: kubectl version --client, kubectl help, --help"
+                "commands run: kubectl version --client, kubectl help, --help, and kubectl config view, "
+                "get-contexts, current-context, get-clusters and get-users"
             )
         if contexts or kubeconfigs or kubeconfig_context:
             raise ConfinementRefusal("this profile task has no target cluster, so a command may not name one")

@@ -39,7 +39,8 @@ from typing import Any, Iterable, Mapping
 # The Ed25519 primitive. The broker's interpreter is the Hermes venv, which
 # carries `cryptography`; requirements-test.txt names it for the test sweep.
 # Imported at module scope on purpose: credential_proxy imports this module
-# only when the profile role is configured (build_profile_gate), so a broker
+# only when the profile role is configured (build_authenticator,
+# build_profile_gate and ProfileTaskGate), so a broker
 # without that role never needs the package, and one with it fails at start
 # rather than refusing every task credential with an ImportError.
 from cryptography.exceptions import InvalidSignature
