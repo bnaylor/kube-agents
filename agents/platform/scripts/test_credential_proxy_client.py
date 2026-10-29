@@ -19,7 +19,7 @@ import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
@@ -1323,6 +1323,37 @@ class TestTaskCredential(SubmittedPayloadTestCase):
         self.assertEqual(
             ["gcloud", "container", "clusters", "get-credentials", "c", "--location=l"], sent["payload"]["argv"]
         )
+
+    def test_get_credentials_in_a_task_lands_no_file_and_pins_nothing(self):
+        # The broker hands the generated kubeconfig back; in a task nothing
+        # reads it (every call is held to the task's cluster), so it is not
+        # filed, no shell context is recorded, and the shim says so in one
+        # line instead of telling the model to export a KUBECONFIG it ignores.
+        generated = write_kubeconfig(self.directory).read_text(encoding="utf-8")
+        stderr = io.StringIO()
+
+        def fake_open(request, *args, **kwargs):
+            return RecordingResponse(json.dumps({"exitCode": 0, "kubeconfig": generated}).encode("utf-8"))
+
+        pin = Mock(return_value=True)
+        write = Mock()
+        with patch.dict("os.environ", self.task_env(), clear=False):
+            with patch.object(credential_proxy_client, "open_broker_request", fake_open), \
+                    patch.object(credential_proxy_client, "record_shell_context", pin), \
+                    patch.object(credential_proxy_client, "_replace_file", write):
+                with patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=stderr):
+                    exit_code = credential_proxy_client.execute(
+                        self.LOCAL_ENDPOINT, ["gcloud", "container", "clusters", "get-credentials", "c", "--location=l"]
+                    )
+        self.assertEqual(0, exit_code)
+        pin.assert_not_called()
+        write.assert_not_called()
+        said = stderr.getvalue()
+        self.assertNotIn("export KUBECONFIG", said)
+        self.assertNotIn("host cluster", said)
+        self.assertIn(GKE_CONTEXT, said)
+        self.assertIn("nothing to export", said)
+        self.assertEqual(1, len(said.strip().splitlines()), said)
 
     def test_cloudsdk_settings_do_not_redirect_a_task(self):
         redirecting = {

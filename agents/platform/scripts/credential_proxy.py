@@ -6913,13 +6913,15 @@ class CommandExecutor:
         kubeconfig_context: str | None = None,
         wants_kubeconfig: bool = False,
         caller: socket.socket | None = None,
-        isolated: bool = False,
+        confined: task_confinement.Confined | None = None,
     ) -> ExecutionResult:
         """Run an agent-selected command.
 
-        `isolated` runs the command against no kubeconfig at all: a profile
-        caller with no task (task_confinement), whose local-only commands
-        must not resolve, select or mint for any cluster, the host's included.
+        `confined` is a profile caller's call as task_confinement parsed it
+        (`_execute_confined`): when it is given, what the command reaches is
+        read from it, never from a second parse of `argv`, which must be the
+        canonical argv it carries. Every other caller passes none and takes
+        the path below unchanged.
 
         `caller` is the connection the command is being run for. While the
         command runs the connection is watched, and its closing ends the
@@ -6943,20 +6945,9 @@ class CommandExecutor:
             raise RuntimeError(f"supported executable is unavailable: {executable}")
         command = [executable_path, *argv[1:]]
 
-        if isolated:
-            # No get-credentials (it authors a kubeconfig for a cluster), no
-            # --kubeconfig reroute (confinement refused any), and no ambient
-            # fallback: KUBECONFIG names an empty file, so kubectl has no
-            # cluster to reach and the pool is never asked for a token.
-            if _is_get_credentials(argv):
-                raise ValueError("get-credentials names a cluster, and an isolated command reaches none")
-            return self._execute(
-                command,
-                stdin=stdin,
-                cwd=cwd,
-                kubeconfig_path=Path(os.devnull),
-                timeout_seconds=self.kubectl_timeout_seconds if executable == "kubectl" else None,
-                caller=caller,
+        if confined is not None:
+            return self._execute_confined(
+                confined, argv, command, stdin=stdin, cwd=cwd, wants_kubeconfig=wants_kubeconfig, caller=caller,
             )
 
         # `get-credentials` is the one command that legitimately authors a
@@ -7061,6 +7052,69 @@ class CommandExecutor:
         ):
             return self._with_host_hint(argv, result)
         return result
+
+    def _execute_confined(
+        self,
+        confined: task_confinement.Confined,
+        argv: list[str],
+        command: list[str],
+        *,
+        stdin: str | None,
+        cwd: str | None,
+        wants_kubeconfig: bool,
+        caller: socket.socket | None,
+    ) -> ExecutionResult:
+        """Run a profile caller's confined call from its parse, not its argv.
+
+        The isolation decision, the get-credentials decision and the
+        kubeconfig are the structure's: no `_reroute_kubeconfig_flags`, no
+        `_is_get_credentials` scan, no ambient fallback. The argv must be the
+        canonical one the structure carries; anything else is refused, so a
+        later edit between the confinement and here can't run a command the
+        confinement never saw.
+        """
+        if list(argv) != confined.argv or argv[0] != confined.executable:
+            raise ValueError("the command is not the one the task confinement produced")
+        if confined.isolated:
+            # A local-only command, or no task: no get-credentials (it
+            # authors a kubeconfig for, and describes, the cluster it names),
+            # and no kubeconfig -- KUBECONFIG names an empty file, so kubectl
+            # has no cluster to reach and the pool is never asked for a token.
+            if confined.get_credentials:
+                raise ValueError("get-credentials names a cluster, and an isolated command reaches none")
+            return self._execute(
+                command,
+                stdin=stdin,
+                cwd=cwd,
+                kubeconfig_path=Path(os.devnull),
+                timeout_seconds=self.kubectl_timeout_seconds if confined.executable == "kubectl" else None,
+                caller=caller,
+            )
+        if confined.get_credentials:
+            # The confinement held the cluster, location and project to the
+            # target; the scratch-file path re-reads them from the canonical
+            # argv, so the two must agree.
+            if _get_credentials_target(argv) != confined.target:
+                raise ValueError("get-credentials does not name the task's cluster")
+            return self._execute_get_credentials(command, stdin, cwd, wants_kubeconfig, caller=caller)
+        if confined.executable == "kubectl":
+            if not confined.kubeconfig_context:
+                raise ValueError("a confined kubectl call names no cluster")
+            kubectl_deadline: int | None = None
+            if not _kubectl_runs_long(command):
+                kubectl_deadline = self.kubectl_timeout_seconds
+                command = [command[0], f"--request-timeout={DEFAULT_KUBECTL_REQUEST_TIMEOUT}", *command[1:]]
+            return self._execute(
+                command,
+                stdin=stdin,
+                cwd=cwd,
+                kubeconfig_path=self._resolve_kubeconfig(confined.kubeconfig_context, scoped=True),
+                timeout_seconds=kubectl_deadline,
+                caller=caller,
+            )
+        # gcloud names its project in argv (injected); it reads no kubeconfig
+        # but get-credentials, which is handled above.
+        return self._execute(command, stdin=stdin, cwd=cwd, kubeconfig_path=None, caller=caller)
 
     def _with_host_hint(self, argv: list[str], result: ExecutionResult) -> ExecutionResult:
         """`result`, plus a line naming the host when a context-less read found nothing.
@@ -10057,7 +10111,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # A profile caller's argv is held to its task's target before any
         # policy reads it, so every check below judges the command that will
         # run: the injected --project, the target's context.
-        isolated = False
+        confined: task_confinement.Confined | None = None
         if principal.role == CALLER_ROLE_PROFILE:
             try:
                 confined = task_confinement.confine(argv, kubeconfig_context, principal.task_target)
@@ -10080,7 +10134,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
-            argv, kubeconfig_context, isolated = confined.argv, confined.kubeconfig_context, confined.isolated
+            argv, kubeconfig_context = confined.argv, confined.kubeconfig_context
         rule = self.policy.blocked_by(argv)
         if rule is not None:
             LOGGER.warning(
@@ -10215,10 +10269,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     # The connection this command answers. Its closing
                     # mid-command kills the command; see CommandExecutor.execute.
                     caller=self.connection,
-                    # Only a profile caller with no task runs isolated, and
-                    # only then is the keyword passed, so every other call
-                    # reaches the executor exactly as before.
-                    **({"isolated": True} if isolated else {}),
+                    # Only a profile caller's call carries its confinement,
+                    # which the executor runs from; only then is the keyword
+                    # passed, so every other call reaches the executor
+                    # exactly as before.
+                    **({"confined": confined} if confined is not None else {}),
                 )
                 if result.abandoned:
                     # The connection is gone, so there is no response to write;

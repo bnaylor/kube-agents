@@ -31,22 +31,36 @@ to it before the broker runs anything:
     Registry or Container Registry image path. A read-list entry missing
     here is refused for a profile caller, so a command added to the read list
     later fails closed until someone says how it names a project.
-  * **Local-only commands** (ruling (d), as narrowed): ``gcloud version``,
-    ``--help``, ``kubectl version --client``, and the ``kubectl config``
-    reads (``view``, ``get-contexts``, ``current-context``, ``get-clusters``,
-    ``get-users``). They run with or without a target. ``gcloud config`` and ``gcloud auth`` are
-    refused whole, with or without one: ``config list``, ``config get-value``
-    and ``auth list`` print the broker's own account and default project, and
-    ``config set``/``unset``/``configurations`` and every ``kubectl config``
-    write (``use-context``, ``set-context``, ...) change what a later bare
-    command targets.
+  * **Local-only commands** (ruling (d), as narrowed to what command_policy
+    admits): ``gcloud version``, ``--help`` on a command, ``kubectl version
+    --client``, and the ``kubectl config`` reads ``get-contexts`` and
+    ``current-context`` (``config view`` is refused: ``--flatten`` prints
+    credentials). They run isolated, against no kubeconfig and with no
+    get-credentials handling, with or without a target. ``gcloud config``
+    and ``gcloud auth`` are refused whole, with or without one: ``config
+    list``, ``config get-value`` and ``auth list`` print the broker's own
+    account and default project, and ``config set``/``unset``/
+    ``configurations`` and every ``kubectl config`` write (``use-context``,
+    ``set-context``, ...) change what a later bare command targets.
+  * **One parse, one canonical argv.** Each argv is read once, with the
+    CLI's flag arity, into the Confined structure the broker's executor
+    runs from: command words, flags with their values, the target. A flag
+    whose detached value starts with ``-``, or whose value starts with
+    ``--``, is refused rather than guessed at, as is an unknown flag. The
+    argv the broker runs is rebuilt from that parse: the command words
+    first, then every flag as one ``--name=value`` token, then positionals.
+    So a check downstream that matches contiguous words (get-credentials)
+    or scans for a flag sees what this module saw, and the executor does
+    not parse again.
   * **Injection is unconditional.** Every credentialed kubectl call carries
     ``--context=<target>`` and runs on the target's kubeconfig; every
     credentialed gcloud call carries ``--project=<target>``, and a GKE call
     ``--location`` (and a node-pool call ``--cluster``) for the target. So a
     stored default changed by some path this module missed (a gcloud property,
     a kubeconfig's ``current-context``) still can't redirect a call: an
-    explicit flag beats both.
+    explicit flag beats both. The caller's own ``--context`` and
+    ``--kubeconfig`` (each checked to name the target) are dropped from the
+    argv; the one ``--context`` the broker runs is the injected one.
   * **No target** (no ``proxyToken``): local-only commands and nothing
     else, run against no kubeconfig at all.
 
@@ -102,15 +116,19 @@ KUBECTL_REDIRECT_FLAGS = frozenset({
     "--as", "--as-group", "--as-uid", "--as-user-extra",
 })
 
-# kubectl reads that touch no cluster: the help surface and the client's own
-# version. `kubectl version` without --client asks the API server.
-KUBECTL_LOCAL_VERBS = frozenset({"help", "options"})
+# kubectl reads that touch no cluster: --help on a command and the client's
+# own version (`kubectl version` without --client asks the API server). No
+# local verbs: `kubectl help` and `kubectl options` are outside
+# command_policy's read list, so the broker would refuse them anyway.
 KUBECTL_HELP_FLAGS = frozenset({"--help", "-h"})
-# The `kubectl config` verbs that only read the kubeconfig. Every other one
-# (use-context, set-context, set-cluster, set-credentials, set, unset,
-# delete-*, rename-context, and whatever a later kubectl adds) writes it, and
-# so changes what a later command naming no context reaches: refused.
-KUBECTL_CONFIG_READ_VERBS = frozenset({"view", "get-contexts", "current-context", "get-clusters", "get-users"})
+# The `kubectl config` verbs that only read the kubeconfig and that
+# command_policy.KUBECTL_READ_VERBS admits. `config view` is not one
+# (`--flatten` prints the credentials), nor are get-clusters and get-users.
+# Every other verb (use-context, set-context, set-cluster, set-credentials,
+# set, unset, delete-*, rename-context, and whatever a later kubectl adds)
+# writes the kubeconfig, and so changes what a later command naming no
+# context reaches: refused.
+KUBECTL_CONFIG_READ_VERBS = frozenset({"get-contexts", "current-context"})
 
 # gcloud flags that choose the identity a call runs as. command_policy refuses
 # them too (_IMPERSONATION_FLAGS, _GCLOUD_IDENTITY_FLAGS); here a profile
@@ -163,8 +181,10 @@ GCLOUD_PROJECTLESS_COMMANDS = frozenset({
     ("projects", "search"),
 })
 
-# gcloud commands that touch nothing remote (ruling (d)).
-GCLOUD_LOCAL_WORDS = frozenset({"help", "topic", "version"})
+# gcloud commands that touch nothing remote (ruling (d)), as far as
+# command_policy admits them: `gcloud help` and `gcloud topic` are outside its
+# read list.
+GCLOUD_LOCAL_WORDS = frozenset({"version"})
 # `gcloud config` and `gcloud auth` are refused whole for a profile caller:
 # the reads print the broker's own account and default project, and the
 # writes change what a later bare command targets.
@@ -178,7 +198,13 @@ GCLOUD_CONFIG_READ_VERBS = frozenset({"get", "get-value", "list"})
 # --cluster; injected for the target when absent (see _confine_gcloud).
 GCLOUD_CONTAINER_LOCATED_GROUPS = frozenset({"clusters", "node-pools", "operations"})
 GCLOUD_CONTAINER_CLUSTER_GROUPS = frozenset({"node-pools"})
-GCLOUD_LOCAL_FLAGS = frozenset({"--help", "-h", "--version"})
+# --help short-circuits to a synopsis before the command acts (measured;
+# command_policy relies on the same). --version is not here: command_policy
+# refuses a bare `gcloud --version`, and beside a command nothing measured
+# says gcloud stops before acting, so there it is confined like any flag.
+GCLOUD_LOCAL_FLAGS = frozenset({"--help", "-h"})
+# Single-dash gcloud flags, spelt long in the canonical argv.
+GCLOUD_LONG_NAMES = {"-h": "--help", "-z": "--zone", "-q": "--quiet"}
 # The values a boolean flag written `--flag=value` counts as set by. Anything
 # else (`--help=false`) is not the flag, so it doesn't make a command local.
 TRUE_VALUES = (None, "true")
@@ -278,16 +304,27 @@ class ConfinementRefusal(Exception):
 
 @dataclass(frozen=True)
 class Confined:
-    """What the broker runs for a confined call.
+    """What the broker runs for a confined call: the one parse of its argv.
 
-    ``argv`` may carry an injected ``--project``; ``kubeconfig_context`` is the
-    context kubectl runs against (the target's when the call named none), and
-    None for gcloud. ``isolated`` means no target: run against no kubeconfig.
+    ``argv`` is canonical (the command words, then each flag as one
+    ``--name=value`` token, then positionals) and carries the injected
+    ``--context`` or ``--project``. ``kubeconfig_context`` is the context
+    kubectl runs against, always the target's for a credentialed kubectl
+    call, and None for gcloud and for an isolated call. ``isolated`` means a
+    local-only command, or no target: run against no kubeconfig, with no
+    get-credentials handling. ``get_credentials`` says the command is
+    ``container clusters get-credentials``. The executor reads these fields
+    for a profile call rather than parsing ``argv`` again.
     """
 
     argv: list[str]
     kubeconfig_context: str | None
     isolated: bool
+    executable: str
+    words: tuple[str, ...]
+    flags: tuple[tuple[str, str | None], ...]
+    target: ClusterTarget | None
+    get_credentials: bool
 
 
 def target_from_claims(project: str, location: str, cluster: str) -> ClusterTarget | None:
@@ -320,31 +357,65 @@ def _kubectl_tables():
     )
 
 
-def _kubectl_walk(argv: list[str]) -> tuple[list[tuple[str, str | None]], list[str]]:
-    """kubectl's flags (name, value) and bare words, up to `--`.
+def _detached_value(argv: list[str], index: int, name: str) -> str:
+    """The value a flag takes from the next element, or a refusal.
+
+    A missing value, or one that starts with `-`, is ambiguous: the CLI may
+    read it as the value and a second reader as a flag (`-n --kubeconfig=x`),
+    or the other way round. Refused, so nothing downstream has to agree with
+    a guess; `--name=value` says it unambiguously.
+    """
+    if index >= len(argv):
+        raise ConfinementRefusal(f"{name} needs a value")
+    value = argv[index]
+    if value.startswith("-"):
+        raise ConfinementRefusal(
+            f"the value after {name} starts with '-', so it can't be told from a flag; "
+            f"write {name}=<value> for a profile task"
+        )
+    return value
+
+
+def _attached_value(name: str, value: str) -> str:
+    """An `=value` (or attached shorthand) value, refused if it reads as a long flag."""
+    if value.startswith("--"):
+        raise ConfinementRefusal(f"the value of {name} looks like a flag, which a profile task may not pass")
+    return value
+
+
+def _flag_token(name: str, value: str | None) -> str:
+    return name if value is None else f"{name}={value}"
+
+
+def _kubectl_walk(argv: list[str]) -> tuple[list[tuple[str, str | None]], list[str], list[str] | None]:
+    """kubectl's flags (name, value), bare words, and what follows `--`.
 
     pflag's grammar: a value flag takes `=value` or the next token; a
     single-dash token is a cluster of shorthands, each boolean consuming
     nothing and the first value-taking one swallowing the rest of the token or
-    the next element. A redirect flag is reported by name wherever it sits.
-    An unknown flag is reported with no value: its arity is unknown, and the
-    caller refuses it.
+    the next element. Shorthands are reported by their long name. A redirect
+    flag is reported by name wherever it sits. An unknown flag is reported
+    with no value: its arity is unknown, and the caller refuses it. A value
+    that could be a flag is refused here (_detached_value, _attached_value).
+    The third element is the words after `--` (None when there is none).
     """
     value_flags, _, shorthands = _kubectl_tables()
     flags: list[tuple[str, str | None]] = []
     words: list[str] = []
+    rest: list[str] | None = None
     index = 1
     while index < len(argv):
         token = argv[index]
         index += 1
         if token == END_OF_FLAGS:
+            rest = list(argv[index:])
             break
         if token.startswith("--"):
             name, separator, value = token.partition("=")
             if separator:
-                flags.append((name, value))
+                flags.append((name, _attached_value(name, value)))
             elif name in value_flags:
-                flags.append((name, argv[index] if index < len(argv) else ""))
+                flags.append((name, _detached_value(argv, index, name)))
                 index += 1
             else:
                 flags.append((name, None))
@@ -366,30 +437,28 @@ def _kubectl_walk(argv: list[str]) -> tuple[list[tuple[str, str | None]], list[s
                 if attached.startswith("="):
                     attached = attached[1:]
                 if attached:
-                    flags.append((long_name, attached))
+                    flags.append((long_name, _attached_value(long_name, attached)))
                 else:
-                    flags.append((long_name, argv[index] if index < len(argv) else ""))
+                    flags.append((long_name, _detached_value(argv, index, long_name)))
                     index += 1
                 break
             continue
         words.append(token)
-    return flags, words
+    return flags, words, rest
 
 
 def _kubectl_is_local(flags: list[tuple[str, str | None]], words: list[str]) -> bool:
-    if any(name in KUBECTL_HELP_FLAGS and value in TRUE_VALUES for name, value in flags):
-        return True
-    if words and words[0] in KUBECTL_LOCAL_VERBS:
+    if words and any(name in KUBECTL_HELP_FLAGS and value in TRUE_VALUES for name, value in flags):
         return True
     if words[:1] == ["config"]:
-        return len(words) == 1 or words[1] in KUBECTL_CONFIG_READ_VERBS
+        return len(words) > 1 and words[1] in KUBECTL_CONFIG_READ_VERBS
     if words[:1] == ["version"]:
         return any(name == "--client" and value in (None, "true") for name, value in flags)
     return False
 
 
 def _confine_kubectl(argv: list[str], kubeconfig_context: str | None, target: ClusterTarget | None) -> Confined:
-    flags, words = _kubectl_walk(argv)
+    flags, words, rest = _kubectl_walk(argv)
     value_flags, boolean_flags, _ = _kubectl_tables()
     for name, _ in flags:
         if name in KUBECTL_REDIRECT_FLAGS:
@@ -405,22 +474,36 @@ def _confine_kubectl(argv: list[str], kubeconfig_context: str | None, target: Cl
     # the help check: a write is refused however it is spelled.
     if words[:1] == ["config"] and len(words) > 1 and words[1] not in KUBECTL_CONFIG_READ_VERBS:
         raise ConfinementRefusal(
-            f"kubectl config {words[1][:32]} changes the kubeconfig a later command reads, so it is refused "
-            "for a profile task; kubectl config view, get-contexts, current-context, get-clusters and "
-            "get-users still run"
+            f"kubectl config {words[1][:32]} changes the kubeconfig a later command reads, or prints its "
+            "credentials, so it is refused for a profile task; kubectl config get-contexts and "
+            "current-context still run"
         )
     contexts = [value for name, value in flags if name == CONTEXT_FLAG]
     kubeconfigs = [value for name, value in flags if name == KUBECONFIG_FLAG]
+    local = _kubectl_is_local(flags, words)
+    # The canonical argv: the words, then the caller's flags as single
+    # tokens, then whatever followed `--`. The caller's --context and
+    # --kubeconfig are checked below and dropped; the target's --context is
+    # the one the broker runs.
+    kept = [_flag_token(name, value) for name, value in flags if name not in (CONTEXT_FLAG, KUBECONFIG_FLAG)]
+    tail = [END_OF_FLAGS, *rest] if rest is not None else []
+
+    def isolated() -> Confined:
+        return Confined(
+            argv=[argv[0], *words, *kept, *tail], kubeconfig_context=None, isolated=True, executable="kubectl",
+            words=tuple(words), flags=tuple(flags), target=target, get_credentials=False,
+        )
+
     if target is None:
-        if not _kubectl_is_local(flags, words):
+        if not local:
             raise ConfinementRefusal(
                 "this profile task has no target cluster (no valid task credential), so only local-only "
-                "commands run: kubectl version --client, kubectl help, --help, and kubectl config view, "
-                "get-contexts, current-context, get-clusters and get-users"
+                "commands run: kubectl version --client, --help on a command, and kubectl config "
+                "get-contexts and current-context"
             )
         if contexts or kubeconfigs or kubeconfig_context:
             raise ConfinementRefusal("this profile task has no target cluster, so a command may not name one")
-        return Confined(argv=list(argv), kubeconfig_context=None, isolated=True)
+        return isolated()
     for value in contexts:
         if value != target.context_name:
             raise ConfinementRefusal(
@@ -435,20 +518,22 @@ def _confine_kubectl(argv: list[str], kubeconfig_context: str | None, target: Cl
         raise ConfinementRefusal(
             f"the kubeconfig's context must be this task's cluster, {target.context_name}"
         )
-    # Naming nothing gets the target: without this the broker resolves the
-    # host cluster the operator named for its own kubeconfig.
-    context = kubeconfig_context
-    if context is None and not kubeconfigs:
-        context = target.context_name
-    # And the context is named in argv as well, every time: the kubeconfig
-    # the broker hands kubectl is the target's, and --context makes kubectl
-    # select the target's entry in it whatever its current-context says, so
-    # a default changed by a write this module failed to refuse can't move
-    # the call.
-    confined = list(argv)
-    if not contexts:
-        confined = [argv[0], f"{CONTEXT_FLAG}={target.context_name}", *argv[1:]]
-    return Confined(argv=confined, kubeconfig_context=context, isolated=False)
+    # A local-only command runs isolated with a target too: it needs no
+    # cluster, so it is given none.
+    if local:
+        return isolated()
+    # The target's context, every time, whatever the call named (each name
+    # was checked equal to it above): without this the broker resolves the
+    # host cluster the operator named for its own kubeconfig. And it is
+    # named in argv as well: the kubeconfig the broker hands kubectl is the
+    # target's, and --context makes kubectl select the target's entry in it
+    # whatever its current-context says, so a default changed by a write
+    # this module failed to refuse can't move the call.
+    confined = [argv[0], *words, f"{CONTEXT_FLAG}={target.context_name}", *kept, *tail]
+    return Confined(
+        argv=confined, kubeconfig_context=target.context_name, isolated=False, executable="kubectl",
+        words=tuple(words), flags=tuple(flags), target=target, get_credentials=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -459,10 +544,12 @@ def _confine_kubectl(argv: list[str], kubeconfig_context: str | None, target: Cl
 def _gcloud_walk(argv: list[str]) -> tuple[list[tuple[str, str | None]], list[str]]:
     """gcloud's flags (name, value) and positionals, with command_policy's arity.
 
-    The same walk command_policy._gcloud_words_and_flag makes, so a value that
-    looks like a flag (`--format --help`) is a value here too. An unknown flag
-    is refused rather than stepped over: its arity is unknown, so nothing after
-    it can be placed. Everything after `--` is positional.
+    The same arity command_policy._gcloud_words_and_flag uses, except that a
+    detached value that looks like a flag (`--format --help`) is refused
+    rather than read as the value (_detached_value), as is an `=value` that
+    starts with `--`. An unknown flag is refused rather than stepped over:
+    its arity is unknown, so nothing after it can be placed. Everything after
+    `--` is positional.
     """
     flags: list[tuple[str, str | None]] = []
     words: list[str] = []
@@ -477,18 +564,22 @@ def _gcloud_walk(argv: list[str]) -> tuple[list[tuple[str, str | None]], list[st
             name, separator, value = token.partition("=")
             if name in GCLOUD_IDENTITY_FLAGS or name in GCLOUD_ORG_SCOPE_FLAGS:
                 # Each takes a value, so `--billing-account help billing ...`
-                # is the flag and its value, and `help` is not a word.
+                # is the flag and its value, and `help` is not a word. (The
+                # value isn't checked for a leading `-`: the flag is refused
+                # whatever it holds, and its own message says why.)
                 if not separator:
                     value = argv[index] if index < len(argv) else ""
                     index += 1
                 flags.append((name, value))
                 continue
             if name in command_policy._GCLOUD_BOOLEAN_FLAGS:
-                flags.append((name, value if separator else None))
+                flags.append((name, _attached_value(name, value) if separator else None))
                 continue
             if name in command_policy._GCLOUD_FLAGS_WITH_VALUE:
-                if not separator:
-                    value = argv[index] if index < len(argv) else ""
+                if separator:
+                    value = _attached_value(name, value)
+                else:
+                    value = _detached_value(argv, index, name)
                     index += 1
                 flags.append((name, value))
                 continue
@@ -510,7 +601,15 @@ def _gcloud_is_local(flags: list[tuple[str, str | None]], words: list[str]) -> b
     if any(name in GCLOUD_LOCAL_FLAGS and value in TRUE_VALUES for name, value in flags):
         return True
     surface = _gcloud_surface_words(words)
-    return not surface or surface[0] in GCLOUD_LOCAL_WORDS
+    return bool(surface) and surface[0] in GCLOUD_LOCAL_WORDS
+
+
+def _is_get_credentials_command(words: list[str]) -> bool:
+    return _gcloud_surface_words(words)[:3] == ["container", "clusters", "get-credentials"]
+
+
+def _gcloud_flag_token(name: str, value: str | None) -> str:
+    return _flag_token(GCLOUD_LONG_NAMES.get(name, name), value)
 
 
 def _gcloud_confined_command(words: list[str]) -> tuple[tuple[str, ...], str] | None:
@@ -565,21 +664,33 @@ def _confine_gcloud(argv: list[str], kubeconfig_context: str | None, target: Clu
             "profile task; the task's project is the one its calls carry"
         )
     local = _gcloud_is_local(flags, words)
+    get_credentials = _is_get_credentials_command(words)
     if target is None:
         if not local:
             raise ConfinementRefusal(
                 "this profile task has no target project (no valid task credential), so only local-only "
-                "commands run: gcloud version, --help"
+                "commands run: gcloud version, --help on a command"
             )
         if kubeconfig_context:
             raise ConfinementRefusal("this profile task has no target cluster, so a command may not name one")
-        return Confined(argv=list(argv), kubeconfig_context=None, isolated=True)
-    if kubeconfig_context is not None and parse_gke_context(kubeconfig_context.strip()) != target:
+    elif kubeconfig_context is not None and parse_gke_context(kubeconfig_context.strip()) != target:
         raise ConfinementRefusal(
             f"the kubeconfig's context must be this task's cluster, {target.context_name}"
         )
     if local:
-        return Confined(argv=list(argv), kubeconfig_context=None, isolated=False)
+        # Isolated, with a target too: a local-only command reaches nothing,
+        # so it is given no credential path at all -- no kubeconfig, and no
+        # get-credentials handling, which would describe whatever cluster
+        # the argv names (the executor refuses an isolated get-credentials).
+        # Canonical like the rest; a `--` would put a word where the
+        # reordering can't keep it, so it is refused.
+        if END_OF_FLAGS in argv:
+            raise ConfinementRefusal("a local-only gcloud command for a profile task takes no --")
+        return Confined(
+            argv=[argv[0], *words, *(_gcloud_flag_token(name, value) for name, value in flags)],
+            kubeconfig_context=None, isolated=True, executable="gcloud", words=tuple(words),
+            flags=tuple(flags), target=target, get_credentials=get_credentials,
+        )
 
     if surface and surface[0] in GCLOUD_PROJECTLESS_SURFACES:
         raise ConfinementRefusal(
@@ -661,27 +772,33 @@ def _confine_gcloud(argv: list[str], kubeconfig_context: str | None, target: Clu
             _check_embedded(value, target, name)
 
     # Unconditional: every credentialed call names the target's project,
-    # either as the caller gave it (checked equal above) or injected, never
-    # the broker's default project (the bootstrap set gcloud's to the host
-    # cluster's) or whatever a stored property says. --project is global, so
-    # it goes right after the executable; nothing after a `--` is gcloud's.
-    confined = list(argv)
-    if not projects:
-        confined = [argv[0], f"{GCLOUD_PROJECT_FLAG}={target.project}", *argv[1:]]
+    # never the broker's default project (the bootstrap set gcloud's to the
+    # host cluster's) or whatever a stored property says. The caller's own
+    # --project, checked equal above, is dropped for the one written here.
+    project_flags = [f"{GCLOUD_PROJECT_FLAG}={target.project}"]
     # The same for a GKE call's location and a node-pool call's cluster,
     # which gcloud otherwise takes from compute/region, compute/zone and
-    # container/cluster. Command flags, so they go after the command, ahead
-    # of any `--`.
+    # container/cluster.
     command_flags: list[str] = []
     if surface[:1] == ["container"] and surface[1:2] and surface[1] in GCLOUD_CONTAINER_LOCATED_GROUPS:
         if not any(name in GCLOUD_LOCATION_FLAGS for name in names):
             command_flags.append(f"--location={target.location}")
         if surface[1] in GCLOUD_CONTAINER_CLUSTER_GROUPS and GCLOUD_CLUSTER_FLAG not in names:
             command_flags.append(f"{GCLOUD_CLUSTER_FLAG}={target.cluster}")
-    if command_flags:
-        end = confined.index(END_OF_FLAGS) if END_OF_FLAGS in confined else len(confined)
-        confined = [*confined[:end], *command_flags, *confined[end:]]
-    return Confined(argv=confined, kubeconfig_context=None, isolated=False)
+    # The canonical argv: the command words, contiguous, then every flag as
+    # one token, then the positionals (after a `--` if the caller wrote
+    # one). A flag between the command words (`container clusters
+    # --location=x get-credentials`) is legal gcloud, but a matcher that
+    # wants the words contiguous (the executor's get-credentials check, the
+    # shim's) would miss it; written this way, every reader sees the command
+    # this module confined.
+    kept = [_gcloud_flag_token(name, value) for name, value in flags if name != GCLOUD_PROJECT_FLAG]
+    separator = [END_OF_FLAGS] if END_OF_FLAGS in argv else []
+    confined = [argv[0], *command, *project_flags, *kept, *command_flags, *separator, *positionals]
+    return Confined(
+        argv=confined, kubeconfig_context=None, isolated=False, executable="gcloud", words=tuple(words),
+        flags=tuple(flags), target=target, get_credentials=get_credentials,
+    )
 
 
 def confine(argv: list[str], kubeconfig_context: str | None, target: ClusterTarget | None) -> Confined:

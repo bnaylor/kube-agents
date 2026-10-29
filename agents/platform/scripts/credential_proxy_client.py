@@ -776,6 +776,25 @@ def land_implicit_kubeconfig(generated: str) -> None:
     print("\n".join(lines), file=sys.stderr)
 
 
+def report_task_kubeconfig(generated: str) -> None:
+    """Say, in one line, what a get-credentials in a profile task did.
+
+    Nothing is filed and no shell context is recorded: in a task neither is
+    read (the broker holds every kubectl and gcloud call to the task's
+    cluster and project), and `land_implicit_kubeconfig`'s advice -- the
+    host cluster for later commands, `export KUBECONFIG` -- would be false.
+    """
+    context = read_current_context(generated)
+    target = parse_gke_context(context) if context else None
+    if target is None:
+        return
+    print(
+        f"credential proxy: credentials for {target.context_name} fetched; this profile task's kubectl and "
+        "gcloud calls already target its cluster, so there is nothing to export.",
+        file=sys.stderr,
+    )
+
+
 def is_get_credentials(argv: list[str]) -> bool:
     """Is this the one command that legitimately authors a kubeconfig?
 
@@ -952,7 +971,10 @@ def execute(
         print("credential proxy output truncated", file=sys.stderr)
     generated = payload.get("kubeconfig")
     if implicit_destination and generated:
-        land_implicit_kubeconfig(generated)
+        if in_task:
+            report_task_kubeconfig(generated)
+        else:
+            land_implicit_kubeconfig(generated)
     if destination is not None and generated:
         # gcloud's own output, written where gcloud would have written it had it
         # run here. The agent never runs a command against this file — a later

@@ -81,6 +81,7 @@ class GoldenFixtureTest(unittest.TestCase):
             "a case-variant AUD beside aud",
             "an unknown top-level claim",
             "no target",
+            "a non-canonical base64url signature",
             "expired a minute ago",
             "a span past the ceiling, with exp-now inside it",
             "expiry past the ceiling plus skew from now",
@@ -148,6 +149,17 @@ class StrictnessTest(unittest.TestCase):
             with self.subTest(bad=bad[:20]):
                 with self.assertRaises(TaskCredentialError):
                     task_credential.verify(bad, tuple(self.doc["trusted"]), self.valid["now"], 3600)
+
+    def test_a_non_canonical_signature_is_go_ok_and_proxy_refused(self):
+        # Go's decoder ignores the signature's unused trailing bits; the
+        # proxy re-encodes and refuses. The fixture pins both verdicts, and
+        # this pins that the refusal is the canonical-encoding check rather
+        # than some earlier one.
+        case = next(c for c in self.doc["cases"] if c["name"] == "a non-canonical base64url signature")
+        self.assertTrue(case["go_ok"])
+        self.assertFalse(case["proxy_ok"])
+        with self.assertRaisesRegex(TaskCredentialError, "not canonical base64url"):
+            task_credential.verify(case["token"], tuple(self.doc["trusted"]), case["now"], 3600)
 
     def test_an_oversized_token_is_refused_before_decoding(self):
         with self.assertRaisesRegex(TaskCredentialError, "too long"):

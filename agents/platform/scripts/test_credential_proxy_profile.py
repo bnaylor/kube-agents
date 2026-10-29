@@ -55,7 +55,7 @@ class KubectlConfinementTest(unittest.TestCase):
     def test_naming_no_cluster_gets_the_target_not_the_host(self):
         confined = confine(["kubectl", "get", "pods"], None, TARGET)
         self.assertEqual(CONTEXT, confined.kubeconfig_context)
-        self.assertEqual(["kubectl", f"--context={CONTEXT}", "get", "pods"], confined.argv)
+        self.assertEqual(["kubectl", "get", "pods", f"--context={CONTEXT}"], confined.argv)
         self.assertFalse(confined.isolated)
 
     def test_the_context_is_named_on_every_call(self):
@@ -64,7 +64,6 @@ class KubectlConfinementTest(unittest.TestCase):
         for argv, context in (
             (["kubectl", "get", "pods"], CONTEXT),
             (["kubectl", f"--kubeconfig={CONTEXT}", "get", "pods"], None),
-            (["kubectl", "version", "--client"], None),
         ):
             with self.subTest(argv=argv):
                 confined = confine(argv, context, TARGET)
@@ -82,11 +81,12 @@ class KubectlConfinementTest(unittest.TestCase):
             with self.subTest(argv=argv, context=context):
                 confine(argv, context, TARGET)
 
-    def test_a_kubeconfig_flag_keeps_its_own_resolution(self):
-        # The broker reroutes the flag to the target's file itself; the
-        # request carries no second context to select.
+    def test_a_kubeconfig_flag_resolves_to_the_target(self):
+        # Checked equal to the target and dropped: the broker runs the
+        # target's kubeconfig from the structure, with no flag to reroute.
         confined = confine(["kubectl", f"--kubeconfig={CONTEXT}", "get", "pods"], None, TARGET)
-        self.assertIsNone(confined.kubeconfig_context)
+        self.assertEqual(CONTEXT, confined.kubeconfig_context)
+        self.assertEqual(["kubectl", "get", "pods", f"--context={CONTEXT}"], confined.argv)
 
     def test_another_context_flag_is_refused(self):
         self.assertIn("--context", self.refused(["kubectl", "get", "pods", f"--context={OTHER_CONTEXT}"]))
@@ -151,7 +151,7 @@ class GcloudConfinementTest(unittest.TestCase):
 
     def test_a_missing_project_is_the_targets(self):
         confined = confine(["gcloud", "compute", "instances", "list"], None, TARGET)
-        self.assertEqual(["gcloud", "--project=proj-a", "compute", "instances", "list"], confined.argv)
+        self.assertEqual(["gcloud", "compute", "instances", "list", "--project=proj-a"], confined.argv)
         self.assertIsNone(confined.kubeconfig_context)
 
     def test_the_target_project_is_kept_as_given(self):
@@ -160,20 +160,22 @@ class GcloudConfinementTest(unittest.TestCase):
             ["gcloud", "--project", "proj-a", "compute", "instances", "list"],
         ):
             with self.subTest(argv=argv):
-                self.assertEqual(argv, confine(argv, None, TARGET).argv)
+                self.assertEqual(
+                    ["gcloud", "compute", "instances", "list", "--project=proj-a"], confine(argv, None, TARGET).argv
+                )
 
     def test_a_gke_call_gets_the_target_location_and_cluster(self):
         # Unconditional: gcloud would otherwise take them from compute/region,
         # compute/zone and container/cluster.
         for argv, want in (
             (["gcloud", "container", "clusters", "list"],
-             ["gcloud", "--project=proj-a", "container", "clusters", "list", "--location=us-central1"]),
+             ["gcloud", "container", "clusters", "list", "--project=proj-a", "--location=us-central1"]),
             (["gcloud", "container", "node-pools", "list"],
-             ["gcloud", "--project=proj-a", "container", "node-pools", "list", "--location=us-central1", "--cluster=cluster-a"]),
+             ["gcloud", "container", "node-pools", "list", "--project=proj-a", "--location=us-central1", "--cluster=cluster-a"]),
             (["gcloud", "container", "operations", "list", "--location=us-central1"],
-             ["gcloud", "--project=proj-a", "container", "operations", "list", "--location=us-central1"]),
+             ["gcloud", "container", "operations", "list", "--project=proj-a", "--location=us-central1"]),
             (["gcloud", "container", "clusters", "describe", "cluster-a"],
-             ["gcloud", "--project=proj-a", "container", "clusters", "describe", "cluster-a", "--location=us-central1"]),
+             ["gcloud", "container", "clusters", "describe", "--project=proj-a", "--location=us-central1", "cluster-a"]),
         ):
             with self.subTest(argv=argv):
                 self.assertEqual(want, confine(argv, None, TARGET).argv)
@@ -263,10 +265,11 @@ class GcloudConfinementTest(unittest.TestCase):
 
     def test_get_credentials_must_name_the_target_exactly(self):
         ok = ["gcloud", "container", "clusters", "get-credentials", "cluster-a", "--location=us-central1"]
-        self.assertEqual(["gcloud", "--project=proj-a", *ok[1:]], confine(ok, None, TARGET).argv)
+        want = ["gcloud", "container", "clusters", "get-credentials", "--project=proj-a", "--location=us-central1", "cluster-a"]
+        self.assertEqual(want, confine(ok, None, TARGET).argv)
         # A location gcloud would default is the target's, injected.
         self.assertEqual(
-            ["gcloud", "--project=proj-a", "container", "clusters", "get-credentials", "cluster-a", "--location=us-central1"],
+            want,
             confine(["gcloud", "container", "clusters", "get-credentials", "cluster-a"], None, TARGET).argv,
         )
         for argv in (
@@ -376,6 +379,20 @@ class FlagValueTest(unittest.TestCase):
                     with self.assertRaisesRegex(ConfinementRefusal, argv[1]):
                         confine(argv, None, target)
 
+    def test_an_identity_flag_beside_a_local_only_command_is_refused(self):
+        # Local-only runs isolated, but gcloud still holds the broker's own
+        # credential there: an identity or scope flag is refused before the
+        # local-only check, however local the command is.
+        for argv in (
+            ["gcloud", "version", "--account=someone@example.com"],
+            ["gcloud", "container", "clusters", "list", "--help", "--impersonate-service-account=sa@proj-b.iam.gserviceaccount.com"],
+            ["gcloud", "version", "--organization=123"],
+        ):
+            for target in (TARGET, None):
+                with self.subTest(argv=argv, target=target):
+                    with self.assertRaisesRegex(ConfinementRefusal, argv[-1].split("=")[0]):
+                        confine(argv, None, target)
+
 
 class StoredDefaultTest(unittest.TestCase):
     """Nothing a profile runs may change what a later bare command targets."""
@@ -442,13 +459,12 @@ class StoredDefaultTest(unittest.TestCase):
 
     def test_the_kubectl_config_reads_still_run(self):
         for argv in (
-            ["kubectl", "config", "view"],
             ["kubectl", "config", "get-contexts"],
             ["kubectl", "config", "current-context"],
         ):
             with self.subTest(argv=argv):
                 self.assertTrue(confine(argv, None, None).isolated)
-                confine(argv, None, TARGET)
+                self.assertTrue(confine(argv, None, TARGET).isolated)
 
 
 class LocalOnlyTest(unittest.TestCase):
@@ -457,9 +473,7 @@ class LocalOnlyTest(unittest.TestCase):
     def test_local_only_commands_run_without_a_target(self):
         for argv in (
             ["kubectl", "version", "--client"],
-            ["kubectl", "--help"],
             ["kubectl", "get", "pods", "--help"],
-            ["kubectl", "help"],
             ["gcloud", "version"],
             ["gcloud", "--help"],
             ["gcloud", "container", "clusters", "list", "--help"],
@@ -603,15 +617,16 @@ class ProfileRouteTest(unittest.TestCase):
         status, body = self.post({"argv": ["kubectl", "get", "pods"]})
         self.assertEqual(200, status, body)
         (argv, kwargs), = self.executor.calls
-        self.assertEqual(["kubectl", f"--context={CONTEXT}", "get", "pods"], argv)
+        self.assertEqual(["kubectl", "get", "pods", f"--context={CONTEXT}"], argv)
         self.assertEqual(CONTEXT, kwargs["kubeconfig_context"])
-        self.assertNotIn("isolated", kwargs)
+        self.assertFalse(kwargs["confined"].isolated)
+        self.assertEqual(argv, kwargs["confined"].argv)
 
     def test_a_bound_credential_gives_gcloud_the_target_project(self):
         status, body = self.post({"argv": ["gcloud", "container", "clusters", "list"]})
         self.assertEqual(200, status, body)
         (argv, _), = self.executor.calls
-        self.assertEqual(["gcloud", "--project=proj-a", "container", "clusters", "list", "--location=us-central1"], argv)
+        self.assertEqual(["gcloud", "container", "clusters", "list", "--project=proj-a", "--location=us-central1"], argv)
 
     def test_changing_a_default_is_refused_at_the_proxy(self):
         for argv in (["gcloud", "config", "set", "project", "other"], ["kubectl", "config", "use-context", OTHER_CONTEXT]):
@@ -654,7 +669,7 @@ class ProfileRouteTest(unittest.TestCase):
         status, body = self.post({"argv": ["kubectl", "version", "--client"]}, token=None)
         self.assertEqual(200, status, body)
         (_, kwargs), = self.executor.calls
-        self.assertTrue(kwargs["isolated"])
+        self.assertTrue(kwargs["confined"].isolated)
         self.assertIsNone(kwargs["kubeconfig_context"])
 
     def test_no_gate_is_no_task(self):
@@ -755,7 +770,7 @@ class ProfileRouteTest(unittest.TestCase):
         self.assertEqual(200, status, body)
         (_, kwargs), = self.executor.calls
         self.assertIsNone(kwargs["kubeconfig_context"])
-        self.assertNotIn("isolated", kwargs)
+        self.assertNotIn("confined", kwargs)
 
     def test_the_profile_flag_allowlist_is_the_sessions(self):
         status, body = self.post({"argv": ["kubectl", "get", "-f", "/etc/credential-proxy/policy.json"]})
@@ -889,6 +904,240 @@ print("context=" + context)
         seen = self.run_bare(["kubectl", "get", "pods"])
         self.assertEqual({"context": CONTEXT}, seen)
         self.assertEqual([CONTEXT], self.resolved)
+
+    def post(self, argv):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}/v1/exec",
+            data=json.dumps({"argv": argv}).encode("utf-8"),
+            headers={"Content-Type": "application/json", credential_proxy.TASK_CREDENTIAL_HEADER: VALID["token"]},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, json.loads(error.read())
+
+    def test_a_kubeconfig_inside_a_flag_value_never_resolves(self):
+        # The confinement and the executor read argv once, the same way: a
+        # `--kubeconfig` or `--context` sitting where a value goes is refused,
+        # never resolved by a second, arity-blind scan.
+        for argv in (
+            ["kubectl", "config", "get-contexts", "-n", f"--kubeconfig={OTHER_CONTEXT}"],
+            ["kubectl", "get", "pods", "-l", "--kubeconfig", OTHER_CONTEXT],
+            ["kubectl", "get", "pods", "--field-selector", f"--kubeconfig={OTHER_CONTEXT}"],
+            ["kubectl", "get", "pods", "--namespace", f"--context={OTHER_CONTEXT}"],
+        ):
+            with self.subTest(argv=argv):
+                self.resolved.clear()
+                status, body = self.post(argv)
+                self.assertNotEqual(200, status, body)
+                self.assertNotIn(OTHER_CONTEXT, self.resolved)
+
+    def test_get_credentials_with_help_makes_no_call_for_another_cluster(self):
+        # Local-only (--help) runs isolated: no get-credentials handling, so
+        # no endpoint describe of the cluster the argv names.
+        describe = mock.Mock(side_effect=AssertionError("a GKE describe ran"))
+        CredentialProxyHandler.executor._endpoint_decision = describe
+        for argv in (
+            ["gcloud", "container", "clusters", "get-credentials", "cluster-b", "--location=europe-west1",
+             "--project=proj-b", "--help"],
+            ["gcloud", "container", "clusters", "get-credentials", "cluster-a", "--help"],
+        ):
+            with self.subTest(argv=argv):
+                status, body = self.post(argv)
+                self.assertNotEqual(200, status, body)
+                self.assertNotEqual(500, status, body)
+        describe.assert_not_called()
+
+    def test_get_credentials_with_flags_between_its_words_is_still_get_credentials(self):
+        # Spelt with a flag between the command words, it still reaches the
+        # one path that writes a kubeconfig into a scratch file, never a plain
+        # run against the broker's own kubeconfig.
+        fetched = []
+
+        def fetch(command, stdin, cwd, wants_kubeconfig, caller=None):
+            fetched.append(command[1:])
+            return credential_proxy.ExecutionResult(
+                exit_code=0, stdout="", stderr="", duration_ms=0, truncated=False, timed_out=False,
+            )
+
+        CredentialProxyHandler.executor._execute_get_credentials = fetch
+        plain = mock.Mock(side_effect=AssertionError("get-credentials ran as a plain command"))
+        CredentialProxyHandler.executor._execute = plain
+        for argv in (
+            ["gcloud", "container", "clusters", "--location=us-central1", "get-credentials", "cluster-a"],
+            ["gcloud", "container", "--project=proj-a", "clusters", "get-credentials", "cluster-a"],
+            ["gcloud", "--project", "proj-a", "container", "clusters", "get-credentials", "--location",
+             "us-central1", "cluster-a"],
+        ):
+            with self.subTest(argv=argv):
+                fetched.clear()
+                status, body = self.post(argv)
+                self.assertEqual(200, status, body)
+                self.assertEqual(1, len(fetched))
+                self.assertEqual(["container", "clusters", "get-credentials"], fetched[0][:3])
+        plain.assert_not_called()
+
+
+class ParseOnceTest(unittest.TestCase):
+    """One arity-aware parse, one canonical argv, one structure the executor reads."""
+
+    def test_a_flag_shaped_value_is_refused(self):
+        for argv in (
+            ["kubectl", "config", "get-contexts", "-n", f"--kubeconfig={OTHER_CONTEXT}"],
+            ["kubectl", "get", "pods", "-l", "--kubeconfig", OTHER_CONTEXT],
+            ["kubectl", "get", "pods", "-n", "--context", OTHER_CONTEXT],
+            ["kubectl", "get", "pods", "--namespace=--kubeconfig=x"],
+            ["kubectl", "get", "pods", "-n"],
+            ["gcloud", "container", "clusters", "list", "--format", "--project=proj-b"],
+        ):
+            for target in (TARGET, None):
+                with self.subTest(argv=argv, target=target):
+                    with self.assertRaises(ConfinementRefusal):
+                        confine(argv, None, target)
+
+    def test_the_kubectl_argv_is_canonical(self):
+        confined = confine(
+            ["kubectl", "--namespace", "ns", "get", "-l", "app=x", f"--kubeconfig={CONTEXT}", "pods", "-A"], None, TARGET,
+        )
+        self.assertEqual(
+            ["kubectl", "get", "pods", f"--context={CONTEXT}", "--namespace=ns", "--selector=app=x", "--all-namespaces"],
+            confined.argv,
+        )
+        self.assertEqual(CONTEXT, confined.kubeconfig_context)
+        self.assertEqual(("get", "pods"), confined.words)
+        # A shorthand takes its value with pflag's arity and is written long.
+        self.assertEqual(
+            ["kubectl", "get", "pods", f"--context={CONTEXT}", "--namespace=ns", "--output=json"],
+            confine(["kubectl", "get", "pods", "-n", "ns", "-ojson"], None, TARGET).argv,
+        )
+        # Nothing the caller wrote is a --kubeconfig or --context any more:
+        # only the one --context the confinement injects.
+        for argv in (
+            ["kubectl", "get", "pods", "-n", "ns", f"--context={CONTEXT}"],
+            ["kubectl", "--kubeconfig", CONTEXT, "get", "pods"],
+        ):
+            with self.subTest(argv=argv):
+                got = confine(argv, None, TARGET).argv
+                self.assertEqual([f"--context={CONTEXT}"], [a for a in got if a.startswith(("--context", "--kubeconfig"))])
+
+    def test_the_gcloud_argv_is_canonical_command_words_first(self):
+        for argv in (
+            ["gcloud", "container", "clusters", "--location=us-central1", "get-credentials", "cluster-a"],
+            ["gcloud", "container", "--project=proj-a", "clusters", "get-credentials", "cluster-a"],
+            ["gcloud", "--project", "proj-a", "container", "clusters", "get-credentials", "-z", "us-central1", "cluster-a"],
+        ):
+            with self.subTest(argv=argv):
+                confined = confine(argv, None, TARGET)
+                self.assertEqual(["gcloud", "container", "clusters", "get-credentials"], confined.argv[:4])
+                self.assertEqual("cluster-a", confined.argv[-1])
+                self.assertTrue(confined.get_credentials)
+                self.assertTrue(credential_proxy._is_get_credentials(confined.argv))
+                self.assertEqual(TARGET, credential_proxy._get_credentials_target(confined.argv))
+        self.assertEqual(
+            ["gcloud", "container", "clusters", "get-credentials", "--project=proj-a", "--zone=us-central1", "cluster-a"],
+            confine(["gcloud", "container", "clusters", "get-credentials", "-z", "us-central1", "cluster-a"],
+                    None, TARGET).argv,
+        )
+
+    def test_a_local_only_command_runs_isolated_with_a_target_too(self):
+        for argv in (
+            ["gcloud", "container", "clusters", "get-credentials", "cluster-b", "--location=europe-west1",
+             "--project=proj-b", "--help"],
+            ["gcloud", "container", "clusters", "list", "--help"],
+            ["gcloud", "version"],
+            ["kubectl", "version", "--client"],
+            ["kubectl", "get", "pods", "--help"],
+            ["kubectl", "config", "current-context"],
+        ):
+            for target in (TARGET, None):
+                with self.subTest(argv=argv, target=target):
+                    confined = confine(argv, None, target)
+                    self.assertTrue(confined.isolated)
+                    self.assertIsNone(confined.kubeconfig_context)
+                    # Nothing injected: no context, no project of the target's.
+                    self.assertNotIn(f"--context={CONTEXT}", confined.argv)
+                    self.assertNotIn(f"--project={TARGET.project}", confined.argv)
+
+    def test_every_local_only_command_passes_the_read_only_policy(self):
+        # What the confinement admits as local-only must be what command_policy
+        # admits downstream; otherwise the refusal text promises a command the
+        # broker then refuses under another rule.
+        for argv in (
+            ["kubectl", "version", "--client"],
+            ["kubectl", "get", "pods", "--help"],
+            ["kubectl", "config", "get-contexts"],
+            ["kubectl", "config", "current-context"],
+            ["gcloud", "version"],
+            ["gcloud", "--help"],
+            ["gcloud", "container", "clusters", "list", "--help"],
+        ):
+            with self.subTest(argv=argv):
+                confined = confine(argv, None, None)
+                self.assertTrue(command_policy.evaluate(confined.argv).allowed, confined.argv)
+        for argv in (
+            ["kubectl", "config", "view"],
+            ["kubectl", "config", "view", "--flatten"],
+            ["kubectl", "config", "get-clusters"],
+            ["kubectl", "config", "get-users"],
+            ["kubectl", "help"],
+            ["kubectl", "options"],
+            ["gcloud", "help"],
+            ["gcloud", "topic"],
+            ["gcloud", "--version"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaises(ConfinementRefusal):
+                    confine(argv, None, None)
+        # --version is not local beside a command: it is confined like any read.
+        with self.assertRaisesRegex(ConfinementRefusal, "--project"):
+            confine(["gcloud", "container", "clusters", "list", "--project=proj-b", "--version"], None, TARGET)
+
+
+class ConfinedExecutionTest(unittest.TestCase):
+    """The executor runs a profile call from the confinement's structure, not a re-parse."""
+
+    def setUp(self):
+        executor = credential_proxy.CommandExecutor.__new__(credential_proxy.CommandExecutor)
+        executor.executables = {"kubectl": "/bin/kubectl", "gcloud": "/bin/gcloud"}
+        executor.kubectl_timeout_seconds = 60
+        executor.scoped_pool = None
+        self.seen = {}
+
+        def fake_execute(command, **kwargs):
+            self.seen["command"], self.seen["kwargs"] = command, kwargs
+            return credential_proxy.ExecutionResult(exit_code=0, stdout="", stderr="", duration_ms=0, truncated=False, timed_out=False)
+
+        executor._execute = fake_execute
+        executor._default_kubeconfig = mock.Mock(side_effect=AssertionError("the host kubeconfig was resolved"))
+        self.resolved = []
+        executor._resolve_kubeconfig = lambda context, scoped=True: self.resolved.append(context) or Path("/k")
+        executor._reroute_kubeconfig_flags = mock.Mock(side_effect=AssertionError("argv was re-parsed for --kubeconfig"))
+        executor._execute_get_credentials = mock.Mock(side_effect=AssertionError("get-credentials handling ran"))
+        self.executor = executor
+
+    def test_the_executor_reads_the_confined_structure_not_the_argv(self):
+        confined = confine(["kubectl", "get", "pods"], None, TARGET)
+        self.executor.execute(confined.argv, confined=confined)
+        self.assertEqual([CONTEXT], self.resolved)
+        self.assertEqual(Path("/k"), self.seen["kwargs"]["kubeconfig_path"])
+
+    def test_an_isolated_structure_runs_against_no_kubeconfig(self):
+        confined = confine(["gcloud", "container", "clusters", "list", "--help"], None, TARGET)
+        self.executor.execute(confined.argv, confined=confined)
+        self.assertEqual(Path(os.devnull), self.seen["kwargs"]["kubeconfig_path"])
+        self.assertEqual([], self.resolved)
+        confined = confine(["gcloud", "container", "clusters", "get-credentials", "cluster-b", "--help"], None, TARGET)
+        with self.assertRaises(ValueError):
+            self.executor.execute(confined.argv, confined=confined)
+
+    def test_an_argv_that_is_not_the_confined_one_is_refused(self):
+        confined = confine(["kubectl", "get", "pods"], None, TARGET)
+        with self.assertRaises(ValueError):
+            self.executor.execute(["kubectl", "get", "pods", f"--kubeconfig={OTHER_CONTEXT}"], confined=confined)
+        self.assertEqual([], self.resolved)
 
 
 class ProfileSlotShareTest(unittest.TestCase):
@@ -1060,10 +1309,12 @@ class IsolatedExecutionTest(unittest.TestCase):
         executor._execute = fake_execute
         executor._default_kubeconfig = mock.Mock(side_effect=AssertionError("the host kubeconfig was resolved"))
         executor._resolve_kubeconfig = mock.Mock(side_effect=AssertionError("a kubeconfig was resolved"))
-        executor.execute(["kubectl", "version", "--client"], isolated=True)
+        confined = confine(["kubectl", "version", "--client"], None, None)
+        executor.execute(confined.argv, confined=confined)
         self.assertEqual(Path(os.devnull), seen["kwargs"]["kubeconfig_path"])
+        confined = confine(["gcloud", "container", "clusters", "get-credentials", "c", "--help"], None, None)
         with self.assertRaises(ValueError):
-            executor.execute(["gcloud", "container", "clusters", "get-credentials", "c"], isolated=True)
+            executor.execute(confined.argv, confined=confined)
 
 
 if __name__ == "__main__":

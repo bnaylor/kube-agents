@@ -76,8 +76,10 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-profile-no-credential-runs",
         "agents/platform/scripts/task_confinement.py",
-        ("    if target is None:\n        if not _kubectl_is_local(flags, words):\n",
-         "    if target is None:\n        if False:\n"),
+        ("    if target is None:\n        if not local:\n            raise ConfinementRefusal(\n"
+         "                \"this profile task has no target cluster",
+         "    if target is None:\n        if False:\n            raise ConfinementRefusal(\n"
+         "                \"this profile task has no target cluster"),
         "test_A3_a_profile_caller_without_a_task_credential_reaches_no_cluster",
         "let a profile worker with no credential run as a session would, on "
         "the host cluster, so a task the dispatcher gave no target still works",

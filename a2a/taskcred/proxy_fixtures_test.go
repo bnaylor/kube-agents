@@ -169,6 +169,7 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(proxyFixture{Name: "a null name", Token: edited(`"sub":"fixturenonce"`, `"sub":"fixturenonce","name":null`), Now: fixtureNow, GoOK: true})
 	add(proxyFixture{Name: "a header key beyond typ and alg", Token: signWithHeader(t, kp, `{"typ":"JWT","alg":"ed25519-nkey","kid":"x"}`, base),
 		Now: fixtureNow, GoOK: true})
+	add(proxyFixture{Name: "a non-canonical base64url signature", Token: nonCanonicalSignature(t, sign(base)), Now: fixtureNow, GoOK: true})
 
 	// Signature and issuer.
 	parts := strings.Split(sign(base), ".")
@@ -316,4 +317,25 @@ func TestCredentialProxyFixtures(t *testing.T) {
 			}
 		}
 	}
+}
+
+// nonCanonicalSignature sets the unused low bits of the signature segment's
+// last character. A 64-byte Ed25519 signature is 86 base64url characters, and
+// the last carries 2 bits of signature and 4 unused ones: Go's non-strict
+// RawURLEncoding ignores them, so the token still verifies, while the proxy
+// re-encodes the decoded bytes and refuses a segment that doesn't round-trip.
+func nonCanonicalSignature(t *testing.T, token string) string {
+	t.Helper()
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	parts := strings.Split(token, ".")
+	signature := parts[2]
+	if len(signature) != 86 {
+		t.Fatalf("signature segment is %d characters, want 86", len(signature))
+	}
+	last := strings.IndexByte(alphabet, signature[85])
+	if last < 0 || last&0x0f != 0 {
+		t.Fatalf("signature's last character %q is not canonical to begin with", signature[85])
+	}
+	parts[2] = signature[:85] + string(alphabet[last|0x01])
+	return strings.Join(parts, ".")
 }
