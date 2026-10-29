@@ -145,6 +145,8 @@ func TestKeysOfTheWrongTypeAreRefused(t *testing.T) {
 func TestTheCalloutKeysSecretIsOnlyReadWhenOwned(t *testing.T) {
 	ctx := context.Background()
 	agent := a2aTestAgent()
+	// A real UID, so the other-UID case compares two non-empty UIDs.
+	agent.UID = "platform-agent-uid"
 	_, valid, err := generateA2ACalloutKeys()
 	if err != nil {
 		t.Fatal(err)
@@ -202,4 +204,38 @@ func TestTheCalloutKeysSecretIsOnlyReadWhenOwned(t *testing.T) {
 			t.Error("the repaired Secret does not hold the keys the repair returned")
 		}
 	})
+}
+
+// The NATS credentials Secret follows the same rule: one at its name that
+// this PlatformAgent doesn't control is refused, not adopted or repaired.
+func TestTheNATSCredsSecretIsOnlyReadWhenOwned(t *testing.T) {
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	agent.UID = "platform-agent-uid"
+	const planted = "0123456789abcdef0123456789abcdef"
+	notController := false
+	for name, owners := range map[string][]metav1.OwnerReference{
+		"no owner": nil,
+		"a non-controller owner reference": {{
+			APIVersion: "kubeagents.x-k8s.io/v1alpha1", Kind: "PlatformAgent", Name: agent.Name, UID: agent.UID, Controller: &notController}},
+		"a controller reference with another UID": {{
+			APIVersion: "kubeagents.x-k8s.io/v1alpha1", Kind: "PlatformAgent", Name: agent.Name, UID: "another-uid", Controller: func() *bool { b := true; return &b }()}},
+	} {
+		t.Run("a Secret with "+name+" is refused", func(t *testing.T) {
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCredsSecretName(agent), Namespace: agent.Namespace, OwnerReferences: owners},
+				Data: map[string][]byte{a2aBridgePasswordKey: []byte(planted)}}
+			r, cl := mcpTestReconciler(t, secret)
+			got, err := r.ensureA2ACredsSecret(ctx, agent)
+			if err == nil || !strings.Contains(err.Error(), "refusing to adopt unowned Secret") {
+				t.Fatalf("an unowned NATS credentials Secret was taken (got %v, err %v)", got != nil, err)
+			}
+			after := &corev1.Secret{}
+			if err := cl.Get(ctx, types.NamespacedName{Name: secret.Name, Namespace: secret.Namespace}, after); err != nil {
+				t.Fatal(err)
+			}
+			if len(after.Data) != 1 || string(after.Data[a2aBridgePasswordKey]) != planted {
+				t.Error("the unowned Secret was changed")
+			}
+		})
+	}
 }
