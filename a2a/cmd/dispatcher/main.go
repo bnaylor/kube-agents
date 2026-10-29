@@ -7,12 +7,15 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -164,9 +167,11 @@ func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.In
 	go pool.Run(ctx)
 	go watchProfileNamespace(ctx, cancel, store, profileNS)
 
-	client, err := lib.Connect(ctx, s.natsURL, lib.WithName(clientName), lib.WithLogger(log),
-		lib.WithAgreementPolicy(lib.AgreementPolicy{Submitter: dispatch.DefaultSubmitter}),
-		lib.WithNATSOptions(append(s.auth, nats.ReconnectWait(reconnectWait), nats.ReconnectJitter(reconnectJitter, reconnectJitter))...))
+	client, err := connectWithRetry(ctx, log, dialBackoff, func(ctx context.Context) (*lib.Client, error) {
+		return lib.Connect(ctx, s.natsURL, lib.WithName(clientName), lib.WithLogger(log),
+			lib.WithAgreementPolicy(lib.AgreementPolicy{Submitter: dispatch.DefaultSubmitter}),
+			lib.WithNATSOptions(append(s.auth, nats.ReconnectWait(reconnectWait), nats.ReconnectJitter(reconnectJitter, reconnectJitter))...))
+	})
 	if err != nil {
 		return fmt.Errorf("bus connect: %w", err)
 	}
@@ -287,4 +292,48 @@ func serveStatus(log *slog.Logger, p *probes) *http.Server {
 		}
 	}()
 	return srv
+}
+
+const (
+	// dialBackoff is the wait after the first failed bus connect, doubled
+	// up to maxDialBackoff: the bus is often still rolling when the
+	// dispatcher starts in the same operator pass, and exiting on it would
+	// cost a CrashLoopBackOff whose delay grows with each restart.
+	dialBackoff    = time.Second
+	maxDialBackoff = 30 * time.Second
+)
+
+// connectWithRetry calls dial until it succeeds, the bus refuses the
+// credential or certificate (connectRefused, which no retry fixes), or ctx is
+// done, logging each failure with the wait before the next attempt.
+func connectWithRetry[C any](ctx context.Context, log *slog.Logger, backoff time.Duration, dial func(context.Context) (C, error)) (C, error) {
+	for {
+		c, err := dial(ctx)
+		if err == nil {
+			return c, nil
+		}
+		if connectRefused(err) {
+			var zero C
+			return zero, fmt.Errorf("the bus refused the connection (check the dispatcher's bus token and the bus CA): %w", err)
+		}
+		log.Warn("the bus is not reachable yet; retrying", "in", backoff, "err", err)
+		select {
+		case <-ctx.Done():
+			var zero C
+			return zero, ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff = min(2*backoff, maxDialBackoff)
+	}
+}
+
+// connectRefused reports a connect failure no retry fixes: a refused
+// credential or an untrusted certificate.
+func connectRefused(err error) bool {
+	var unknownCA x509.UnknownAuthorityError
+	var wrongName x509.HostnameError
+	var unverified *tls.CertificateVerificationError
+	return errors.Is(err, nats.ErrAuthorization) ||
+		strings.Contains(strings.ToLower(err.Error()), "authorization violation") ||
+		errors.As(err, &unknownCA) || errors.As(err, &wrongName) || errors.As(err, &unverified)
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -213,4 +215,30 @@ func TestReadyzNeedsConfigBusAndBoundDurables(t *testing.T) {
 	check(http.StatusOK, "ok")
 	connected.Store(false)
 	check(http.StatusServiceUnavailable, "bus")
+}
+
+// The first bus connect is retried while the bus is unreachable (it is often
+// rolling in the same operator pass), and stops at once on a refused
+// credential, which no retry fixes.
+func TestTheFirstBusConnectIsRetried(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	calls := 0
+	got, err := connectWithRetry(context.Background(), log, time.Millisecond, func(context.Context) (int, error) {
+		calls++
+		if calls < 3 {
+			return 0, nats.ErrNoServers
+		}
+		return 7, nil
+	})
+	if err != nil || got != 7 || calls != 3 {
+		t.Fatalf("got %d, %v after %d calls; want 7 after 3", got, err, calls)
+	}
+	calls = 0
+	_, err = connectWithRetry(context.Background(), log, time.Millisecond, func(context.Context) (int, error) {
+		calls++
+		return 0, nats.ErrAuthorization
+	})
+	if err == nil || calls != 1 {
+		t.Fatalf("a refused credential: %v after %d calls; want an error after 1", err, calls)
+	}
 }
