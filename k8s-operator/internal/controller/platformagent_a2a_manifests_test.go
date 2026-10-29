@@ -304,7 +304,7 @@ func TestBuildA2ANATSStatefulSet(t *testing.T) {
 	}
 }
 
-// The provisioning payload: four streams, four KV buckets, four starter
+// The provisioning payload: four streams, five KV buckets, four starter
 // topics, the deployment spec's retention numbers verbatim.
 func TestBuildA2AProvisionJob(t *testing.T) {
 	agent := a2aTestAgent()
@@ -721,19 +721,21 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 
 	pub := rest[strings.Index(rest, "publish"):strings.Index(rest, "subscribe")]
 	sub := rest[strings.Index(rest, "subscribe"):]
-	var got, gotSub []string
-	for _, line := range strings.Split(pub, "\n") {
-		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
-		if strings.HasPrefix(line, `"`) {
-			got = append(got, strings.Trim(line, `"`))
-		}
+	subDeny := ""
+	if i := strings.Index(sub, "deny"); i >= 0 {
+		sub, subDeny = sub[:i], sub[i:]
 	}
-	for _, line := range strings.Split(sub, "\n") {
-		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
-		if strings.HasPrefix(line, `"`) {
-			gotSub = append(gotSub, strings.Trim(line, `"`))
+	quoted := func(block string) []string {
+		var out []string
+		for _, line := range strings.Split(block, "\n") {
+			line = strings.TrimSuffix(strings.TrimSpace(line), ",")
+			if strings.HasPrefix(line, `"`) {
+				out = append(out, strings.Trim(line, `"`))
+			}
 		}
+		return out
 	}
+	got, gotSub, gotSubDeny := quoted(pub), quoted(sub), quoted(subDeny)
 	want := []string{
 		"$JS.API.INFO",
 		"$JS.API.STREAM.INFO.TASKS",
@@ -752,6 +754,7 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 		"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
 		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
 		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+		"$JS.API.DIRECT.GET.PROFILE_SUBMITS.>",
 		"chat.console.*.in",
 		"_INBOX.console.>",
 	}
@@ -761,6 +764,10 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	wantSub := []string{"a2a.>", "chat.console.*.out", "_INBOX.console.>"}
 	if !reflect.DeepEqual(gotSub, wantSub) {
 		t.Errorf("console subscribe allow-list changed.\n got: %q\nwant: %q", gotSub, wantSub)
+	}
+	// web's subtraction: `a2a.>` covers the verifier's queue group.
+	if want := []string{"a2a.cap.>"}; !reflect.DeepEqual(gotSubDeny, want) {
+		t.Errorf("console subscribe deny-list = %q, want %q", gotSubDeny, want)
 	}
 	// No verb on any KV_* stream, STREAM.INFO included: its subjects_filter
 	// body lists every key. Nor the KV data plane.
@@ -2152,7 +2159,7 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	failRole := true
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, chartProfileNamespace(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Patch: fakeServerSideApplyInterceptors().Patch,
@@ -2184,6 +2191,13 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 
 	if _, err := r.reconcileA2A(ctx, agent); err != nil {
 		t.Fatalf("render: %v", err)
+	}
+	// Precondition: the profile namespace's half rendered, so its delete
+	// below proves something.
+	for _, obj := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
+		if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-dispatcher", Namespace: "test-ns-profiles"}, obj); err != nil {
+			t.Fatalf("precondition: the dispatcher's pod-read %T in the profile namespace wasn't rendered: %v", obj, err)
+		}
 	}
 
 	// The render has to have produced what the cleanup is asked to remove.
@@ -2223,6 +2237,13 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 		{"gateway Role", &rbacv1.Role{}, "test-agent-a2a-gateway"},
 		{"gateway RoleBinding", &rbacv1.RoleBinding{}, "test-agent-a2a-gateway"},
 		{"gateway ServiceAccount", &corev1.ServiceAccount{}, "test-agent-a2a-gateway"},
+		// The dispatcher, rendered because the image is set above; its Role
+		// is the first the injected failure stops on.
+		{"dispatcher Deployment", &appsv1.Deployment{}, "test-agent-a2a-dispatcher"},
+		{"dispatch ConfigMap", &corev1.ConfigMap{}, "test-agent-a2a-dispatch"},
+		{"dispatcher Role", &rbacv1.Role{}, "test-agent-a2a-dispatcher"},
+		{"dispatcher RoleBinding", &rbacv1.RoleBinding{}, "test-agent-a2a-dispatcher"},
+		{"dispatcher ServiceAccount", &corev1.ServiceAccount{}, "test-agent-a2a-dispatcher"},
 		{"NATS Service", &corev1.Service{}, "test-agent-a2a-nats"},
 		{"NATS config Secret", &corev1.Secret{}, "test-agent-a2a-nats-config"},
 		{"NATS StatefulSet", &appsv1.StatefulSet{}, "test-agent-a2a-nats"},
@@ -2230,6 +2251,15 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 		err := cl.Get(ctx, types.NamespacedName{Name: tc.name, Namespace: "test-ns"}, tc.obj)
 		if !errors.IsNotFound(err) {
 			t.Errorf("%s survived the resumed cleanup (err=%v) — the early exit stepped over it", tc.what, err)
+		}
+	}
+
+	// The dispatcher's pod-read Role and binding in the profile namespace,
+	// which carry no owner reference and so need the flip's own delete.
+	for _, obj := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
+		err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-dispatcher", Namespace: "test-ns-profiles"}, obj)
+		if !errors.IsNotFound(err) {
+			t.Errorf("the dispatcher's pod-read %T in the profile namespace survived the cleanup (err=%v)", obj, err)
 		}
 	}
 
@@ -2249,6 +2279,8 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 // StatefulSet sentinel.
 func TestCleanupA2AResumesAfterAMidPassErrorOnFullRender(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
+	// The dispatcher too, so the labelled-kind sweep sees its objects.
+	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
 	scheme := setupScheme()
 	next := a2aTestAgent()
 	today := next.DeepCopy()
@@ -5783,6 +5815,10 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	consoleStreams := a2aSameVerbsOn(
 		[]string{a2aTasksStream, "DIRECTORY", a2aTopicsStateStream, a2aTopicsJournalStream},
 		"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT")
+	// Plus the profiles' submissions, read by subject and nothing else: no
+	// STREAM.INFO (the same subjects_filter listing) and no consumer verb,
+	// so a browser credential can't pull a profile's queue.
+	consoleStreams[a2aProfileSubmitStream] = []string{"DIRECT.GET"}
 	rows := map[string]a2aGrantRow{
 		"gateway": {
 			streams: map[string][]string{

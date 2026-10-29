@@ -689,6 +689,7 @@ type StallWatchSpec struct {
 // known when the CR is written: cluster profiles are scaffolded at runtime, one per
 // managed cluster, with generated names like `cluster-<project>-<cluster>-<region>`.
 // `Cluster` therefore applies to every `cluster-*` profile rather than to one of them.
+// +kubebuilder:validation:XValidation:rule="!has(self.profiles) || !has(self.profiles.childReserve) || self.profiles.childReserve < (has(self.profiles.ceiling) ? self.profiles.ceiling : (has(self.maxInProgress) ? self.maxInProgress : 6))",message="profiles.childReserve must be below the profile ceiling (profiles.ceiling, or maxInProgress when that is unset, default 6): the reserve is a share of the ceiling that top-level tasks can't take"
 type TuningSpec struct {
 	// Default applies to the `default` profile — the Chat Agent front door. Delivered
 	// as a config overlay merged into that profile at pod startup, like the others.
@@ -851,13 +852,15 @@ type TuningSpec struct {
 // field set alone is still checked against the other's default.
 // +kubebuilder:validation:XValidation:rule="(has(self.leaseSeconds) ? self.leaseSeconds : 90) >= 3 * (has(self.renewSeconds) ? self.renewSeconds : 20)",message="leaseSeconds must be at least three renewSeconds (defaults 90 and 20), so one late renewal doesn't expire a live task's lease"
 // +kubebuilder:validation:XValidation:rule="(has(self.restartGraceSeconds) ? self.restartGraceSeconds : 60) >= 2 * (has(self.renewSeconds) ? self.renewSeconds : 20)",message="restartGraceSeconds must be at least two renewSeconds (defaults 60 and 20), so a live worker renews at least twice inside a restarted dispatcher's grace"
-// +kubebuilder:validation:XValidation:rule="!has(self.childReserve) || !has(self.ceiling) || self.childReserve < self.ceiling",message="childReserve must be below ceiling: the reserve is a share of the ceiling that top-level tasks can't take"
 type ProfileTuning struct {
 	// Ceiling is the most profile tasks running at once across every profile
-	// on the install, of every kind. The dispatcher enforces it, reserving
-	// max(1, ceil(Ceiling/3)) of it for interactive tiers so unattended work
-	// can't starve people, and ChildReserve for child tasks so waiting parents
-	// can't hold every slot. The profile namespace's pod quota is derived
+	// on the install, of every kind. The dispatcher keeps two disjoint
+	// reserves in it, ChildReserve for child tasks (so waiting parents can't
+	// hold every slot) and max(1, ceil(Ceiling/3)) for interactive tiers (so
+	// unattended work can't starve people), trimmed child first to leave at
+	// least one slot for top-level unattended work. With the default
+	// reserves, ceilings of 1, 2 and 4 can't honour both in full, and the
+	// PlatformAgent warns. The profile namespace's pod quota is derived
 	// from it. Absent means maxInProgress's resolved value, so an install's
 	// footprint doesn't jump while both exist (spec-profiles-dispatch.md).
 	// +kubebuilder:validation:Minimum=1
@@ -868,7 +871,8 @@ type ProfileTuning struct {
 	// ChildReserve is the share of Ceiling kept for child tasks, which
 	// top-level tasks can't take. A parent holds its slot while its children
 	// run, so without it a ceiling full of waiting parents could never start
-	// their children. Absent means max(1, ceil(Ceiling/3)).
+	// their children. Absent means max(1, ceil(Ceiling/3)), trimmed to
+	// Ceiling-1 so one slot stays unreserved (none at a ceiling of 1).
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=999
 	// +optional
@@ -927,6 +931,10 @@ type ProfileTuning struct {
 	// +optional
 	WarmReplicas *int `json:"warmReplicas,omitempty"`
 }
+
+// MaxProfileCeiling is ProfileTuning.Ceiling's maximum, which the ceiling
+// also holds to when it defaults to maxInProgress.
+const MaxProfileCeiling = 1000
 
 // The ProfileTuning defaults. The ceiling's is maxInProgress's resolved
 // value, which the controller owns, and ChildReserve's is derived from the

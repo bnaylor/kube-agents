@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -129,15 +130,17 @@ func TestTheDispatcherIdentityHoldsOnlyItsContractGrants(t *testing.T) {
 		}
 	}
 	for _, p := range id.publish {
-		if strings.Contains(p, "TASKS.*") || strings.Contains(p, "profile-*") {
-			t.Errorf("the dispatcher's grant %s is a wildcard over consumers: a token wildcard reaches every session's consumer", p)
+		if strings.Contains(p, "TASKS") || strings.Contains(p, "PROFILE_SUBMITS.*") || strings.Contains(p, "profile-*") {
+			t.Errorf("the dispatcher's grant %s reaches TASKS or a wildcard of consumers: it reads only its own durables", p)
 		}
 	}
-	if slices.Contains(id.publish, "a2a.tasks.*.*.events") {
-		t.Error("the dispatcher may write any task's events; it should name the profiles it dispatches for")
+	for _, p := range id.publish {
+		if strings.HasSuffix(p, ".events") || p == "a2a.tasks.*.*.supervisor" {
+			t.Errorf("the dispatcher publishes %s: its terminals go on its profiles' .supervisor, so .events stays the executor's alone", p)
+		}
 	}
-	for _, want := range []string{"$KV.PROFILE_LEASES.>", "a2a.dispatch.*.*.*", "a2a.tasks.tse.*.events", "a2a.cap.verify.dispatcher",
-		"$JS.API.CONSUMER.MSG.NEXT.TASKS.profile-tse-read-top", "$JS.ACK.TASKS.profile-tse-read-child.>"} {
+	for _, want := range []string{"$KV.PROFILE_LEASES.>", "a2a.dispatch.*.*.*", "a2a.tasks.tse.*.supervisor", "a2a.cap.verify.dispatcher",
+		"$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-tse-read-top", "$JS.ACK.PROFILE_SUBMITS.profile-tse-read-child.>"} {
 		if !slices.Contains(id.publish, want) {
 			t.Errorf("the dispatcher can't publish %s", want)
 		}
@@ -300,24 +303,20 @@ func TestRemovingTheDispatcherImageRemovesTheDispatcher(t *testing.T) {
 	}
 }
 
-// With a dispatcher the TASKS budget carries the profile durables'
-// allowance; without one it is what it was.
-func TestTheTasksBudgetCarriesTheProfileDurablesWithADispatcher(t *testing.T) {
+// TASKS is sized for the sessions alone, dispatcher or not: the profiles'
+// durables live on PROFILE_SUBMITS, whose cap is their allowance.
+func TestTheProfileDurablesTakeNoTasksSlot(t *testing.T) {
 	agent := a2aTestAgent()
 	t.Setenv(a2aDispatcherImageEnvVar, "")
-	budget, created := a2aTasksConsumerBudget(agent), a2aTasksMaxConsumers(agent)
+	without := a2aTasksMaxConsumers(agent)
 	withDispatcher(t)
-	// A new stream is created with room for the durables...
-	if got := a2aTasksMaxConsumers(agent); got != max(budget+a2aProfileDurablesAllowed, a2aTasksMaxConsumersFloor) {
-		t.Errorf("a new TASKS with a dispatcher gets max_consumers %d, want %d", got, budget+a2aProfileDurablesAllowed)
+	if got := a2aTasksMaxConsumers(agent); got != without {
+		t.Errorf("a new TASKS with a dispatcher gets max_consumers %d, want %d as without one", got, without)
 	}
-	// ...but an existing one is held to the sessions' budget alone, so
-	// turning the dispatcher on never refuses provisioning on an install
-	// whose stream predates it (max_consumers can't be raised in place).
-	if got := a2aTasksConsumerBudget(agent); got != budget {
-		t.Errorf("the budget an existing stream is held to moved from %d to %d with a dispatcher", budget, got)
+	script := a2aProvisionScript(agent)
+	if !strings.Contains(script, "--max-consumers="+strconv.Itoa(a2aProfileDurablesAllowed)+" --defaults") || !strings.Contains(script, "stream add PROFILE_SUBMITS") {
+		t.Error("the provision script doesn't create PROFILE_SUBMITS with the durables' allowance as its cap")
 	}
-	_ = created
 }
 
 // The reserves are disjoint shares of the ceiling that always leave a slot
@@ -341,9 +340,12 @@ func TestTheDispatchReservesLeaveASlotForEveryKind(t *testing.T) {
 // the reserve that is short; the default ceiling honours both.
 func TestASmallCeilingWarnsWhichReserveIsShort(t *testing.T) {
 	for ceiling, want := range map[int][]string{
-		1: {"child reserve is 0 of 1", "interactive reserve is 0 of 1"},
-		2: {"interactive reserve is 0 of 1"},
+		1: {"child reserve is 0 of 1", "interactive reserve is 0 of 1", "at least 3"},
+		2: {"interactive reserve is 0 of 1", "at least 3"},
 		3: nil,
+		// Not monotonic: 4 is short where 3 isn't, and the advice is 5.
+		4: {"interactive reserve is 1 of 2", "at least 5"},
+		5: nil,
 		6: nil,
 	} {
 		agent := profileTunedAgent(ptr.To(ceiling), nil)
@@ -411,6 +413,20 @@ func TestATaskDeadlinePastTheCapIsClampedAndWarned(t *testing.T) {
 	}
 	if !warned {
 		t.Error("no warning for the clamped deadline")
+	}
+	// A refused profile has no tasks to cap, and gets no warning.
+	refused := testAgentProfile(agent.Namespace, "platform", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.Lifecycle.ActiveDeadlineSeconds = 86400
+	})
+	rec2 := record.NewFakeRecorder(10)
+	r2 := &PlatformAgentReconciler{Client: c, Scheme: scheme, Recorder: rec2}
+	if _, err := r2.reconcileA2ADispatcher(context.Background(), agent, []agentv1alpha1.AgentProfile{refused}, false); err != nil {
+		t.Fatal(err)
+	}
+	for len(rec2.Events) > 0 {
+		if e := <-rec2.Events; strings.Contains(e, reasonProfileDeadlineCapped) {
+			t.Errorf("a refused profile was warned about its deadline: %s", e)
+		}
 	}
 	env := map[string]string{}
 	for _, e := range buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers[0].Env {
