@@ -3352,6 +3352,11 @@ class GetCredentialsFlagsBetweenWordsTest(unittest.TestCase):
             # Unreadable (a flag of unknown arity) but carrying the verb.
             (["gcloud", "container", "--no-such-flag", "clusters", "get-credentials", "c"], True),
             (["gcloud", "container", "clusters", "list"], False),
+            # The verb as a positional of another command is that command.
+            (["gcloud", "container", "clusters", "describe", "get-credentials", "--zone", "z"], False),
+            (["gcloud", "container", "clusters", "list", "get-credentials"], False),
+            # An argv the walk can't read is routed only if it carries the verb.
+            (["gcloud", "container", "--no-such-flag", "clusters", "list"], False),
             (["kubectl", "container", "clusters", "get-credentials"], False),
         ):
             with self.subTest(argv=argv):
