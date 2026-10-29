@@ -315,7 +315,7 @@ paths:
   them.~~ Amended 10/28: the durables live on `PROFILE_SUBMITS`, whose `max_consumers` is
   their allowance (64, so 16 profiles with both tiers). They take no TASKS slot.
 
-**As built (amended 10/28, #3655).** The dispatcher is its own Deployment,
+**As built (amended 10/29, #3655).** The dispatcher is its own Deployment,
 `<agent>-a2a-dispatcher`: one replica, replaced with `Recreate`, since two at once would each
 enforce the ceiling against half the in-flight count. The mechanics the decisions above
 leave open:
@@ -338,16 +338,29 @@ leave open:
   the pod counts as busy in memory, and a dispatcher restarted mid-offer finds no record and
   dispatches the task afresh. With no free pod the submission waits over its cap and is
   redelivered. A record past its expiry doesn't keep its pod busy, and a sweep deletes records
-  long expired that no held submission has (a settle whose delete failed). Answers a pod sends
-  for tasks it doesn't hold are held to a small budget per pod.
+  long expired that no held submission has (its submission aged off the stream). Answers a pod
+  sends for tasks it doesn't hold are held to a small budget per pod.
 - **Holding.** The submission stays unacknowledged for the task's whole life. This replaces
   the subagent spec's ack after Job create. The worker renews on its `.lease` subject every
   `renewSeconds`, and the dispatcher extends the record by `leaseSeconds`. When the worker
   has published the task's terminal it sends a renewal with `final` set (`LeaseRenewal.Final`).
   The dispatcher has no read on `.events`, so that renewal is how it learns the task ended:
-  it acks the submission, waits for the server to confirm the ack, then deletes the record
-  and frees the slot. An expired lease or a passed deadline also tells the worker to abandon
-  the task.
+  it turns the record into a tombstone, acks the submission, waits for the server to confirm
+  the ack, then frees the slot. An expired lease or a passed deadline also tells the worker
+  to abandon the task.
+- **Tombstones.** `PROFILE_SUBMITS` keeps acked submissions for its 72h max age (limits
+  retention), so a durable re-created with DeliverAll replays every task it ever held. Every
+  outcome the dispatcher sees or writes is final: a `final` renewal, a `lease-expired` or
+  `deadline-exceeded` failure, a refusal at admission. On each it writes a tombstone before
+  it acks: the lease record under the same key with `finishedAt` set
+  (`LeaseRecord.FinishedAt`); a refusal, which no pod held, under the pod token `_refused`.
+  A submission that finds a tombstone is acked and nothing else: it is never offered,
+  adopted or given a second terminal, so a grant given since never runs a task once refused.
+  A tombstone keeps no pod busy and is never renewed or re-adopted; it is told from a
+  running lease by `finishedAt` alone, never by expiry, so an expired running lease is still
+  re-adopted under the restart grace and failed. The sweep deletes a tombstone, by revision,
+  once it is older than the stream's retention plus an hour (`lib.ProfileSubmitRetention`
+  until the dispatch config carries the stream's max age).
 - **Restart.** A re-adopted task's record gets `restartGraceSeconds` before an expired lease
   fails it, which covers the gap `Recreate` leaves. The record carries the deadline and
   intervals its offer did, so a re-adopted task keeps them whatever the config says now.

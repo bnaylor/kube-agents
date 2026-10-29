@@ -65,8 +65,9 @@ const (
 	// durables are bound. It is far longer than the held durables' AckWait
 	// and any restart grace, so a record whose submission can still come
 	// back has been re-adopted long before: what is left is a record whose
-	// submission is gone (a settle whose delete failed, or a crash between
-	// the ack and the delete).
+	// submission is gone (aged off the stream, or its durable deleted). A
+	// tombstone is not swept on this clock: it is kept for the submit
+	// stream's retention plus a margin.
 	DefaultSweepAfter = 30 * time.Minute
 	// DefaultSubmitter is the one principal whose submissions are held.
 	DefaultSubmitter = "gateway"

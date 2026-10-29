@@ -305,8 +305,32 @@ func (b *bus) submitWith(profile, tier, kind, taskID, capKey string, params map[
 	}
 }
 
-// leases lists the lease bucket's records by key.
+// leases lists the lease bucket's running records (no tombstones) by key.
 func (b *bus) leases() map[string]lib.LeaseRecord {
+	b.t.Helper()
+	out := map[string]lib.LeaseRecord{}
+	for k, rec := range b.records() {
+		if !rec.Finished() {
+			out[k] = rec
+		}
+	}
+	return out
+}
+
+// tombstones lists the lease bucket's tombstones by key.
+func (b *bus) tombstones() map[string]lib.LeaseRecord {
+	b.t.Helper()
+	out := map[string]lib.LeaseRecord{}
+	for k, rec := range b.records() {
+		if rec.Finished() {
+			out[k] = rec
+		}
+	}
+	return out
+}
+
+// records lists every record in the lease bucket by key.
+func (b *bus) records() map[string]lib.LeaseRecord {
 	b.t.Helper()
 	kv, err := b.js.KeyValue(b.ctx, lib.ProfileLeaseBucket)
 	if err != nil {

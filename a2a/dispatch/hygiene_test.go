@@ -106,9 +106,10 @@ func (s *stubDelivery) AckSync(context.Context) error {
 	return nil
 }
 
-// A settle deletes the lease record only once the server has confirmed the
-// ack: with the ack unconfirmed the submission could come back, and without
-// its record it would be offered again.
+// A settle writes the task's tombstone before it acks, and frees the slot
+// only once the server has confirmed the ack: the submission is never
+// without a record, so one that comes back (an unconfirmed ack, a replay)
+// is never offered again.
 func TestASettleWaitsForTheConfirmedAck(t *testing.T) {
 	b := newBus(t)
 	d, err := New(testConfig(), b.connect("dispatcher"), oneProfile("tse", 2).src, NewStaticPool(), &fakeVerifier{}, quietLog())
@@ -116,20 +117,24 @@ func TestASettleWaitsForTheConfirmedAck(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := b.putRecord("tse", "read", "tse-0", "task-1", time.Now().Add(time.Hour))
+	rec := b.records()[key]
 	h, _ := d.reserve(testDispatchConfig(6, testProfile("tse", 2)), testProfile("tse", 2), "read", lib.SubmitKindTop, "task-1")
 	del := &stubDelivery{syncFails: 3}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		d.settle(b.ctx, quietLog(), del, h, key)
+		d.settle(b.ctx, quietLog(), del, h, key, rec)
 	}()
 	time.Sleep(700 * time.Millisecond) // inside the unconfirmed retries
-	if _, ok := b.leases()[key]; !ok {
-		t.Fatal("the record was deleted before the server confirmed the ack")
+	if _, ok := b.tombstones()[key]; !ok {
+		t.Fatalf("no tombstone while the ack is unconfirmed: %v", b.records())
+	}
+	if d.holder(h.key()) == nil {
+		t.Fatal("the slot was freed before the server confirmed the ack")
 	}
 	<-done
-	if _, ok := b.leases()[key]; ok {
-		t.Error("the record outlived the confirmed ack")
+	if tomb, ok := b.tombstones()[key]; !ok || tomb.TaskID != "task-1" || tomb.Pod != "tse-0" {
+		t.Errorf("after the settle the record is %+v (tombstone %v), want task-1's tombstone on tse-0", tomb, ok)
 	}
 	if del.syncs != 4 {
 		t.Errorf("%d AckSync calls, want 4 (three unanswered, one confirmed)", del.syncs)
