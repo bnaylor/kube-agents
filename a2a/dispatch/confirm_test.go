@@ -94,7 +94,7 @@ func TestALostConfirmFailsTheTaskAndNeverRunsItTwice(t *testing.T) {
 	waitFor(t, 10*time.Second, "the confirm", func() bool { return w.confirmCount() == 1 })
 	ti.pool.Set("tse", "read", "tse-0", "tse-1")
 	ts := b.waitTerminal("task-1", 10*time.Second)
-	if ts.state != lib.StateFailed || !hasReason(ts, ReasonLeaseExpired) || ts.from != selfSession {
+	if ts.state != lib.StateFailed || !hasReason(ts, ReasonLeaseExpired) || ts.from != selfSession || ts.class != lib.TaskClassSupervisor {
 		t.Errorf("terminal %+v, want the dispatcher's failed lease-expired", ts)
 	}
 	time.Sleep(3 * time.Second) // many retry delays

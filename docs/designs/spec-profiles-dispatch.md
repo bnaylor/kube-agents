@@ -352,19 +352,22 @@ leave open:
   fails it, which covers the gap `Recreate` leaves. The record carries the deadline and
   intervals its offer did, so a re-adopted task keeps them whatever the config says now.
 - **Grants.** The callout fixes a connection's grants when it connects, and the dispatcher's
-  name each durable and each profile's `.events`. When the config adds a durable or a profile
+  name each durable and each profile's `.supervisor`. When the config adds a durable or a profile
   the dispatcher reconnects, retrying with backoff while the callout's map catches up. Tasks
   it holds keep running across the reconnect, which drains the old connection so answers it
-  had already received still arrive. The NATS spec's `TASKS` and callout amendments of 10/28
-  ([`spec-nats-deployment.md`](spec-nats-deployment.md)) say the same from the bus's side.
+  had already received still arrive. The NATS spec's `PROFILE_SUBMITS` and callout
+  amendments of 10/28 ([`spec-nats-deployment.md`](spec-nats-deployment.md)) say the same
+  from the bus's side.
 - **Off by default.** The operator renders the dispatcher only when its `A2A_DISPATCHER_IMAGE`
-  is set, until profiles dispatch end to end; with it unset there is no dispatcher, identity
-  or `TASKS` allowance for the profile durables.
-- **Terminal notice.** A task the dispatcher ends gets a final status on its `.events`:
-  `rejected` when it is refused at admission (nothing ran), `failed` once a worker had it. The
-  message is `reason: <code> - <detail>`, the executors' form, which the gateway already
-  reads. The codes are `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and
-  `queue-timeout` at admission, and `lease-expired` and `deadline-exceeded` while it holds.
+  is set, until profiles dispatch end to end; with it unset there is no dispatcher and no
+  identity for one.
+- **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
+  subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
+  the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
+  once a worker had it. The message is `reason: <code> - <detail>`, the executors' form, and
+  the gateway's relay already reads `.supervisor` beside `.events`. The codes are
+  `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and `queue-timeout` at
+  admission, and `lease-expired` and `deadline-exceeded` while it holds.
 
 ### Execution
 

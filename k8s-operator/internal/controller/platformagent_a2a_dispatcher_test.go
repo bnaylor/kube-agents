@@ -38,8 +38,9 @@ func withDispatcher(t *testing.T) {
 // with A2A_DISPATCHER_IMAGE unset the operator renders none of it, even
 // where the release set would resolve its image (OPERATOR_IMAGE set). No
 // Deployment, no dispatch ConfigMap, no identity-map entry (and none of
-// the operator's own grants for the profile durables), and TASKS at the
-// size it has with no dispatcher. Setting the image turns all of it on.
+// the operator's own grants for the profile durables). TASKS is the same
+// size either way: the durables are on PROFILE_SUBMITS (contract addendum
+// 7). Setting the image turns all of it on.
 func TestNoDispatcherImageRendersNoDispatcher(t *testing.T) {
 	agent := a2aTestAgent()
 	hasIdentity := func() bool {
@@ -66,8 +67,9 @@ func TestNoDispatcherImageRendersNoDispatcher(t *testing.T) {
 	if hasIdentity() {
 		t.Error("the identity map carries the dispatcher with A2A_DISPATCHER_IMAGE unset")
 	}
-	if got, want := a2aTasksMaxConsumers(agent), max(a2aTasksConsumerBudget(agent), a2aTasksMaxConsumersFloor); got != want || a2aProfileDurableAllowance() != 0 {
-		t.Errorf("TASKS is created at %d (allowance %d), want %d with no dispatcher", got, a2aProfileDurableAllowance(), want)
+	tasksWithout := a2aTasksMaxConsumers(agent)
+	if want := max(a2aTasksConsumerBudget(agent), a2aTasksMaxConsumersFloor); tasksWithout != want {
+		t.Errorf("TASKS is created at %d, want %d with no dispatcher", tasksWithout, want)
 	}
 	if got := a2aTasksMaxConsumers(&agentv1alpha1.PlatformAgent{}); got != a2aTasksMaxConsumersFloor {
 		t.Errorf("a default install's TASKS is created at %d, want the floor %d", got, a2aTasksMaxConsumersFloor)
@@ -99,8 +101,8 @@ func TestNoDispatcherImageRendersNoDispatcher(t *testing.T) {
 	if !hasIdentity() {
 		t.Error("with an image, the identity map has no dispatcher")
 	}
-	if a2aProfileDurableAllowance() != a2aProfileDurablesAllowed {
-		t.Error("with an image, TASKS carries no allowance for the profile durables")
+	if got := a2aTasksMaxConsumers(agent); got != tasksWithout {
+		t.Errorf("with an image, TASKS is created at %d, want %d: the profile durables take no TASKS slot", got, tasksWithout)
 	}
 	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, nil, true); err != nil || profileErr != nil {
 		t.Fatalf("reconcile with an image: %v / %v", err, profileErr)

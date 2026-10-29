@@ -944,7 +944,7 @@ func TestEnsureHeldConsumerRefusesWhenTheLookupFails(t *testing.T) {
 // reaches the handler.
 func TestSubscribeHeldTakesASubmissionIntake(t *testing.T) {
 	s := startServer(t)
-	provisionTasksStream(t, clientURL(s))
+	provisionProfileSubmitStream(t, clientURL(s))
 	ctx := testCtx(t)
 	gw, err := Connect(ctx, clientURL(s), WithName("gateway"))
 	if err != nil {
@@ -958,7 +958,7 @@ func TestSubscribeHeldTakesASubmissionIntake(t *testing.T) {
 	defer disp.Close()
 	const profile = "cluster-agent"
 	cfg := SubscribeConfig{
-		Stream: "TASKS", Durable: "profile-cluster-agent-read-top",
+		Stream: ProfileSubmitStream, Durable: "profile-cluster-agent-read-top",
 		Subject:   TaskSubmitSubject(profile, "read", SubmitKindTop, "*"),
 		Session:   profile,
 		Agreement: &AgreementPolicy{Submitter: "gateway"},
@@ -1014,11 +1014,12 @@ func TestSubscribeHeldRefusesASubmissionIntakeWithoutASubmitter(t *testing.T) {
 		t.Errorf("SubscribeHeld on a submission intake with no submitter = %v, want refused", err)
 	}
 	for _, subject := range []string{
-		"a2a.tasks.subm.*.top.*.submit",  // wildcard tier
-		"a2a.tasks.subm.read.*.*.submit", // wildcard kind
-		"a2a.tasks.*.read.top.*.submit",  // wildcard profile
-		"a2a.tasks.subm.read.top.task-1.submit",
-		"a2a.tasks.subm.read.top.>",
+		"a2a.submit.subm.*.top.*",  // wildcard tier
+		"a2a.submit.subm.read.*.*", // wildcard kind
+		"a2a.submit.*.read.top.*",  // wildcard profile
+		"a2a.submit.subm.read.top.task-1",
+		"a2a.submit.subm.read.top.>",
+		"a2a.tasks.subm.read.top.*.submit", // the old shape, gone (addendum 7)
 	} {
 		cfg := h.cfg()
 		cfg.Subject = subject

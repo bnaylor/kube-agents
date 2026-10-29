@@ -12,9 +12,9 @@ import (
 )
 
 // The callout fixes the dispatcher's grants per connection, enumerating the
-// durables and the profiles' `.events` in the config it rendered against.
+// durables and the profiles' `.supervisor` in the config it rendered against.
 // Modelled here with two users: "disp-old", which may not touch the
-// durables of profile `tse2` nor publish on its `.events`, and "disp-new",
+// durables of profile `tse2` nor publish on its `.supervisor`, and "disp-new",
 // which may. The dispatcher's connection authenticates as
 // whichever the test says, read at each dial, as a fresh token would be.
 
@@ -24,9 +24,10 @@ func dispatcherUsers() []*natsserver.User {
 	var deny []string
 	for _, kind := range submitKinds {
 		name := lib.ProfileDurableName("tse2", "read", kind)
-		deny = append(deny, "$JS.API.CONSUMER.INFO.TASKS."+name, "$JS.API.CONSUMER.MSG.NEXT.TASKS."+name, "$JS.ACK.TASKS."+name+".>")
+		deny = append(deny, "$JS.API.CONSUMER.INFO."+lib.ProfileSubmitStream+"."+name,
+			"$JS.API.CONSUMER.MSG.NEXT."+lib.ProfileSubmitStream+"."+name, "$JS.ACK."+lib.ProfileSubmitStream+"."+name+".>")
 	}
-	deny = append(deny, "a2a.tasks.tse2.*.events")
+	deny = append(deny, "a2a.tasks.tse2.*.supervisor")
 	return []*natsserver.User{
 		{Username: "disp-old", Password: dispPass, Permissions: &natsserver.Permissions{
 			Publish: &natsserver.SubjectPermission{Allow: []string{">"}, Deny: deny}}},
@@ -86,10 +87,10 @@ func TestAnAddedDurableReconnectsOnceAndKeepsHeldWork(t *testing.T) {
 	if ts := b.waitTerminal("task-2", 15*time.Second); ts.state != lib.StateCompleted || ts.from != "tse2-0" {
 		t.Errorf("task-2 on the added profile: %+v", ts)
 	}
-	// The dispatcher's own `.events` publish for the new profile rides the
+	// The dispatcher's own `.supervisor` publish for the new profile rides the
 	// new grants too: a refusal's terminal lands.
 	b.submitWith("tse2", "read", lib.SubmitKindTop, "task-refused", "", map[string]string{})
-	if ts := b.waitTerminal("task-refused", 15*time.Second); ts.state != lib.StateRejected || ts.from != selfSession {
+	if ts := b.waitTerminal("task-refused", 15*time.Second); ts.state != lib.StateRejected || ts.from != selfSession || ts.class != lib.TaskClassSupervisor {
 		t.Errorf("the dispatcher's terminal on the added profile: %+v", ts)
 	}
 	if ts := b.waitTerminal("task-1", 15*time.Second); ts.state != lib.StateCompleted || ts.from != "tse-0" {
@@ -101,7 +102,7 @@ func TestAnAddedDurableReconnectsOnceAndKeepsHeldWork(t *testing.T) {
 	if w2.offerCount() != 1 {
 		t.Errorf("task-2 offered %d times", w2.offerCount())
 	}
-	cons, err := b.js.Consumer(b.ctx, "TASKS", lib.ProfileDurableName("tse", "read", lib.SubmitKindTop))
+	cons, err := b.js.Consumer(b.ctx, lib.ProfileSubmitStream, lib.ProfileDurableName("tse", "read", lib.SubmitKindTop))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -50,12 +50,12 @@ func noticeText(reason, detail string) string {
 	return noticeReasonPrefix + reason + noticeDetailSeparator + detail
 }
 
-// publishTerminal is the dispatcher's one write to a task's `.events`: a
-// final status update, `rejected` for a submission refused at admission
-// (nothing ran) or `failed` once a worker had it. Every terminal the
-// dispatcher writes goes through here, so where it goes (`.events`, decided
-// in contract addendum 1, or a `.supervisor` notice if that decision is
-// revisited) is this function's business alone.
+// publishTerminal is the dispatcher's one write to a task: a final status
+// update on its `.supervisor` subject (lib.TaskSupervisorSubject, contract
+// addendum 6), `rejected` for a submission refused at admission (nothing
+// ran) or `failed` once a worker had it. `.supervisor`, not `.events`, so
+// `.events` stays the executor's alone and replay can tell the two apart.
+// Every terminal the dispatcher writes goes through here.
 func (d *Dispatcher) publishTerminal(ctx context.Context, profile string, sub *lib.Envelope, state lib.TaskState, reason, detail string) error {
 	payload, err := json.Marshal(lib.StatusUpdate{
 		TaskID:    sub.TaskID,
@@ -76,5 +76,5 @@ func (d *Dispatcher) publishTerminal(ctx context.Context, profile string, sub *l
 	if err != nil {
 		return fmt.Errorf("build the %s terminal: %w", reason, err)
 	}
-	return d.bus.Publish(ctx, lib.TaskEventsSubject(profile, sub.TaskID), env)
+	return d.bus.Publish(ctx, lib.TaskSupervisorSubject(profile, sub.TaskID), env)
 }

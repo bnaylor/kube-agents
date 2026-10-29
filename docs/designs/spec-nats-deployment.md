@@ -53,11 +53,6 @@ Streams bind to the payload spec's subjects and topic classes:
 | `TOPICS-STATE`    | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3                      | Read latest-per-subject                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `TOPICS-JOURNAL`  | journal-class topics | `max_age: 30d`, R3                                               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
-Amended 10/28 (#3655): `TASKS`' profile consumers are one shared durable per (profile,
-tier, kind) on `a2a.tasks.{profile}.{tier}.{kind}.*.submit`, created by the operator and read
-only by the dispatcher, each with its own `MaxAckPending`, in place of one per profile on
-`…in`. The dispatcher holds each submission unacknowledged for its task's life.
-
 State and journal topics both live under `a2a.topics.>`, so the two topic streams' subject
 lists are rendered per topic from the provisioned registry - which topics exist is already
 config, and the retention class lives there too. Shared fan-out (blueprints, config
@@ -501,11 +496,7 @@ Layout:
   The trade is stated where it is made: an install that raises `maxSessions` raises
   `web`'s unreapable-durable ceiling in the same proportion. Deriving downward on a small
   install would silently tighten a working one, so the render takes the larger of 64 and
-  the derived budget. Amended 10/28 (#3655): with the AgentProfile dispatcher rendered, a
-  stream created then also carries 64 slots for its durables, one per (profile, tier,
-  kind); a stream that already exists is held to the sessions' budget alone and is never
-  refused for those slots. The dispatcher is off by default, so a default install's
-  `TASKS` is still created at 64. Because creates never edit, an install whose `maxSessions` already
+  the derived budget. Because creates never edit, an install whose `maxSessions` already
   exceeds what its stream holds is under-provisioned today, and the check is reached on
   an operator upgrade alone with no CR edit involved - it runs last, after every other
   stream and bucket, so the refusal leaves a fully provisioned bus short one limit rather

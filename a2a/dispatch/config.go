@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"slices"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 const (
@@ -68,8 +70,10 @@ const (
 	DefaultSweepAfter = 30 * time.Minute
 	// DefaultSubmitter is the one principal whose submissions are held.
 	DefaultSubmitter = "gateway"
-	// DefaultStream is the stream the durables are on.
-	DefaultStream = "TASKS"
+	// DefaultStream is the stream the durables are on: profile submissions
+	// have their own (contract addendum 7), so only the operator can make a
+	// consumer on it.
+	DefaultStream = lib.ProfileSubmitStream
 	// DefaultUnattendedTier is the one unattended tier until tier CRs say
 	// which tiers are.
 	DefaultUnattendedTier = "unattended"

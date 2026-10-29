@@ -50,7 +50,7 @@ func TestAdmissionRefusalsAreVisibleAndTerminal(t *testing.T) {
 	}
 	for id, reason := range want {
 		ts := b.waitTerminal(id, 10*time.Second)
-		if ts.state != lib.StateRejected || !hasReason(ts, reason) || ts.from != selfSession {
+		if ts.state != lib.StateRejected || !hasReason(ts, reason) || ts.from != selfSession || ts.class != lib.TaskClassSupervisor {
 			t.Errorf("%s: terminal %+v, want the dispatcher's rejected %s", id, ts, reason)
 		}
 	}

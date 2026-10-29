@@ -176,7 +176,7 @@ func TestAnExpiredLeaseIsTerminalAndNeverReRun(t *testing.T) {
 	w0.kill()
 	w1.kill()
 	ts := b.waitTerminal("task-1", 10*time.Second)
-	if ts.state != lib.StateFailed || !hasReason(ts, ReasonLeaseExpired) || ts.from != selfSession {
+	if ts.state != lib.StateFailed || !hasReason(ts, ReasonLeaseExpired) || ts.from != selfSession || ts.class != lib.TaskClassSupervisor {
 		t.Errorf("terminal %+v, want the dispatcher's failed lease-expired", ts)
 	}
 	time.Sleep(4 * time.Second) // more than a lease, many retry delays

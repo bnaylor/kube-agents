@@ -85,7 +85,8 @@ type HeldConsumerConfig struct {
 	Stream  string
 	Durable string
 	// FilterSubject is the intake: one (profile, tier, kind)'s submissions,
-	// `a2a.tasks.<profile>.<tier>.<kind>.*.submit`, or a profile's
+	// `a2a.submit.<profile>.<tier>.<kind>.*` on ProfileSubmitStream, or a
+	// profile's
 	// `a2a.tasks.<profile>.*.in`.
 	FilterSubject string
 	// MaxAckPending is the most deliveries held unacknowledged at once.
@@ -219,8 +220,8 @@ type HeldSubscription interface {
 // is paced from the durable's own AckWait.
 // The intake is one profile's: either `a2a.tasks.<profile>.*.in`, the shape
 // ParseTaskSubject knows, or one (profile, tier, kind)'s submissions,
-// `a2a.tasks.<profile>.<tier>.<top|child>.*.submit` (ParseSubmitSubject),
-// which is the dispatcher's. Envelope-subject agreement and the session
+// `a2a.submit.<profile>.<tier>.<top|child>.*` (ParseSubmitSubject) on
+// ProfileSubmitStream, which is the dispatcher's. Envelope-subject agreement and the session
 // filter apply as in SubscribeDurable; cfg.Session must be that profile, so
 // the filter can't silently drop every task. A submission intake also needs
 // the agreement policy's Submitter named (the gateway), so only the gateway's
@@ -244,7 +245,7 @@ func (c *Client) SubscribeHeld(ctx context.Context, cfg SubscribeConfig, handler
 	// literal equal to Session.
 	addressee, submit, ok := heldIntake(cfg.Subject)
 	if !ok {
-		return nil, fmt.Errorf("SubscribeHeld: %q is not one profile's intake (a2a.tasks.<profile>.*.in, or a2a.tasks.<profile>.<tier>.<top|child>.*.submit)", cfg.Subject)
+		return nil, fmt.Errorf("SubscribeHeld: %q is not one profile's intake (a2a.tasks.<profile>.*.in, or a2a.submit.<profile>.<tier>.<top|child>.*)", cfg.Subject)
 	}
 	if cfg.Session != addressee {
 		return nil, fmt.Errorf("SubscribeHeld: Session %q is not the intake's addressee %q; the session filter would ack every task away", cfg.Session, addressee)
@@ -275,7 +276,7 @@ func (c *Client) SubscribeHeld(ctx context.Context, cfg SubscribeConfig, handler
 // whether it is the submission shape. Two shapes are a held intake: one
 // profile's `.in` (`a2a.tasks.<profile>.*.in`, the warm-worker shape #3679
 // shipped) and one (profile, tier, kind)'s submissions
-// (`a2a.tasks.<profile>.<tier>.<top|child>.*.submit`, the dispatcher's, #3660).
+// (`a2a.submit.<profile>.<tier>.<top|child>.*`, the dispatcher's, #3660).
 // Every token but the task's must be a literal.
 func heldIntake(subject string) (addressee string, submit, ok bool) {
 	if a, task, class, ok := ParseTaskSubject(subject); ok {

@@ -47,10 +47,10 @@ import (
 const (
 	// a2aDispatcherImageEnvVar names the dispatcher's image, and setting it
 	// is the only way to turn the dispatcher on. Unset, the operator renders
-	// no dispatcher at all, not its identity, its grants, its TASKS
-	// allowance nor its Deployment: until profiles dispatch end to end (the
-	// worker's side is #3655's PR 5) it would be an idle component that
-	// costs every next install 64 TASKS consumer slots and a principal.
+	// no dispatcher at all, not its identity, its grants nor its
+	// Deployment: until profiles dispatch end to end (the worker's side is
+	// #3655's PR 5) it would be an idle component that costs every next
+	// install a principal and a pod.
 	// a2aDispatcherImageName is its name in the release set, which it is
 	// built and published under already; a2aDispatcherReleaseImage resolves
 	// it, so turning the default on is one line in a2aDispatcherImage.

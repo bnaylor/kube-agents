@@ -168,7 +168,7 @@ type Dispatcher struct {
 	binding    map[string]bool
 	draining   []lib.HeldSubscription
 	// granted is the durables, and grantedProfiles the profiles (their
-	// `.events` publish), the current connection's grants cover: the callout
+	// `.supervisor` publish), the current connection's grants cover: the callout
 	// fixes a principal's grants per connection, from the config the
 	// operator rendered when it connected. A config listing a durable or a
 	// profile outside them needs a reconnect first.
@@ -401,7 +401,7 @@ func (d *Dispatcher) regrant(ctx context.Context, want map[string]string, durabl
 			d.log.Warn("reconnect for new durables' grants", "attempt", attempt, "err", err)
 			continue
 		}
-		// A profile's `.events` grant can't be probed without publishing;
+		// A profile's `.supervisor` grant can't be probed without publishing;
 		// the reconnect is what carries it.
 		d.mu.Lock()
 		for _, p := range addedProfiles {

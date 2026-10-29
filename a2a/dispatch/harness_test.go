@@ -22,7 +22,7 @@ import (
 )
 
 // The test bus: an embedded JetStream server (the a2a/mcp testBus shape)
-// with the TASKS stream, the PROFILE_LEASES bucket, an admin user for the
+// with the TASKS and PROFILE_SUBMITS streams, the PROFILE_LEASES bucket, an admin user for the
 // gateway, the dispatcher and the test, and one user per worker pod holding
 // only the contract's worker grants. No worker can touch the lease bucket,
 // so every test is also a test that the dispatcher is its only writer.
@@ -115,6 +115,9 @@ type terminalSeen struct {
 	state lib.TaskState
 	text  string
 	from  string
+	// class is the subject's last token: an executor's terminal is on
+	// `.events`, the dispatcher's on `.supervisor` (contract addendum 6).
+	class string
 }
 
 func workerUser(pod string) string { return "w-" + pod }
@@ -168,12 +171,21 @@ func newBusWith(t *testing.T, extra []*natsserver.User, pods ...string) *bus {
 		Retention: jetstream.LimitsPolicy, MaxAge: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
+	// Profile submissions' own stream (contract addendum 7), one message per
+	// subject as provisioned.
+	if _, err := b.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{Name: lib.ProfileSubmitStream,
+		Subjects: []string{lib.SubmitSubjectPrefix + ">"}, Retention: jetstream.LimitsPolicy, MaxAge: time.Hour,
+		MaxMsgsPerSubject: 1, Duplicates: 2 * time.Minute}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := b.js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: lib.ProfileLeaseBucket, History: 1}); err != nil {
 		t.Fatal(err)
 	}
 	b.gateway = b.connect("gateway")
-	if _, err := b.admin.Subscribe("a2a.tasks.*.*.events", b.onEvent); err != nil {
-		t.Fatal(err)
+	for _, class := range []string{lib.TaskClassEvents, lib.TaskClassSupervisor} {
+		if _, err := b.admin.Subscribe("a2a.tasks.*.*."+class, b.onEvent); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return b
 }
@@ -201,6 +213,10 @@ func (b *bus) onEvent(msg *nats.Msg) {
 	if err != nil || env.Kind != lib.KindStatusUpdate {
 		return
 	}
+	_, _, class, ok := lib.ParseTaskSubject(msg.Subject)
+	if !ok {
+		return
+	}
 	var su lib.StatusUpdate
 	if json.Unmarshal(env.Payload, &su) != nil || !su.Final {
 		return
@@ -210,7 +226,7 @@ func (b *bus) onEvent(msg *nats.Msg) {
 		text = su.Status.Message.Parts[0].Text
 	}
 	b.mu.Lock()
-	b.terminals[env.TaskID] = append(b.terminals[env.TaskID], terminalSeen{su.Status.State, text, env.From.Session})
+	b.terminals[env.TaskID] = append(b.terminals[env.TaskID], terminalSeen{su.Status.State, text, env.From.Session, class})
 	b.mu.Unlock()
 }
 
@@ -240,7 +256,7 @@ func (b *bus) ensure(profile string, maxAckPending int, ackWait time.Duration, t
 	b.t.Helper()
 	for _, tier := range tiers {
 		for _, kind := range submitKinds {
-			if err := b.gateway.EnsureHeldConsumer(b.ctx, lib.HeldConsumerConfig{Stream: "TASKS",
+			if err := b.gateway.EnsureHeldConsumer(b.ctx, lib.HeldConsumerConfig{Stream: lib.ProfileSubmitStream,
 				Durable: lib.ProfileDurableName(profile, tier, kind), FilterSubject: lib.ProfileDurableFilter(profile, tier, kind),
 				MaxAckPending: maxAckPending, AckWait: ackWait}); err != nil {
 				b.t.Fatalf("EnsureHeldConsumer: %v", err)
@@ -317,7 +333,7 @@ func (b *bus) leases() map[string]lib.LeaseRecord {
 // many it still has to deliver.
 func (b *bus) pending(durable string) (ackPending int, numPending uint64) {
 	b.t.Helper()
-	c, err := b.js.Consumer(b.ctx, "TASKS", durable)
+	c, err := b.js.Consumer(b.ctx, lib.ProfileSubmitStream, durable)
 	if err != nil {
 		b.t.Fatal(err)
 	}

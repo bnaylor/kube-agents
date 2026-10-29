@@ -244,8 +244,8 @@ profile's dispatch. Notes on the mechanics:
 
 **Amended 10/28 (#3655):** the dispatcher is its own Deployment (`<agent>-a2a-dispatcher`,
 one replica, replaced with `Recreate`), not a controller in the operator, and it reads one
-shared durable per (profile, tier, kind) on the `.submit` subjects rather than one per
-profile on `…in`. Ack-after-create is replaced by holding: the dispatcher keeps each
+shared durable per (profile, tier, kind) on `PROFILE_SUBMITS` (`a2a.submit.>`) rather than
+one per profile on `…in`. Ack-after-create is replaced by holding: the dispatcher keeps each
 submission unacknowledged for the task's whole life, with in-progress acks, and acks it
 only when the task ends (the worker's final lease renewal, an expired lease, or a passed
 deadline). A restart therefore redelivers every held task, and the task's lease record
