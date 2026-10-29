@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	natsserver "github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/dispatch"
@@ -52,11 +56,84 @@ func TestReadSettingsNeedsTheBusTheNamespaceAndTheConfigMap(t *testing.T) {
 	}
 }
 
-func TestTheVerifierFailsClosedUntilProfileRunLands(t *testing.T) {
-	err := unavailableVerifier{}.CheckProfileRun(context.Background(), capability.Ref{Key: "k", Revision: 1}, "tse", "read", "namespace/x")
+// The binary's verifier is capability.Client's profile.run, asked as the
+// dispatcher on the bus client's current connection: the verifier's verdict
+// is the answer either way, a connection the client replaced is not used,
+// and with nobody answering the check is a refusal, never a permit.
+func TestTheVerifierAsksProfileRunOnTheCurrentConnection(t *testing.T) {
+	opts := &natsserver.Options{Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true}
+	srv, err := natsserver.NewServer(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go srv.Start()
+	if !srv.ReadyForConnections(10 * time.Second) {
+		t.Fatal("nats-server not ready")
+	}
+	defer srv.Shutdown()
+	dial := func() *nats.Conn {
+		nc, err := nats.Connect(srv.ClientURL())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(nc.Close)
+		return nc
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	ref := capability.Ref{Key: "cap-ok", Revision: 1}
+	var current atomic.Pointer[nats.Conn]
+	current.Store(dial())
+	v := busVerifier{conn: current.Load}
+
+	// Nobody answers: a refusal, within the caller's ctx.
+	nctx, ncancel := context.WithTimeout(ctx, 2*time.Second)
+	err = v.CheckProfileRun(nctx, ref, "tse", "read", "namespace/ka")
+	ncancel()
 	var r *capability.Refusal
 	if !errors.As(err, &r) {
-		t.Fatalf("got %v, want a refusal", err)
+		t.Fatalf("with no verifier, got %v, want a refusal", err)
+	}
+
+	verifier := dial()
+	var asked atomic.Pointer[capability.Request]
+	verify, err := capability.VerifySubject(natsUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.Subscribe(verify, func(m *nats.Msg) {
+		var req capability.Request
+		_ = json.Unmarshal(m.Data, &req)
+		asked.Store(&req)
+		resp := capability.Response{Allowed: req.Ref.Key == "cap-ok"}
+		if !resp.Allowed {
+			resp.Reason = "not this one"
+		}
+		b, _ := json.Marshal(resp)
+		_ = verifier.Publish(m.Reply, b)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifier.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	// The client replaced its connection: the old one is closed.
+	current.Load().Close()
+	current.Store(dial())
+	if err := v.CheckProfileRun(ctx, ref, "tse", "read", "namespace/ka"); err != nil {
+		t.Fatalf("permitted ref: %v", err)
+	}
+	if req := asked.Load(); req == nil || req.Verb != capability.VerbProfileRun || req.Profile != "tse" ||
+		req.Tier != "read" || req.Resource != "namespace/ka" || req.Ref != ref {
+		t.Errorf("the verifier was asked %+v, want profile.run for tse at read on namespace/ka", req)
+	}
+	err = v.CheckProfileRun(ctx, capability.Ref{Key: "cap-bad", Revision: 1}, "tse", "read", "namespace/ka")
+	if !errors.As(err, &r) || capability.Reason(err) != "not this one" {
+		t.Errorf("refused ref: got %v, want the verifier's refusal", err)
+	}
+	current.Store(nil)
+	if err := v.CheckProfileRun(ctx, ref, "tse", "read", "namespace/ka"); !errors.As(err, &r) {
+		t.Errorf("with no connection, got %v, want a refusal", err)
 	}
 }
 

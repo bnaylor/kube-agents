@@ -55,18 +55,29 @@ const (
 	clientName      = "a2a-dispatcher"
 )
 
-// errProfileRunUnavailable is the verifier's answer until #3734's
-// capability.Client.CheckProfileRun is on main: every submission is refused
-// verifier-refused, so the dispatcher fails closed rather than running
-// unverified work.
-var errProfileRunUnavailable = &capability.Refusal{Rule: "the profile.run verb is not available in this build"}
+// busVerifier is the dispatcher's verifier: capability.Client's
+// CheckProfileRun (profile.run, #3734), asked as natsUser on the bus
+// client's current connection. A capability.Client is bound to one
+// connection, and the dispatcher replaces its connection when its grants
+// change (lib.Client.Reconnect), so one is built per check: it is only the
+// connection and a subject, and the check's reply subscription ends with
+// the check. Any error, an unreachable verifier included, is a refusal.
+type busVerifier struct {
+	conn func() *nats.Conn
+	log  *slog.Logger
+}
 
-// unavailableVerifier stands in for capability.Client until #3734 lands;
-// then this becomes capability.NewClient(nc, natsUser).
-type unavailableVerifier struct{}
-
-func (unavailableVerifier) CheckProfileRun(context.Context, capability.Ref, string, capability.Tier, capability.Scope) error {
-	return errProfileRunUnavailable
+func (v busVerifier) CheckProfileRun(ctx context.Context, ref capability.Ref, profile string, tier capability.Tier, target capability.Scope) error {
+	nc := v.conn()
+	if nc == nil {
+		return &capability.Refusal{Rule: "the dispatcher is not connected to the bus"}
+	}
+	c, err := capability.NewClient(nc, natsUser)
+	if err != nil {
+		return err
+	}
+	c.Log = v.log
+	return c.CheckProfileRun(ctx, ref, profile, tier, target)
 }
 
 // errProfileNamespaceMoved ends the process when the config's profile
@@ -161,7 +172,7 @@ func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.In
 	}
 	defer client.Close()
 	pr.setBus(func() bool { return client.Conn().IsConnected() })
-	d, err := dispatch.New(dispatch.DefaultConfig(), client, store, pool, unavailableVerifier{}, log)
+	d, err := dispatch.New(dispatch.DefaultConfig(), client, store, pool, busVerifier{conn: client.Conn, log: log}, log)
 	if err != nil {
 		return err
 	}
