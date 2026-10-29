@@ -817,7 +817,12 @@ def main(data_dir: Path | None = None) -> int:
 
 def _hand_off(data_dir: Path, marker: Path) -> None:
     try:
-        bootstrap_handoff.hand_off(data_dir, marker, _parse_task_id, roster=cluster_agents)
+        # The uncapped roster budgets the time limit for a sweep whose marker
+        # pinned nothing: a failed listing at filing still sent the worker to
+        # audit every cluster past the cap.
+        bootstrap_handoff.hand_off(
+            data_dir, marker, _parse_task_id, roster=cluster_agents, full_roster=lambda: cluster_agents(capped=False)
+        )
     except Exception as e:  # noqa: BLE001 - never fail the cron run; the next tick retries
         sys.stderr.write(f"bootstrap_scan_gate: hand-off failed: {e!r}\n")
 

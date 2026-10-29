@@ -716,6 +716,48 @@ class HandOffTest(unittest.TestCase):
             self.assertIsNone(self._run_roster([self._agent(f"t_{i}") for i in range(4)]))
         self.assertEqual(len(sent), 2)
 
+    def _unpinned_at(self, now, full_roster):
+        # #3702: a marker that pinned nothing (an empty or failed listing at
+        # filing), cap 6, six cluster cards, and 200 ready agents now.
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\ncap=6\n")
+        self.board.unlink(missing_ok=True)
+        # Four done with findings and two still running: six cards, so the
+        # timed-out hand-off has audits to rank.
+        _board(self.board, clusters=_all_done() + [(f"t_run{i}", "running", None, "") for i in range(2)])
+        with self._stub_kanban([]):
+            return h.hand_off(self.d, self.scan_marker, None, roster=[], now=now, full_roster=full_roster)
+
+    def test_an_unpinned_sweep_budgets_the_live_roster_past_the_cap(self):
+        roster = [self._agent(f"t_{i:03d}") for i in range(200)]
+        filed_at = NOW - 60
+        self.assertEqual(h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * (6 + 194), 63600)
+        self.assertIsNone(self._unpinned_at(filed_at + h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * 6 + 1, lambda: roster))
+        self.assertIsNone(self._unpinned_at(filed_at + 63600 - 1, lambda: roster))
+        self.assertFalse((self.d / "INVENTORY.raw.md").exists())
+        self.assertEqual(self._unpinned_at(filed_at + 63600, lambda: roster), "t_rank1")
+        self.assertIn("stopped waiting", (self.d / "INVENTORY.raw.md").read_text())
+
+    def test_a_full_roster_that_raises_reads_as_no_live_budget(self):
+        def broken():
+            raise OSError("profiles unreadable")
+
+        with mock.patch.object(h, "_log"):
+            self.assertEqual(
+                self._unpinned_at(NOW - 60 + h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * 6, broken), "t_rank1"
+            )
+
+    def test_a_pinned_marker_ignores_the_live_roster(self):
+        marker = self.d / "pinned"
+        roster = [self._agent(f"t_{i}") for i in range(200)]
+        marker.write_text("task_id=t\ncap=6\nuncarded=4\n")
+        self.assertEqual(h.uncarded_budget(marker, 6, roster), 4)
+        marker.write_text(f"task_id=t\ncap=6\ncarded={h.CLUSTER_KEY_PREFIX}t_0\n")
+        self.assertEqual(h.uncarded_budget(marker, 6, roster), 0)
+        marker.write_text("task_id=t\ncap=6\n")
+        self.assertEqual(h.uncarded_budget(marker, 6, roster), 194)
+        self.assertEqual(h.uncarded_budget(marker, 6, None), 0)
+        self.assertEqual(h.uncarded_budget(marker, 6, [self._agent("t")] * 5000), h.FIRST_RUN_UNCARDED_MAX)
+
     def test_a_roster_under_the_cap_files_every_card(self):
         _board(self.board, clusters=[])
         sent = []

@@ -299,8 +299,9 @@ cluster cards filed for the onboarding discovery sweep, read from the agent pod'
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
 card for anything else), or, with `cap`, one of the first-run cap's two (#3702):
-`cards_for_first_cap_profiles` (cards for exactly the first `cap` profiles by name) and
-`past_cap_clusters_sweep_audited` (every cluster past the cap shown in the sandbox's
+`cards_for_first_cap_profiles` (cards for exactly the carded profiles: the sweep marker's
+`carded=` set when it has one, else the first `cap` profiles by name) and
+`past_cap_clusters_sweep_audited` (every roster cluster outside that set shown in the sandbox's
 `INVENTORY.raw.md` as audited by the sweep itself).
 
 `bootstrap_handoff` reads both ends of the sweep's hand-off to the prioritization stage. Its

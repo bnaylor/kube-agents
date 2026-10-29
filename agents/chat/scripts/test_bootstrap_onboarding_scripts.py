@@ -2516,8 +2516,13 @@ class ScanGateTest(unittest.TestCase):
             rc, out = self._run()
         self.assertEqual((rc, out, self.filed), (0, "", []))
         hand_off.assert_called_once_with(
-            self.d, self.d / SCAN_FILED, bootstrap_scan_gate._parse_task_id, roster=bootstrap_scan_gate.cluster_agents
+            self.d, self.d / SCAN_FILED, bootstrap_scan_gate._parse_task_id, roster=bootstrap_scan_gate.cluster_agents,
+            full_roster=mock.ANY,
         )
+        # The uncapped roster, for the time limit of a sweep the marker did not pin.
+        with mock.patch.object(bootstrap_scan_gate, "cluster_agents", return_value=["x"]) as listing:
+            self.assertEqual(hand_off.call_args.kwargs["full_roster"](), ["x"])
+        listing.assert_called_once_with(capped=False)
 
     def test_filing_the_sweep_files_the_cluster_cards_in_the_same_tick(self):
         with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off") as hand_off:

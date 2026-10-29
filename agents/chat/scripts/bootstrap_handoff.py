@@ -264,6 +264,33 @@ def carded_keys(marker: Path) -> frozenset[str] | None:
     return frozenset(keys[:FIRST_RUN_CLUSTER_CARDS_MAX])
 
 
+def uncarded_budget(scan_marker: Path, cap: int, full_roster=None) -> int:
+    """How many uncarded clusters the hand-off's time limit budgets for (#3702).
+
+    The marker's ``uncarded=`` when the gate pinned the sweep (it recorded
+    ``uncarded=`` or ``carded=``). A sweep it did not pin, because the listing
+    came back empty when it was filed (failed, or no Cluster Agent yet), or an
+    older build filed it, has no count, yet its worker was told to audit every
+    cluster without a card, including those past the cap on the live roster;
+    the deadline must still cover them. So the count is read from
+    ``full_roster``, the ready Cluster Agents uncapped (a list, or a callable
+    that returns one): how many exceed ``cap``, at most FIRST_RUN_UNCARDED_MAX.
+    Zero without it, or when the callable raises.
+    """
+    pinned = uncarded_agents(scan_marker)
+    if pinned > 0 or carded_keys(scan_marker) is not None:
+        return pinned
+    if callable(full_roster):
+        try:
+            full_roster = full_roster()
+        except Exception as e:  # noqa: BLE001 - no live budget rather than no hand-off
+            _log(f"could not list the Cluster Agents for the time limit: {e!r}")
+            return 0
+    if full_roster is None:
+        return 0
+    return min(max(0, len(full_roster) - cap), FIRST_RUN_UNCARDED_MAX)
+
+
 def sweep_cluster_cards(data_dir: Path, marker: Path) -> int:
     """The per-cluster card cap for a filed sweep: its marker's, else the data dir's file."""
     cap = marker_cap(marker)
@@ -932,12 +959,16 @@ def _record(marker: Path, sweep_id: str, task_id: str, now: float) -> None:
     marker.write_text(f"sweep={sweep_id}\ntask_id={task_id}\nfiled_at={int(now)}\n", encoding="utf-8")
 
 
-def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now: float | None = None) -> str | None:
+def hand_off(
+    data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now: float | None = None, full_roster=None
+) -> str | None:
     """Advance the hand-off one tick. Returns the ranking card id once filed.
 
     ``roster`` is the gate's list of ready Cluster Agents (or a callable that
     returns it), each ``{name, key, title, cluster_label}``; their cards are
-    filed here, once per sweep.
+    filed here, once per sweep. ``full_roster``, the same uncapped, budgets the
+    time limit for the clusters past the cap when the marker pinned nothing
+    (``uncarded_budget``).
     """
     now = time.time() if now is None else now
     filed = read_scan_marker(scan_marker, now)
@@ -952,7 +983,7 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
     state = read_board(_board_path(data_dir), sweep_id)
     if state is None:
         return None
-    state["uncarded"] = uncarded_agents(scan_marker)
+    state["uncarded"] = uncarded_budget(scan_marker, sweep_cluster_cards(data_dir, scan_marker), full_roster)
     # Archiving the sweep, or every one of its cards, is how a person, the
     # re-arm runbook or a bench stack cancels it, often to plant a raw file of
     # their own; writing over that file once the deadline passed would undo
