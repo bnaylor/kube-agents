@@ -359,7 +359,8 @@ What the operator renders per profile, as built (amended 10/6):
     the TokenReview attests, and its profile and tier the ServiceAccount's map entry. It logs
     the credential's `jti`, never the token. A credential that fails refuses the request. No
     credential leaves the caller local-only commands, run against no kubeconfig: `version`,
-    `--help`, `gcloud config get` and `list`, `gcloud auth list`, `kubectl config view`.
+    `--help`, `kubectl config view`. `gcloud config` and `gcloud auth` are refused whole,
+    since even their reads print the broker's own account and default project.
   - With a credential, every call is held to its target (`task_confinement.py`). Every
     `kubectl --context`, `--kubeconfig` and `kubeconfigContext` must name the target, and a
     call naming none gets the target, not the host cluster; `--cluster`, `--server`, `--user`
@@ -369,8 +370,14 @@ What the operator renders per profile, as built (amended 10/6):
     exactly; `--impersonate-service-account`, `--account` and the other identity flags are
     refused; reads with no project scope (`projects list`, `organizations`, `billing`,
     org-scoped `asset` searches, `storage`) are refused; and a `projects/<id>/...` name in any
-    argument must name the target. The shim honours no `KUBECONFIG` or `CLOUDSDK_*` override
-    for a task, and says so.
+    argument must name the target. gcloud is held to an allowlist of its own
+    (`GCLOUD_CONFINED_COMMANDS`): each read says how it names a project (by `--project`, by a
+    positional project id, by a metrics scope, by a `<location>-docker.pkg.dev/<project>` or
+    `gcr.io/<project>` image path), and a read the policy admits but the table doesn't name is
+    refused, so a later addition to the read list fails closed. The shim honours no
+    `KUBECONFIG` or `CLOUDSDK_*` override for a task, and says so. Profile calls hold at most
+    `CREDENTIAL_PROXY_PROFILE_SLOTS` (default 4) of the broker's command slots, clamped so the
+    platform agent's shell always keeps one.
   - Nothing may change what a later bare command targets. `gcloud config set`, `unset` and
     `configurations`, and every `kubectl config` write (`use-context`, `set-context`,
     `set-cluster`, `set-credentials` and the rest) are refused with or without a credential.
@@ -378,9 +385,9 @@ What the operator renders per profile, as built (amended 10/6):
     for the target, and every `gcloud` call `--project` (a GKE call `--location`, a node-pool
     call `--cluster`), so a stored default changed some other way still can't move a call.
   - Known limits. It is a confinement layer over the broker's IAM, not a sandbox. A project
-    named by number, or inside a `--filter` or `--format` expression, or in a form that isn't
-    a `projects/...` path (a BigQuery `project:dataset`, an Artifact Registry image path), is
-    not parsed; the number is refused, the others are bounded by IAM alone. A zonal read
+    named by number is refused; one inside a `--filter` or `--format` expression, or in a form
+    the allowlist doesn't parse for a command it admits as flag-named, is bounded by IAM
+    alone. A zonal read
     under a regional target is refused rather than matched. A warm pod's credential stays
     valid until its task's deadline plus the skew: the adapter removes the file at task end,
     and a broker check that a newer credential supersedes an older one would need per-pod

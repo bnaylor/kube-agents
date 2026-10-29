@@ -70,7 +70,7 @@ const (
 	// PlatformAgent field it comes from (the install's maxTaskDeadlineSeconds)
 	// and renders it for both. Until then both default to 6h. Reserved now,
 	// so a CR can't set a ceiling the operator didn't choose.
-	credentialProxyTaskCredentialMaxLifetimeEnvVar = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
+	credentialProxyTaskCredentialMaxLifetimeEnvVar = "A2A_TASK_CREDENTIAL_MAX_LIFETIME" // #nosec G101 -- Environment variable name, not hardcoded credentials
 )
 
 // credentialProxyProfileIdentity is one profile worker ServiceAccount, as the

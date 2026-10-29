@@ -10,6 +10,7 @@ to its target cluster and project.
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import logging
@@ -22,6 +23,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
+import command_policy
 import credential_proxy
 import task_confinement
 import task_credential
@@ -148,14 +150,14 @@ class GcloudConfinementTest(unittest.TestCase):
         return str(caught.exception)
 
     def test_a_missing_project_is_the_targets(self):
-        confined = confine(["gcloud", "iam", "service-accounts", "list"], None, TARGET)
-        self.assertEqual(["gcloud", "--project=proj-a", "iam", "service-accounts", "list"], confined.argv)
+        confined = confine(["gcloud", "compute", "instances", "list"], None, TARGET)
+        self.assertEqual(["gcloud", "--project=proj-a", "compute", "instances", "list"], confined.argv)
         self.assertIsNone(confined.kubeconfig_context)
 
     def test_the_target_project_is_kept_as_given(self):
         for argv in (
-            ["gcloud", "iam", "service-accounts", "list", "--project=proj-a"],
-            ["gcloud", "--project", "proj-a", "iam", "service-accounts", "list"],
+            ["gcloud", "compute", "instances", "list", "--project=proj-a"],
+            ["gcloud", "--project", "proj-a", "compute", "instances", "list"],
         ):
             with self.subTest(argv=argv):
                 self.assertEqual(argv, confine(argv, None, TARGET).argv)
@@ -170,8 +172,8 @@ class GcloudConfinementTest(unittest.TestCase):
              ["gcloud", "--project=proj-a", "container", "node-pools", "list", "--location=us-central1", "--cluster=cluster-a"]),
             (["gcloud", "container", "operations", "list", "--location=us-central1"],
              ["gcloud", "--project=proj-a", "container", "operations", "list", "--location=us-central1"]),
-            (["gcloud", "beta", "container", "clusters", "describe", "cluster-a"],
-             ["gcloud", "--project=proj-a", "beta", "container", "clusters", "describe", "cluster-a", "--location=us-central1"]),
+            (["gcloud", "container", "clusters", "describe", "cluster-a"],
+             ["gcloud", "--project=proj-a", "container", "clusters", "describe", "cluster-a", "--location=us-central1"]),
         ):
             with self.subTest(argv=argv):
                 self.assertEqual(want, confine(argv, None, TARGET).argv)
@@ -223,6 +225,22 @@ class GcloudConfinementTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.refused(argv)
 
+    def test_project_less_reads_are_named_as_such(self):
+        # The allowlist refuses these too; the explicit lists are what tell
+        # the model why, so the message is pinned.
+        for argv in (
+            ["gcloud", "projects", "list"],
+            ["gcloud", "beta", "projects", "list"],
+            ["gcloud", "projects", "search"],
+            ["gcloud", "organizations", "list"],
+            ["gcloud", "resource-manager", "folders", "list"],
+            ["gcloud", "billing", "budgets", "list"],
+            ["gcloud", "storage", "ls", "gs://some-bucket"],
+            ["gcloud", "info"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIn("reads outside any one project", self.refused(argv))
+
     def test_a_project_scoped_asset_search_passes(self):
         confine(["gcloud", "asset", "search-all-resources", "--scope=projects/proj-a"], None, TARGET)
 
@@ -267,6 +285,96 @@ class GcloudConfinementTest(unittest.TestCase):
 
     def test_an_unknown_flag_is_refused(self):
         self.refused(["gcloud", "container", "clusters", "list", "--some-new-flag", "x"])
+
+
+class ConfinedCommandTableTest(unittest.TestCase):
+    """gcloud reads are confined only where the table says how they name a project."""
+
+    def test_every_table_entry_is_a_read_the_policy_admits(self):
+        self.assertLessEqual(set(task_confinement.GCLOUD_CONFINED_COMMANDS), set(command_policy.GCLOUD_READ_COMMANDS))
+
+    def test_a_read_missing_from_the_table_is_refused(self):
+        # `version` is the one read outside the table that runs: it is
+        # local-only (ruling (d)) and names no project at all.
+        missing = set(command_policy.GCLOUD_READ_COMMANDS) - set(task_confinement.GCLOUD_CONFINED_COMMANDS) - {("version",)}
+        self.assertTrue(missing)
+        for command in sorted(missing):
+            with self.subTest(command=command):
+                with self.assertRaises(ConfinementRefusal):
+                    confine(["gcloud", *command], None, TARGET)
+
+    def test_a_read_added_to_the_policy_later_fails_closed(self):
+        added = ("compute", "new-surface", "list")
+        with mock.patch.object(command_policy, "GCLOUD_READ_COMMANDS", command_policy.GCLOUD_READ_COMMANDS | {added}):
+            with self.assertRaisesRegex(ConfinementRefusal, "GCLOUD_CONFINED_COMMANDS"):
+                confine(["gcloud", *added], None, TARGET)
+
+    def test_shared_vpc_names_only_the_target_host_project(self):
+        with self.assertRaisesRegex(ConfinementRefusal, "another project"):
+            confine(["gcloud", "compute", "shared-vpc", "list-associated-resources", "other-proj"], None, TARGET)
+        confine(["gcloud", "compute", "shared-vpc", "list-associated-resources", "proj-a"], None, TARGET)
+
+    def test_a_metrics_scope_names_only_the_target(self):
+        for scope in ("other-proj", "locations/global/metricsScopes/other-proj", "locations/global/metricsScopes/123"):
+            with self.subTest(scope=scope):
+                with self.assertRaisesRegex(ConfinementRefusal, "metrics scope"):
+                    confine(["gcloud", "beta", "monitoring", "metrics-scopes", "describe", scope], None, TARGET)
+        for scope in ("proj-a", "locations/global/metricsScopes/proj-a"):
+            with self.subTest(scope=scope):
+                confine(["gcloud", "beta", "monitoring", "metrics-scopes", "describe", scope], None, TARGET)
+
+    def test_an_image_names_only_the_target_project(self):
+        for image in (
+            "us-docker.pkg.dev/other/repo/img:1",
+            "europe-west1-docker.pkg.dev/other/repo/img@sha256:abc",
+            "gcr.io/other/img",
+            "eu.gcr.io/other/img",
+            "registry.example.com/proj-a/img",
+            "img",
+        ):
+            with self.subTest(image=image):
+                with self.assertRaisesRegex(ConfinementRefusal, "image"):
+                    confine(["gcloud", "artifacts", "docker", "images", "describe", image], None, TARGET)
+        for image in ("us-docker.pkg.dev/proj-a/repo/img:1", "gcr.io/proj-a/img", "us.gcr.io/proj-a/img@sha256:abc"):
+            with self.subTest(image=image):
+                confine(["gcloud", "artifacts", "docker", "images", "describe", image], None, TARGET)
+
+    def test_a_kubeconfig_context_for_another_cluster_refuses_a_gcloud_call(self):
+        with self.assertRaisesRegex(ConfinementRefusal, "kubeconfig's context"):
+            confine(["gcloud", "container", "clusters", "list"], OTHER_CONTEXT, TARGET)
+        confine(["gcloud", "container", "clusters", "list"], CONTEXT, TARGET)
+
+
+class FlagValueTest(unittest.TestCase):
+    """A flag's value is read the way the CLI reads it."""
+
+    def test_help_false_is_not_local_only(self):
+        for argv in (["kubectl", "get", "pods", "--help=false"], ["gcloud", "container", "clusters", "list", "--help=false"]):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(ConfinementRefusal, "no target"):
+                    confine(argv, None, None)
+        confine(["kubectl", "get", "pods", "--help=true"], None, None)
+
+    def test_the_walk_gives_a_scope_flag_its_value(self):
+        flags, words = task_confinement._gcloud_walk(["gcloud", "--billing-account", "help", "billing", "budgets", "list"])
+        self.assertEqual([("--billing-account", "help")], flags)
+        self.assertEqual(["billing", "budgets", "list"], words)
+        flags, words = task_confinement._gcloud_walk(["gcloud", "--account=x", "version"])
+        self.assertEqual(([("--account", "x")], ["version"]), (flags, words))
+
+    def test_a_scope_or_identity_flag_consumes_its_value(self):
+        # Without the value consumed, `help` is the first word and the command
+        # reads as local-only help.
+        for argv in (
+            ["gcloud", "--billing-account", "help", "billing", "budgets", "list"],
+            ["gcloud", "--organization", "help", "projects", "list"],
+            ["gcloud", "--impersonate-service-account", "help", "compute", "instances", "list"],
+            ["gcloud", "--account", "version"],
+        ):
+            for target in (TARGET, None):
+                with self.subTest(argv=argv, target=target):
+                    with self.assertRaisesRegex(ConfinementRefusal, argv[1]):
+                        confine(argv, None, target)
 
 
 class StoredDefaultTest(unittest.TestCase):
@@ -315,10 +423,25 @@ class StoredDefaultTest(unittest.TestCase):
                     else:
                         self.fail(f"{argv} ran")
 
-    def test_the_config_reads_still_run(self):
+    def test_the_brokers_own_gcloud_state_is_not_shown(self):
+        # config list, config get-value and auth list print the broker's own
+        # account and default project: refused with or without a credential,
+        # --help or not.
         for argv in (
             ["gcloud", "config", "list"],
-            ["gcloud", "config", "get-value", "project"],
+            ["gcloud", "config", "get", "project"],
+            ["gcloud", "config", "get-value", "account"],
+            ["gcloud", "auth", "list"],
+            ["gcloud", "beta", "auth", "list"],
+            ["gcloud", "auth", "list", "--help"],
+        ):
+            for target in (TARGET, None):
+                with self.subTest(argv=argv, target=target):
+                    with self.assertRaisesRegex(ConfinementRefusal, "broker's own account"):
+                        confine(argv, None, target)
+
+    def test_the_kubectl_config_reads_still_run(self):
+        for argv in (
             ["kubectl", "config", "view"],
             ["kubectl", "config", "get-contexts"],
             ["kubectl", "config", "current-context"],
@@ -340,9 +463,6 @@ class LocalOnlyTest(unittest.TestCase):
             ["gcloud", "version"],
             ["gcloud", "--help"],
             ["gcloud", "container", "clusters", "list", "--help"],
-            ["gcloud", "config", "get", "project"],
-            ["gcloud", "config", "get-value", "account"],
-            ["gcloud", "auth", "list"],
         ):
             with self.subTest(argv=argv):
                 confined = confine(argv, None, None)
@@ -612,6 +732,21 @@ class ProfileRouteTest(unittest.TestCase):
         status, body = self.post({"argv": ["kubectl", "version", "--client"]})
         self.assert_refused(status, body, credential_proxy.RULE_TASK_CREDENTIAL)
 
+    def test_the_route_answers_busy_past_the_profile_share(self):
+        slots = credential_proxy.SessionSlots(
+            1, role=credential_proxy.CALLER_ROLE_PROFILE, env_name=credential_proxy.ENV_PROFILE_SLOTS,
+            bound=credential_proxy.ADMISSION_BOUND_PROFILE,
+        )
+        CredentialProxyHandler.profile_slots = slots
+        self.addCleanup(setattr, CredentialProxyHandler, "profile_slots", None)
+        with slots.acquire(credential_proxy.CALLER_ROLE_PROFILE):
+            status, body = self.post({"argv": ["kubectl", "get", "pods"]})
+            self.assertNotEqual(200, status, body)
+            self.assertIn(credential_proxy.ENV_PROFILE_SLOTS, json.dumps(body))
+            self.assertEqual([], self.executor.calls)
+        status, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        self.assertEqual(200, status, body)
+
     def test_other_roles_ignore_the_header(self):
         shell = credential_proxy.Principal(workload="system:serviceaccount:ns:shell", role=credential_proxy.CALLER_ROLE_SHELL)
         CredentialProxyHandler.authenticator = _StubAuthenticator(shell)
@@ -754,6 +889,42 @@ print("context=" + context)
         seen = self.run_bare(["kubectl", "get", "pods"])
         self.assertEqual({"context": CONTEXT}, seen)
         self.assertEqual([CONTEXT], self.resolved)
+
+
+class ProfileSlotShareTest(unittest.TestCase):
+    """Profile work holds a bounded share of the pool, and the shell keeps a slot."""
+
+    def test_the_share_is_named_defaulted_and_clamped_below_the_pool(self):
+        with mock.patch.dict(os.environ, {credential_proxy.ENV_PROFILE_SLOTS: ""}):
+            self.assertEqual(4, credential_proxy.profile_slot_limit_from_env(8, 2))
+        for raw, pool, session, want, warns in (
+            ("3", 8, 2, 3, False),
+            ("10", 8, 2, 5, True),  # clamped: 8 - 2 - 1, so the shell keeps a slot
+            ("x", 8, 2, 4, True),
+            ("0", 8, 2, 4, True),
+            ("4", 3, 2, 1, True),  # a pool too small to share still serves one
+        ):
+            with self.subTest(raw=raw, pool=pool):
+                with mock.patch.dict(os.environ, {credential_proxy.ENV_PROFILE_SLOTS: raw}):
+                    with self.assertLogs(credential_proxy.LOGGER, level="WARNING") if warns else contextlib.nullcontext():
+                        self.assertEqual(want, credential_proxy.profile_slot_limit_from_env(pool, session))
+
+    def test_a_profile_past_its_share_is_busy_and_the_shell_is_not(self):
+        slots = credential_proxy.SessionSlots(
+            1, role=credential_proxy.CALLER_ROLE_PROFILE, env_name=credential_proxy.ENV_PROFILE_SLOTS,
+            bound=credential_proxy.ADMISSION_BOUND_PROFILE,
+        )
+        with slots.acquire(credential_proxy.CALLER_ROLE_PROFILE):
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
+                with slots.acquire(credential_proxy.CALLER_ROLE_PROFILE):
+                    pass
+            self.assertEqual(credential_proxy.ADMISSION_BOUND_PROFILE, raised.exception.bound)
+            self.assertIn(credential_proxy.ENV_PROFILE_SLOTS, str(raised.exception))
+            for role in (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_SESSION):
+                with slots.acquire(role):
+                    pass
+        with slots.acquire(credential_proxy.CALLER_ROLE_PROFILE):
+            pass
 
 
 class ProfileRouteTableTest(unittest.TestCase):

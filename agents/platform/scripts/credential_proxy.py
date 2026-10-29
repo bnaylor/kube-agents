@@ -322,6 +322,29 @@ CGROUP_NO_LIMIT = "max"
 # knob, and the operator's spec.deployment.env reaches it.
 DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS = 2
 ENV_SESSION_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS"
+# The profile role's share (#3889), the same mechanism as the session's: every
+# AgentProfile worker's calls together hold at most this many of the pool's
+# slots, counted before the pool is asked and refused at once past it.
+#
+# How it sits beside the global cap (CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS,
+# 8 by default and shared by every caller; #4082 redesigns it):
+#   * Profile work cannot starve the shell. At serve() the share is clamped to
+#     the pool minus the session share minus one, so even with every profile
+#     and session slot taken the platform agent's shell keeps at least one
+#     slot; with the defaults (8, 2, 4) it keeps two. The child-memory budget
+#     can admit fewer than the slot count, and then the guarantee is in slots,
+#     not in admissions: a budget-bound pool can still queue the shell behind
+#     running profile commands until one finishes.
+#   * The shell and sessions can starve profile work. The shell is
+#     unbounded, so a shell holding the whole pool leaves a profile call
+#     queued until the slot wait expires and then answered busy; sessions
+#     hold at most their own share. That is the intended priority: the
+#     platform agent first.
+# Operator-unset: the broker default applies, and spec.deployment.env can set
+# it, as it can the session share; the clamp holds the shell's slot whatever
+# value arrives.
+DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS = 4
+ENV_PROFILE_SLOTS = "CREDENTIAL_PROXY_PROFILE_SLOTS"
 # How long a request waits for admission -- a slot under the slot cap and room
 # under the child memory budget alike -- before it is refused with 503. Long
 # enough to ride out a burst of one-shot reads, short enough that a queue held
@@ -585,13 +608,15 @@ ADMISSION_BOUND_SLOT = "slot"
 ADMISSION_BOUND_BUDGET = "budget"
 ADMISSION_BOUND_REFRESH_LOCK = "refresh-lock"
 ADMISSION_BOUND_SESSION = "session"
+ADMISSION_BOUND_PROFILE = "profile"
 ADMISSION_BOUND_OTHER = "other"
 #: The histogram's label for a request admitted without a wait: nothing held
 #: it, so neither bound is blamed, and the label does not flip with the memory
 #: limit. Never a refusal's bound.
 ADMISSION_BOUND_NONE = "none"
 ADMISSION_BOUNDS = frozenset(
-    {ADMISSION_BOUND_SLOT, ADMISSION_BOUND_BUDGET, ADMISSION_BOUND_REFRESH_LOCK, ADMISSION_BOUND_SESSION, ADMISSION_BOUND_NONE}
+    {ADMISSION_BOUND_SLOT, ADMISSION_BOUND_BUDGET, ADMISSION_BOUND_REFRESH_LOCK, ADMISSION_BOUND_SESSION,
+     ADMISSION_BOUND_PROFILE, ADMISSION_BOUND_NONE}
 )
 # Edges where a reader wants them: 15 s is the cap the Cluster Agent preflight
 # (cluster_preflight.sh) puts on one brokered call, the shortest caller-side
@@ -2099,31 +2124,73 @@ def session_slot_limit_from_env() -> int:
     return value
 
 
-class SessionSlots:
-    """The session role's bounded share of the command pool.
+def profile_slot_limit_from_env(pool: int, session_limit: int) -> int:
+    """The profile role's concurrent-command share, clamped below the pool.
 
-    Only CALLER_ROLE_SESSION is counted; every other role passes through to
-    the pool unchanged. A session at its bound is refused immediately with
+    Read like the session's (a non-positive or non-integer value is the
+    default, with a warning), then held to ``pool - session_limit - 1`` so the
+    shell always keeps a slot (DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS says
+    why). At least one, so a pool too small to share still serves profiles.
+    """
+    raw = os.getenv(ENV_PROFILE_SLOTS, "").strip()
+    value = DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value <= 0:
+            LOGGER.warning(
+                "%s=%r is not a positive integer; using the default of %d",
+                ENV_PROFILE_SLOTS, raw, DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS,
+            )
+            value = DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS
+    ceiling = max(1, pool - session_limit - 1)
+    if value > ceiling:
+        LOGGER.warning(
+            "the profile share of %d is more than the pool of %d less the session share of %d and one slot "
+            "for the shell; using %d",
+            value, pool, session_limit, ceiling,
+        )
+        value = ceiling
+    return value
+
+
+class SessionSlots:
+    """A role's bounded share of the command pool: the session's by default.
+
+    Only ``role`` is counted; every other role passes through to the pool
+    unchanged. A caller at the bound is refused immediately with
     CommandSlotUnavailable, which the exec route already answers as busy, so
-    the shim prints why and the model reports it rather than retrying.
+    the shim prints why and the model reports it rather than retrying. The
+    profile role has an instance of its own (``profile_slots``).
     """
 
-    def __init__(self, limit: int) -> None:
+    def __init__(
+        self,
+        limit: int,
+        role: str = CALLER_ROLE_SESSION,
+        env_name: str = ENV_SESSION_MAX_CONCURRENT_COMMANDS,
+        bound: str = ADMISSION_BOUND_SESSION,
+    ) -> None:
         self.limit = limit
+        self.role = role
+        self.env_name = env_name
+        self.bound = bound
         self._in_flight = 0
         self._lock = threading.Lock()
 
     @contextlib.contextmanager
     def acquire(self, role: str) -> Iterator[None]:
-        if role != CALLER_ROLE_SESSION:
+        if role != self.role:
             yield
             return
         with self._lock:
             if self._in_flight >= self.limit:
                 raise CommandSlotUnavailable(
-                    f"the session role is limited to {self.limit} concurrent command(s) through the "
-                    f"credential proxy ({ENV_SESSION_MAX_CONCURRENT_COMMANDS}); try again when one finishes",
-                    bound=ADMISSION_BOUND_SESSION,
+                    f"the {self.role} role is limited to {self.limit} concurrent command(s) through the "
+                    f"credential proxy ({self.env_name}); try again when one finishes",
+                    bound=self.bound,
                 )
             self._in_flight += 1
         try:
@@ -9382,6 +9449,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # The session role's bounded share of the command pool, installed by main
     # beside the executor; None (the route tests' stand-ins) means unbounded.
     session_slots: "SessionSlots | None" = None
+    # The profile role's, the same way (profile_slot_limit_from_env).
+    profile_slots: "SessionSlots | None" = None
     max_request_bytes: int
     slack_max_request_bytes: int
     enforce_read_only: bool = True
@@ -11774,8 +11843,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
 
     def _session_slot(self, role: str) -> contextlib.AbstractContextManager:
-        """The session role's bounded share, or nothing for every other role."""
-        slots = getattr(self, "session_slots", None)
+        """The session or profile role's bounded share, or nothing for every other role."""
+        slots = getattr(self, "profile_slots" if role == CALLER_ROLE_PROFILE else "session_slots", None)
         if slots is None:
             return contextlib.nullcontext()
         return slots.acquire(role)
@@ -12081,6 +12150,12 @@ def serve(args: argparse.Namespace) -> None:
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
     CredentialProxyHandler.session_slots = SessionSlots(session_slot_limit_from_env())
+    CredentialProxyHandler.profile_slots = SessionSlots(
+        profile_slot_limit_from_env(executor.max_concurrent_commands, CredentialProxyHandler.session_slots.limit),
+        role=CALLER_ROLE_PROFILE,
+        env_name=ENV_PROFILE_SLOTS,
+        bound=ADMISSION_BOUND_PROFILE,
+    )
     CredentialProxyHandler.base_branch = (
         getattr(args, "base_branch", "")
         or os.getenv("CREDENTIAL_PROXY_BASE_BRANCH", "")
