@@ -341,6 +341,51 @@ What the operator renders per profile, as built (amended 10/6):
   first PR adds the task connection, and the pod connection keeps its profile-wide task
   reach. The worker PR moves the worker onto the task connection and removes that reach, and
   it has to land before #3659's tiers stronger than Read go live.
+- Proxy confinement (#3889). A worker's `kubectl` and `gcloud` are the credential-proxy
+  shim, and they reach the shared broker, not a proxy in the worker's pod (one there could
+  ask the metadata server for the broker's Workload Identity token). The broker gives them a
+  role of its own, `profile`, by the audience `kubeagents-credential-proxy-profile`: the exec
+  route only, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist.
+  The operator renders the audience, an identity map from each tier's ServiceAccount to its
+  (profile, tier) (`CREDENTIAL_PROXY_PROFILE_IDENTITIES`, from the callout map's profile
+  entries), those ServiceAccounts on the broker's callers, and the task-signing public key
+  (`A2A_TASK_SIGNING_PUBLIC_KEYS`). All four, and `A2A_TASK_CREDENTIAL_MAX_LIFETIME`, are
+  reserved against `spec.deployment.env`. The broker's fence admits the profile namespace and
+  the profile namespace's fence lets it out to the broker's credentialed port.
+  - The shim reads the dispatcher's `proxyToken` from `CREDENTIAL_PROXY_TASK_TOKEN_FILE` on
+    every call and sends it in `X-Kube-Agents-Task-Credential`, never in the body. The
+    broker verifies it in Python (`task_credential.py`, held to `taskcred.Verify` by golden
+    fixtures in `a2a/taskcred/testdata`) and binds it: its pod and pod UID must be the ones
+    the TokenReview attests, and its profile and tier the ServiceAccount's map entry. It logs
+    the credential's `jti`, never the token. A credential that fails refuses the request. No
+    credential leaves the caller local-only commands, run against no kubeconfig: `version`,
+    `--help`, `gcloud config get` and `list`, `gcloud auth list`, `kubectl config view`.
+  - With a credential, every call is held to its target (`task_confinement.py`). Every
+    `kubectl --context`, `--kubeconfig` and `kubeconfigContext` must name the target, and a
+    call naming none gets the target, not the host cluster; `--cluster`, `--server`, `--user`
+    and `--insecure-skip-tls-verify` are refused. `gcloud --project` must be the target's, and
+    a missing one is set to it, not the broker's default; `--cluster`, `--location`,
+    `--region` and `--zone` must be the target's; `get-credentials` must name the target
+    exactly; `--impersonate-service-account`, `--account` and the other identity flags are
+    refused; reads with no project scope (`projects list`, `organizations`, `billing`,
+    org-scoped `asset` searches, `storage`) are refused; and a `projects/<id>/...` name in any
+    argument must name the target. The shim honours no `KUBECONFIG` or `CLOUDSDK_*` override
+    for a task, and says so.
+  - Nothing may change what a later bare command targets. `gcloud config set`, `unset` and
+    `configurations`, and every `kubectl config` write (`use-context`, `set-context`,
+    `set-cluster`, `set-credentials` and the rest) are refused with or without a credential.
+    And the injection is unconditional: every credentialed `kubectl` call carries `--context`
+    for the target, and every `gcloud` call `--project` (a GKE call `--location`, a node-pool
+    call `--cluster`), so a stored default changed some other way still can't move a call.
+  - Known limits. It is a confinement layer over the broker's IAM, not a sandbox. A project
+    named by number, or inside a `--filter` or `--format` expression, or in a form that isn't
+    a `projects/...` path (a BigQuery `project:dataset`, an Artifact Registry image path), is
+    not parsed; the number is refused, the others are bounded by IAM alone. A zonal read
+    under a regional target is refused rather than matched. A warm pod's credential stays
+    valid until its task's deadline plus the skew: the adapter removes the file at task end,
+    and a broker check that a newer credential supersedes an older one would need per-pod
+    state across replicas. A change to the identity map re-renders the broker's environment
+    and so restarts it.
 - The card: the operator is a bus principal for this and nothing else. Its entry publishes on
   `a2a.agents.*` and direct-gets the directory, so reconcile can tell a missing or stale card
   from a current one. The grant is a wildcard over the profile token because callout grants are

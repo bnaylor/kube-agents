@@ -1,0 +1,899 @@
+"""The broker's profile role (#3889): task credentials, binding and confinement.
+
+A profile worker's kubectl and gcloud reach the shared broker with a projected
+ServiceAccount token (the profile audience) and the dispatcher's task
+credential in X-Kube-Agents-Task-Credential. These tests hold the broker to:
+the credential is verified and bound to the attested pod, UID, profile and
+tier; without one only local-only commands run; with one every call is held
+to its target cluster and project.
+"""
+
+from __future__ import annotations
+
+import http.client
+import json
+import logging
+import os
+import threading
+import unittest
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from unittest import mock
+
+import credential_proxy
+import task_confinement
+import task_credential
+from credential_proxy import CredentialProxyHandler, Policy
+from credential_proxy_client import ClusterTarget
+from task_confinement import ConfinementRefusal, confine
+
+FIXTURES = Path(__file__).resolve().parents[3] / "a2a" / "taskcred" / "testdata" / "credential_proxy_fixtures.json"
+DOC = json.loads(FIXTURES.read_text(encoding="utf-8"))
+CASES = {case["name"]: case for case in DOC["cases"]}
+VALID = CASES["valid"]
+
+TARGET = ClusterTarget(project="proj-a", location="us-central1", cluster="cluster-a")
+CONTEXT = TARGET.context_name
+OTHER_CONTEXT = "gke_proj-b_us-central1_cluster-b"
+PROFILE_SA = "system:serviceaccount:kubeagents-profiles:agentprofile-auditor-read"
+POD = "auditor-read-x7k2p"
+POD_UID = "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0"
+
+
+class KubectlConfinementTest(unittest.TestCase):
+    """Every way kubectl names a cluster resolves to the target or is refused."""
+
+    def refused(self, argv, kubeconfig_context=None, target=TARGET):
+        with self.assertRaises(ConfinementRefusal) as caught:
+            confine(argv, kubeconfig_context, target)
+        return str(caught.exception)
+
+    def test_naming_no_cluster_gets_the_target_not_the_host(self):
+        confined = confine(["kubectl", "get", "pods"], None, TARGET)
+        self.assertEqual(CONTEXT, confined.kubeconfig_context)
+        self.assertEqual(["kubectl", f"--context={CONTEXT}", "get", "pods"], confined.argv)
+        self.assertFalse(confined.isolated)
+
+    def test_the_context_is_named_on_every_call(self):
+        # Unconditional: whatever the kubeconfig's current-context says,
+        # kubectl selects the target's entry.
+        for argv, context in (
+            (["kubectl", "get", "pods"], CONTEXT),
+            (["kubectl", f"--kubeconfig={CONTEXT}", "get", "pods"], None),
+            (["kubectl", "version", "--client"], None),
+        ):
+            with self.subTest(argv=argv):
+                confined = confine(argv, context, TARGET)
+                self.assertIn(f"--context={CONTEXT}", confined.argv)
+        given = ["kubectl", "get", "pods", f"--context={CONTEXT}"]
+        self.assertEqual(given, confine(given, None, TARGET).argv)
+
+    def test_the_target_named_every_way_passes(self):
+        for argv, context in (
+            (["kubectl", "get", "pods", f"--context={CONTEXT}"], None),
+            (["kubectl", "--context", CONTEXT, "get", "pods"], None),
+            (["kubectl", "get", "pods"], CONTEXT),
+            (["kubectl", f"--kubeconfig={CONTEXT}", "get", "pods"], None),
+        ):
+            with self.subTest(argv=argv, context=context):
+                confine(argv, context, TARGET)
+
+    def test_a_kubeconfig_flag_keeps_its_own_resolution(self):
+        # The broker reroutes the flag to the target's file itself; the
+        # request carries no second context to select.
+        confined = confine(["kubectl", f"--kubeconfig={CONTEXT}", "get", "pods"], None, TARGET)
+        self.assertIsNone(confined.kubeconfig_context)
+
+    def test_another_context_flag_is_refused(self):
+        self.assertIn("--context", self.refused(["kubectl", "get", "pods", f"--context={OTHER_CONTEXT}"]))
+        self.refused(["kubectl", "--context", OTHER_CONTEXT, "get", "pods"])
+        # kubectl reads the last; every one is checked, so a target first does
+        # not cover another after it.
+        self.refused(["kubectl", f"--context={CONTEXT}", "get", "pods", f"--context={OTHER_CONTEXT}"])
+        self.refused(["kubectl", "get", "pods", "--context="])
+
+    def test_another_kubeconfig_flag_is_refused(self):
+        self.assertIn("--kubeconfig", self.refused(["kubectl", f"--kubeconfig={OTHER_CONTEXT}", "get", "pods"]))
+        self.refused(["kubectl", "--kubeconfig", "/etc/credential-proxy/kubeconfig", "get", "pods"])
+        self.refused(["kubectl", f"--kubeconfig={CONTEXT}", f"--kubeconfig={OTHER_CONTEXT}", "get", "pods"])
+
+    def test_another_kubeconfig_context_is_refused(self):
+        self.assertIn("context", self.refused(["kubectl", "get", "pods"], kubeconfig_context=OTHER_CONTEXT))
+
+    # Refused by name, for the redirect itself: the message is the explicit
+    # check's, not the unlisted-flag fallback's, so the explicit check is what
+    # these pin (the allowlist stands behind it on its own test).
+    REDIRECT = "is refused for a profile task: the cluster and the credential are the task's"
+
+    def redirect_refused(self, argv, flag):
+        message = self.refused(argv)
+        self.assertIn(flag, message)
+        self.assertIn(self.REDIRECT, message)
+
+    def test_the_cluster_flag_is_refused(self):
+        self.redirect_refused(["kubectl", "get", "pods", "--cluster=gke_proj-b"], "--cluster")
+
+    def test_the_server_flag_is_refused(self):
+        self.redirect_refused(["kubectl", "get", "pods", "--server", "https://10.0.0.1"], "--server")
+        self.redirect_refused(["kubectl", "get", "pods", "-s", "https://10.0.0.1"], "-s")
+        self.redirect_refused(["kubectl", "get", "pods", "-As", "https://10.0.0.1"], "-s")
+
+    def test_the_user_flag_is_refused(self):
+        self.redirect_refused(["kubectl", "get", "pods", "--user=admin"], "--user")
+
+    def test_insecure_skip_tls_verify_is_refused(self):
+        self.redirect_refused(["kubectl", "get", "pods", "--insecure-skip-tls-verify"], "--insecure-skip-tls-verify")
+
+    def test_the_other_credential_flags_are_refused(self):
+        for flag in ("--token=x", "--as=admin", "--certificate-authority=/x", "--client-key=/x"):
+            with self.subTest(flag=flag):
+                self.redirect_refused(["kubectl", "get", "pods", flag], flag.split("=")[0])
+
+    def test_an_unlisted_flag_is_refused(self):
+        self.refused(["kubectl", "get", "pods", "--raw", "/api"])
+
+    def test_a_flag_after_double_dash_is_the_remote_commands(self):
+        # After `--` the words are the command kubectl exec runs in the pod.
+        confine(["kubectl", "exec", "pod/x", "--", "tool", f"--context={OTHER_CONTEXT}"], None, TARGET)
+
+
+class GcloudConfinementTest(unittest.TestCase):
+    """--project, locations, identity and project-less reads."""
+
+    def refused(self, argv, target=TARGET):
+        with self.assertRaises(ConfinementRefusal) as caught:
+            confine(argv, None, target)
+        return str(caught.exception)
+
+    def test_a_missing_project_is_the_targets(self):
+        confined = confine(["gcloud", "iam", "service-accounts", "list"], None, TARGET)
+        self.assertEqual(["gcloud", "--project=proj-a", "iam", "service-accounts", "list"], confined.argv)
+        self.assertIsNone(confined.kubeconfig_context)
+
+    def test_the_target_project_is_kept_as_given(self):
+        for argv in (
+            ["gcloud", "iam", "service-accounts", "list", "--project=proj-a"],
+            ["gcloud", "--project", "proj-a", "iam", "service-accounts", "list"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(argv, confine(argv, None, TARGET).argv)
+
+    def test_a_gke_call_gets_the_target_location_and_cluster(self):
+        # Unconditional: gcloud would otherwise take them from compute/region,
+        # compute/zone and container/cluster.
+        for argv, want in (
+            (["gcloud", "container", "clusters", "list"],
+             ["gcloud", "--project=proj-a", "container", "clusters", "list", "--location=us-central1"]),
+            (["gcloud", "container", "node-pools", "list"],
+             ["gcloud", "--project=proj-a", "container", "node-pools", "list", "--location=us-central1", "--cluster=cluster-a"]),
+            (["gcloud", "container", "operations", "list", "--location=us-central1"],
+             ["gcloud", "--project=proj-a", "container", "operations", "list", "--location=us-central1"]),
+            (["gcloud", "beta", "container", "clusters", "describe", "cluster-a"],
+             ["gcloud", "--project=proj-a", "beta", "container", "clusters", "describe", "cluster-a", "--location=us-central1"]),
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(want, confine(argv, None, TARGET).argv)
+
+    def test_another_project_is_refused(self):
+        self.assertIn("--project", self.refused(["gcloud", "container", "clusters", "list", "--project=proj-b"]))
+        self.refused(["gcloud", "--project", "proj-b", "container", "clusters", "list"])
+        self.refused(["gcloud", "container", "clusters", "list", "--project=proj-a", "--project=proj-b"])
+        self.refused(["gcloud", "logging", "read", "x", "--billing-project=proj-b"])
+
+    def test_impersonation_is_refused(self):
+        self.assertIn(
+            "--impersonate-service-account",
+            self.refused(["gcloud", "container", "clusters", "list", "--impersonate-service-account=sa@proj-a.iam.gserviceaccount.com"]),
+        )
+
+    def test_another_account_is_refused(self):
+        self.assertIn("--account", self.refused(["gcloud", "container", "clusters", "list", "--account", "someone@example.com"]))
+
+    def test_the_other_identity_flags_are_refused(self):
+        for flag in ("--configuration=other", "--access-token-file=/x", "--flags-file=/x.yaml"):
+            with self.subTest(flag=flag):
+                self.refused(["gcloud", "container", "clusters", "list", flag])
+
+    def test_another_location_or_cluster_is_refused(self):
+        self.assertIn("--location", self.refused(["gcloud", "container", "node-pools", "list", "--cluster=cluster-a", "--location=europe-west1"]))
+        self.assertIn("--zone", self.refused(["gcloud", "container", "operations", "list", "--zone", "us-central1-a"]))
+        self.refused(["gcloud", "container", "operations", "list", "--region=europe-west1"])
+        self.assertIn("--cluster", self.refused(["gcloud", "container", "node-pools", "list", "--cluster=cluster-b", "--location=us-central1"]))
+        confine(["gcloud", "container", "node-pools", "list", "--cluster=cluster-a", "--location=us-central1"], None, TARGET)
+
+    def test_project_less_reads_are_refused(self):
+        for argv in (
+            ["gcloud", "projects", "list"],
+            ["gcloud", "beta", "projects", "list"],
+            ["gcloud", "projects", "search", "--query=x"],
+            ["gcloud", "organizations", "list"],
+            ["gcloud", "resource-manager", "folders", "list"],
+            ["gcloud", "billing", "accounts", "list"],
+            ["gcloud", "asset", "search-all-resources", "--scope=organizations/123"],
+            ["gcloud", "asset", "search-all-resources"],
+            ["gcloud", "asset", "search-all-iam-policies", "--scope=folders/9"],
+            ["gcloud", "logging", "read", "x", "--organization=123"],
+            ["gcloud", "storage", "ls", "gs://some-bucket"],
+            ["gcloud", "auth", "print-access-token"],
+            ["gcloud", "config", "set", "project", "proj-b"],
+            ["gcloud", "info"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+
+    def test_a_project_scoped_asset_search_passes(self):
+        confine(["gcloud", "asset", "search-all-resources", "--scope=projects/proj-a"], None, TARGET)
+
+    def test_projects_names_only_the_target(self):
+        confine(["gcloud", "projects", "describe", "proj-a"], None, TARGET)
+        self.refused(["gcloud", "projects", "describe", "proj-b"])
+
+    def test_embedded_projects_are_held_to_the_target(self):
+        for argv in (
+            ["gcloud", "logging", "read", 'logName="projects/proj-b/logs/x"'],
+            ["gcloud", "container", "clusters", "describe", "https://container.googleapis.com/v1/projects/proj-b/locations/us-central1/clusters/c"],
+            ["gcloud", "container", "clusters", "describe", "projects/proj-a/locations/us-central1/clusters/cluster-b"],
+            ["gcloud", "iam", "service-accounts", "list", "--filter=name:projects/proj-b/serviceAccounts/x"],
+            ["gcloud", "projects", "get-iam-policy", "projects/123456789"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+        confine(["gcloud", "logging", "read", 'logName="projects/proj-a/logs/x"'], None, TARGET)
+        confine(["gcloud", "container", "clusters", "describe", "projects/proj-a/locations/us-central1/clusters/cluster-a"], None, TARGET)
+
+    def test_get_credentials_must_name_the_target_exactly(self):
+        ok = ["gcloud", "container", "clusters", "get-credentials", "cluster-a", "--location=us-central1"]
+        self.assertEqual(["gcloud", "--project=proj-a", *ok[1:]], confine(ok, None, TARGET).argv)
+        # A location gcloud would default is the target's, injected.
+        self.assertEqual(
+            ["gcloud", "--project=proj-a", "container", "clusters", "get-credentials", "cluster-a", "--location=us-central1"],
+            confine(["gcloud", "container", "clusters", "get-credentials", "cluster-a"], None, TARGET).argv,
+        )
+        for argv in (
+            ["gcloud", "container", "clusters", "get-credentials", "cluster-b", "--location=us-central1"],
+            ["gcloud", "container", "clusters", "get-credentials", "cluster-a", "--location=europe-west1"],
+            ["gcloud", "container", "clusters", "get-credentials", "cluster-a", "--location=us-central1", "--project=proj-b"],
+            # No "run as given": a cluster gcloud would default is one this
+            # side can't see.
+            ["gcloud", "container", "clusters", "get-credentials", "--location=us-central1"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+
+    def test_another_cluster_by_positional_is_refused(self):
+        self.refused(["gcloud", "container", "clusters", "describe", "cluster-b", "--location=us-central1"])
+
+    def test_an_unknown_flag_is_refused(self):
+        self.refused(["gcloud", "container", "clusters", "list", "--some-new-flag", "x"])
+
+
+class StoredDefaultTest(unittest.TestCase):
+    """Nothing a profile runs may change what a later bare command targets."""
+
+    def test_gcloud_config_writes_are_refused(self):
+        for argv in (
+            ["gcloud", "config", "set", "project", "other"],
+            ["gcloud", "config", "set", "account", "someone@example.com"],
+            ["gcloud", "config", "set", "auth/impersonate_service_account", "sa@other.iam.gserviceaccount.com"],
+            ["gcloud", "config", "set", "compute/region", "europe-west1"],
+            ["gcloud", "config", "set", "container/cluster", "cluster-b"],
+            ["gcloud", "config", "unset", "project"],
+            ["gcloud", "config", "configurations", "activate", "other"],
+            ["gcloud", "config", "configurations", "create", "other"],
+            ["gcloud", "config", "configurations", "delete", "other"],
+            ["gcloud", "beta", "config", "set", "project", "other"],
+            ["gcloud", "config", "set", "project", "other", "--help"],
+        ):
+            for target in (TARGET, None):
+                with self.subTest(argv=argv, target=target):
+                    with self.assertRaisesRegex(ConfinementRefusal, "changes the configuration"):
+                        confine(argv, None, target)
+
+    def test_kubectl_config_writes_are_refused(self):
+        for argv in (
+            ["kubectl", "config", "use-context", OTHER_CONTEXT],
+            ["kubectl", "config", "set-context", "--current", "--namespace=x"],
+            ["kubectl", "config", "set-cluster", "x"],
+            ["kubectl", "config", "set-credentials", "x"],
+            ["kubectl", "config", "set", "current-context", OTHER_CONTEXT],
+            ["kubectl", "config", "unset", "current-context"],
+            ["kubectl", "config", "delete-context", CONTEXT],
+            ["kubectl", "config", "rename-context", CONTEXT, "x"],
+            ["kubectl", "config", "use-context", OTHER_CONTEXT, "--help"],
+        ):
+            for target in (TARGET, None):
+                with self.subTest(argv=argv, target=target):
+                    try:
+                        confine(argv, None, target)
+                    except ConfinementRefusal as exc:
+                        # Refused for the write, or (--current, --namespace
+                        # are outside the allowlist) for a flag: either way,
+                        # never run.
+                        self.assertRegex(str(exc), "changes the kubeconfig|not a flag")
+                    else:
+                        self.fail(f"{argv} ran")
+
+    def test_the_config_reads_still_run(self):
+        for argv in (
+            ["gcloud", "config", "list"],
+            ["gcloud", "config", "get-value", "project"],
+            ["kubectl", "config", "view"],
+            ["kubectl", "config", "get-contexts"],
+            ["kubectl", "config", "current-context"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(confine(argv, None, None).isolated)
+                confine(argv, None, TARGET)
+
+
+class LocalOnlyTest(unittest.TestCase):
+    """Ruling (d): local-only commands run without a target; nothing else does."""
+
+    def test_local_only_commands_run_without_a_target(self):
+        for argv in (
+            ["kubectl", "version", "--client"],
+            ["kubectl", "--help"],
+            ["kubectl", "get", "pods", "--help"],
+            ["kubectl", "help"],
+            ["gcloud", "version"],
+            ["gcloud", "--help"],
+            ["gcloud", "container", "clusters", "list", "--help"],
+            ["gcloud", "config", "get", "project"],
+            ["gcloud", "config", "get-value", "account"],
+            ["gcloud", "auth", "list"],
+        ):
+            with self.subTest(argv=argv):
+                confined = confine(argv, None, None)
+                self.assertTrue(confined.isolated)
+                self.assertIsNone(confined.kubeconfig_context)
+                self.assertEqual(argv, confined.argv)
+
+    def test_without_a_target_nothing_else_runs(self):
+        for argv, context in (
+            (["kubectl", "get", "pods"], None),
+            (["kubectl", "version"], None),
+            (["kubectl", "version", "--client", f"--context={CONTEXT}"], None),
+            (["kubectl", "version", "--client"], CONTEXT),
+            (["gcloud", "container", "clusters", "list"], None),
+            (["gcloud", "container", "clusters", "list", "--project=proj-a"], None),
+            (["gcloud", "projects", "list"], None),
+        ):
+            with self.subTest(argv=argv, context=context):
+                with self.assertRaisesRegex(ConfinementRefusal, "no target|may not name"):
+                    confine(argv, context, None)
+
+    def test_a_target_that_is_not_a_gke_name_is_no_target(self):
+        self.assertIsNone(task_confinement.target_from_claims("proj_a", "us-central1", "c"))
+        self.assertEqual(TARGET, task_confinement.target_from_claims("proj-a", "us-central1", "cluster-a"))
+
+
+class _StubAuthenticator:
+    authenticates = True
+
+    def __init__(self, principal):
+        self.principal = principal
+
+    def authenticate(self, headers):
+        return self.principal
+
+
+class _RecordingExecutor:
+    ALLOWED_EXECUTABLES = credential_proxy.CommandExecutor.ALLOWED_EXECUTABLES
+
+    def __init__(self):
+        self.calls = []
+
+    def git_lease_violation(self, argv, cwd):
+        return None
+
+    def execute(self, argv, **kwargs):
+        self.calls.append((list(argv), kwargs))
+        return credential_proxy.ExecutionResult(
+            exit_code=0, stdout="ran", stderr="", duration_ms=0, truncated=False, timed_out=False,
+        )
+
+
+class ProfileRouteTest(unittest.TestCase):
+    """The broker end to end: header in, binding, confinement, executor out."""
+
+    def setUp(self):
+        for attribute in (
+            "policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator", "profile_gate",
+        ):
+            self.addCleanup(
+                self._restore, attribute, attribute in CredentialProxyHandler.__dict__,
+                CredentialProxyHandler.__dict__.get(attribute),
+            )
+        self.executor = _RecordingExecutor()
+        CredentialProxyHandler.executor = self.executor
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+        CredentialProxyHandler.enforce_read_only = True
+        self.principal = credential_proxy.Principal(
+            workload=PROFILE_SA, uid="sa-uid", role=credential_proxy.CALLER_ROLE_PROFILE, pod=POD, pod_uid=POD_UID,
+        )
+        CredentialProxyHandler.authenticator = _StubAuthenticator(self.principal)
+        self.now = VALID["now"]
+        self.identities = {PROFILE_SA: task_credential.ProfileIdentity("auditor", "read")}
+        self.set_gate()
+
+        self.records = []
+        level = credential_proxy.LOGGER.level
+        credential_proxy.LOGGER.setLevel(logging.INFO)
+        self.addCleanup(credential_proxy.LOGGER.setLevel, level)
+        test = self
+
+        class Capture(logging.Handler):
+            def emit(self, record):
+                test.records.append(record.getMessage() + " " + json.dumps(getattr(record, "audit", {}), default=str))
+
+        previous = list(credential_proxy.LOGGER.handlers)
+        propagate = credential_proxy.LOGGER.propagate
+        credential_proxy.LOGGER.handlers = [Capture()]
+        credential_proxy.LOGGER.propagate = False
+        self.addCleanup(setattr, credential_proxy.LOGGER, "propagate", propagate)
+        self.addCleanup(setattr, credential_proxy.LOGGER, "handlers", previous)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    @staticmethod
+    def _restore(attribute, was_set, original):
+        if was_set:
+            setattr(CredentialProxyHandler, attribute, original)
+        elif attribute in CredentialProxyHandler.__dict__:
+            delattr(CredentialProxyHandler, attribute)
+
+    def set_gate(self, trusted=None, identities=None, lifetime=None):
+        CredentialProxyHandler.profile_gate = credential_proxy.ProfileTaskGate(
+            trusted=tuple(trusted or DOC["trusted"]),
+            identities=self.identities if identities is None else identities,
+            max_lifetime_raw=lifetime or f"{DOC['max_lifetime_seconds']}s",
+            clock=lambda: self.now,
+        )
+
+    def post(self, payload, token=VALID["token"], path="/v1/exec"):
+        headers = {"Content-Type": "application/json"}
+        if token is not None:
+            headers[credential_proxy.TASK_CREDENTIAL_HEADER] = token
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}{path}",
+            data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, json.loads(error.read())
+
+    def assert_refused(self, status, body, rule):
+        self.assertEqual(403, status, body)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", body.get("code"), body)
+        self.assertEqual(rule, body["rule"])
+        self.assertEqual([], self.executor.calls, "a refused call reached the executor")
+
+    # -- a valid credential ------------------------------------------------
+
+    def test_a_bound_credential_runs_kubectl_on_the_target(self):
+        status, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        self.assertEqual(200, status, body)
+        (argv, kwargs), = self.executor.calls
+        self.assertEqual(["kubectl", f"--context={CONTEXT}", "get", "pods"], argv)
+        self.assertEqual(CONTEXT, kwargs["kubeconfig_context"])
+        self.assertNotIn("isolated", kwargs)
+
+    def test_a_bound_credential_gives_gcloud_the_target_project(self):
+        status, body = self.post({"argv": ["gcloud", "container", "clusters", "list"]})
+        self.assertEqual(200, status, body)
+        (argv, _), = self.executor.calls
+        self.assertEqual(["gcloud", "--project=proj-a", "container", "clusters", "list", "--location=us-central1"], argv)
+
+    def test_changing_a_default_is_refused_at_the_proxy(self):
+        for argv in (["gcloud", "config", "set", "project", "other"], ["kubectl", "config", "use-context", OTHER_CONTEXT]):
+            with self.subTest(argv=argv):
+                status, body = self.post({"argv": argv})
+                self.assert_refused(status, body, task_confinement.RULE_TASK_TARGET)
+
+    def test_a_call_outside_the_target_is_refused_at_the_proxy(self):
+        for argv in (
+            ["kubectl", "get", "pods", f"--context={OTHER_CONTEXT}"],
+            ["gcloud", "container", "clusters", "list", "--project=proj-b"],
+            ["gcloud", "container", "clusters", "get-credentials", "cluster-b", "--location=us-central1"],
+        ):
+            with self.subTest(argv=argv):
+                status, body = self.post({"argv": argv})
+                self.assert_refused(status, body, task_confinement.RULE_TASK_TARGET)
+
+    def test_a_kubeconfig_context_outside_the_target_is_refused(self):
+        status, body = self.post({"argv": ["kubectl", "get", "pods"], "kubeconfigContext": OTHER_CONTEXT})
+        self.assert_refused(status, body, task_confinement.RULE_TASK_TARGET)
+
+    def test_the_token_is_never_logged_and_its_jti_is(self):
+        self.post({"argv": ["kubectl", "get", "pods"]})
+        self.post({"argv": ["kubectl", "get", "pods"]}, token=CASES["the nats audience"]["token"])
+        joined = "\n".join(self.records)
+        self.assertNotIn(VALID["token"], joined)
+        self.assertNotIn(VALID["token"].split(".")[2], joined)
+        self.assertNotIn(CASES["the nats audience"]["token"].split(".")[2], joined)
+        self.assertIn("jti FIXTUREJTI", joined)
+
+    # -- the mandatory credential -------------------------------------------
+
+    def test_no_credential_runs_no_cluster_call(self):
+        for argv in (["kubectl", "get", "pods"], ["gcloud", "container", "clusters", "list"]):
+            with self.subTest(argv=argv):
+                status, body = self.post({"argv": argv}, token=None)
+                self.assert_refused(status, body, task_confinement.RULE_TASK_TARGET)
+
+    def test_no_credential_still_runs_local_only_commands_isolated(self):
+        status, body = self.post({"argv": ["kubectl", "version", "--client"]}, token=None)
+        self.assertEqual(200, status, body)
+        (_, kwargs), = self.executor.calls
+        self.assertTrue(kwargs["isolated"])
+        self.assertIsNone(kwargs["kubeconfig_context"])
+
+    def test_no_gate_is_no_task(self):
+        CredentialProxyHandler.profile_gate = None
+        status, body = self.post({"argv": ["kubectl", "get", "pods"]}, token=None)
+        self.assert_refused(status, body, task_confinement.RULE_TASK_TARGET)
+        status, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        self.assert_refused(status, body, credential_proxy.RULE_TASK_CREDENTIAL)
+
+    def test_two_credential_headers_are_refused(self):
+        # urllib folds a repeated header into one; http.client sends both.
+        body = json.dumps({"argv": ["kubectl", "get", "pods"]}).encode("utf-8")
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
+        self.addCleanup(connection.close)
+        connection.putrequest("POST", "/v1/exec")
+        connection.putheader("Content-Type", "application/json")
+        connection.putheader("Content-Length", str(len(body)))
+        connection.putheader(credential_proxy.TASK_CREDENTIAL_HEADER, VALID["token"])
+        connection.putheader(credential_proxy.TASK_CREDENTIAL_HEADER, CASES["the nats audience"]["token"])
+        connection.endheaders(body)
+        response = connection.getresponse()
+        self.assert_refused(response.status, json.loads(response.read()), credential_proxy.RULE_TASK_CREDENTIAL)
+
+    # -- the binding ----------------------------------------------------------
+
+    def refused_credential(self):
+        status, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        self.assert_refused(status, body, credential_proxy.RULE_TASK_CREDENTIAL)
+        return body["message"]
+
+    def test_another_pod_is_refused(self):
+        CredentialProxyHandler.authenticator = _StubAuthenticator(
+            credential_proxy.Principal(workload=PROFILE_SA, role=credential_proxy.CALLER_ROLE_PROFILE, pod="auditor-read-other", pod_uid=POD_UID)
+        )
+        self.assertIn("another pod", self.refused_credential())
+
+    def test_another_pod_uid_is_refused(self):
+        CredentialProxyHandler.authenticator = _StubAuthenticator(
+            credential_proxy.Principal(workload=PROFILE_SA, role=credential_proxy.CALLER_ROLE_PROFILE, pod=POD, pod_uid="99999999-0000-0000-0000-000000000000")
+        )
+        self.assertIn("pod UID", self.refused_credential())
+
+    def test_another_profile_is_refused(self):
+        self.set_gate(identities={PROFILE_SA: task_credential.ProfileIdentity("other-profile", "read")})
+        self.assertIn("profile", self.refused_credential())
+
+    def test_another_tier_is_refused(self):
+        self.set_gate(identities={PROFILE_SA: task_credential.ProfileIdentity("auditor", "unattended")})
+        self.assertIn("tier", self.refused_credential())
+
+    def test_an_unmapped_service_account_is_refused(self):
+        self.set_gate(identities={})
+        self.assertIn("no profile identity", self.refused_credential())
+
+    def test_an_expired_credential_is_refused(self):
+        self.now = VALID["claims"]["exp"] + 60
+        self.assertIn("expired", self.refused_credential())
+
+    def test_the_wrong_audience_is_refused(self):
+        status, body = self.post({"argv": ["kubectl", "get", "pods"]}, token=CASES["the nats audience"]["token"])
+        self.assert_refused(status, body, credential_proxy.RULE_TASK_CREDENTIAL)
+
+    def test_an_untrusted_key_is_refused(self):
+        self.set_gate(trusted=[DOC["untrusted"]])
+        self.assertIn("not a trusted", self.refused_credential())
+
+    def test_an_unusable_lifetime_setting_refuses_every_credential(self):
+        self.set_gate(lifetime="forever")
+        self.assertIn("A2A_TASK_CREDENTIAL_MAX_LIFETIME", self.refused_credential())
+
+    def test_a_refused_credential_is_refused_even_for_a_local_command(self):
+        # A presented credential that fails is loud, not a quiet downgrade to
+        # local-only.
+        self.set_gate(trusted=[DOC["untrusted"]])
+        status, body = self.post({"argv": ["kubectl", "version", "--client"]})
+        self.assert_refused(status, body, credential_proxy.RULE_TASK_CREDENTIAL)
+
+    def test_other_roles_ignore_the_header(self):
+        shell = credential_proxy.Principal(workload="system:serviceaccount:ns:shell", role=credential_proxy.CALLER_ROLE_SHELL)
+        CredentialProxyHandler.authenticator = _StubAuthenticator(shell)
+        self.set_gate(trusted=[DOC["untrusted"]])
+        status, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        self.assertEqual(200, status, body)
+        (_, kwargs), = self.executor.calls
+        self.assertIsNone(kwargs["kubeconfig_context"])
+        self.assertNotIn("isolated", kwargs)
+
+    def test_the_profile_flag_allowlist_is_the_sessions(self):
+        status, body = self.post({"argv": ["kubectl", "get", "-f", "/etc/credential-proxy/policy.json"]})
+        self.assert_refused(status, body, credential_proxy.RULE_CALLER_KUBECTL_FLAG)
+
+    def test_git_is_not_a_profile_executable(self):
+        routed = (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git")
+        with mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", routed):
+            status, body = self.post({"argv": ["git", "status"]})
+        self.assert_refused(status, body, credential_proxy.RULE_CALLER_EXECUTABLE)
+
+
+class ChangedDefaultTest(unittest.TestCase):
+    """A stored default that changed anyway does not move a profile's call.
+
+    The real executor runs stub CLIs that resolve their target the way the
+    real ones do: an explicit flag first, then the stored default. The
+    defaults here point elsewhere (a gcloud configuration naming another
+    project, region and cluster; a kubeconfig whose current-context is
+    another cluster), as if a write had got past the refusals. The call still
+    reaches the token's target, because the injected flags beat the defaults.
+    """
+
+    GCLOUD_STUB = """#!{python}
+import sys
+args = sys.argv[1:]
+def flag(name, default):
+    value = default
+    for i, a in enumerate(args):
+        if a == name and i + 1 < len(args):
+            value = args[i + 1]
+        elif a.startswith(name + "="):
+            value = a.split("=", 1)[1]
+    return value
+# The stored configuration, changed to point elsewhere.
+print("project=" + flag("--project", "other-project"))
+print("location=" + flag("--location", "europe-west1"))
+print("cluster=" + flag("--cluster", "cluster-b"))
+"""
+
+    KUBECTL_STUB = """#!{python}
+import os, sys
+args = sys.argv[1:]
+context = None
+for i, a in enumerate(args):
+    if a == "--context" and i + 1 < len(args):
+        context = args[i + 1]
+    elif a.startswith("--context="):
+        context = a.split("=", 1)[1]
+if context is None:
+    for line in open(os.environ["KUBECONFIG"]):
+        if line.startswith("current-context:"):
+            context = line.split(":", 1)[1].strip()
+print("context=" + context)
+"""
+
+    def setUp(self):
+        import sys
+        import tempfile
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        for attribute in ("policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator", "profile_gate"):
+            self.addCleanup(
+                ProfileRouteTest._restore, attribute, attribute in CredentialProxyHandler.__dict__,
+                CredentialProxyHandler.__dict__.get(attribute),
+            )
+        policy_path = root / "policy.json"
+        policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        executor = credential_proxy.CommandExecutor(
+            timeout_seconds=10, max_output_bytes=4096, state_dir=str(root / "state"), scoped_pool=None,
+        )
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        for name, body in (("gcloud", self.GCLOUD_STUB), ("kubectl", self.KUBECTL_STUB)):
+            stub = bin_dir / name
+            stub.write_text(body.format(python=sys.executable), encoding="utf-8")
+            stub.chmod(0o755)
+            executor.executables[name] = str(stub)
+        # The kubeconfig the broker resolves for the target, with its
+        # current-context moved to another cluster; and the host's, which a
+        # call naming no cluster must never reach.
+        self.resolved = []
+        target_file = root / "target.yaml"
+        target_file.write_text(f"apiVersion: v1\nkind: Config\ncurrent-context: {OTHER_CONTEXT}\n", encoding="utf-8")
+
+        def resolve(context, scoped=True):
+            self.resolved.append(context)
+            return target_file
+
+        executor._resolve_kubeconfig = resolve
+        executor._default_kubeconfig = mock.Mock(side_effect=AssertionError("the host kubeconfig was resolved"))
+        CredentialProxyHandler.executor = executor
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+        CredentialProxyHandler.enforce_read_only = True
+        CredentialProxyHandler.authenticator = _StubAuthenticator(credential_proxy.Principal(
+            workload=PROFILE_SA, role=credential_proxy.CALLER_ROLE_PROFILE, pod=POD, pod_uid=POD_UID,
+        ))
+        CredentialProxyHandler.profile_gate = credential_proxy.ProfileTaskGate(
+            trusted=tuple(DOC["trusted"]),
+            identities={PROFILE_SA: task_credential.ProfileIdentity("auditor", "read")},
+            max_lifetime_raw="1h",
+            clock=lambda: VALID["now"],
+        )
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def run_bare(self, argv):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}/v1/exec",
+            data=json.dumps({"argv": argv}).encode("utf-8"),
+            headers={"Content-Type": "application/json", credential_proxy.TASK_CREDENTIAL_HEADER: VALID["token"]},
+            method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            body = json.loads(response.read())
+        self.assertEqual(0, body["exitCode"], body)
+        return dict(line.split("=", 1) for line in body["stdout"].splitlines())
+
+    def test_a_bare_gcloud_call_reaches_the_target_whatever_the_stored_default(self):
+        seen = self.run_bare(["gcloud", "container", "node-pools", "list"])
+        self.assertEqual({"project": "proj-a", "location": "us-central1", "cluster": "cluster-a"}, seen)
+        seen = self.run_bare(["gcloud", "container", "clusters", "list"])
+        self.assertEqual(("proj-a", "us-central1"), (seen["project"], seen["location"]))
+
+    def test_a_bare_kubectl_call_reaches_the_target_whatever_the_current_context(self):
+        seen = self.run_bare(["kubectl", "get", "pods"])
+        self.assertEqual({"context": CONTEXT}, seen)
+        self.assertEqual([CONTEXT], self.resolved)
+
+
+class ProfileRouteTableTest(unittest.TestCase):
+    def test_the_profile_role_reaches_the_exec_route_alone(self):
+        for prefix, roles in credential_proxy.ROUTE_ROLES:
+            with self.subTest(prefix=prefix):
+                self.assertEqual(prefix == "/v1/exec", credential_proxy.CALLER_ROLE_PROFILE in roles)
+
+    def test_the_shim_and_the_broker_name_one_header(self):
+        import credential_proxy_client
+
+        self.assertEqual(credential_proxy.TASK_CREDENTIAL_HEADER, credential_proxy_client.TASK_CREDENTIAL_HEADER)
+
+    def test_kubectl_and_gcloud_only(self):
+        self.assertEqual(frozenset({"kubectl", "gcloud"}), credential_proxy.ROLE_EXECUTABLES[credential_proxy.CALLER_ROLE_PROFILE])
+
+
+class ProfileAuthenticatorTest(unittest.TestCase):
+    """The profile audience and the identity map's ServiceAccounts go together."""
+
+    SHELL = "kubeagents-credential-proxy"
+    CHAT = "kubeagents-credential-proxy-chat"
+    PROFILE = "kubeagents-credential-proxy-profile"
+    AGENT = "system:serviceaccount:kubeagents-system:agent"
+
+    def _authenticator(self, identities=None):
+        return credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                self.SHELL: credential_proxy.CALLER_ROLE_SHELL,
+                self.CHAT: credential_proxy.CALLER_ROLE_CHAT,
+                self.PROFILE: credential_proxy.CALLER_ROLE_PROFILE,
+            },
+            allowed_callers=frozenset({self.AGENT, PROFILE_SA}),
+            profile_identities={PROFILE_SA: task_credential.ProfileIdentity("auditor", "read")} if identities is None else identities,
+            api_host="10.0.0.1", api_port="443", ca_file="", token_file="/nonexistent", cache_seconds=0.0,
+        )
+
+    def _review(self, username, audience, extra=None):
+        user = {"username": username, "uid": "sa-uid", "groups": []}
+        if extra is not None:
+            user["extra"] = extra
+        return {"status": {"authenticated": True, "audiences": [audience], "user": user}}
+
+    def test_a_profile_caller_gets_the_profile_role_with_its_pod_and_uid(self):
+        principal = self._authenticator()._principal_from(self._review(
+            PROFILE_SA, self.PROFILE,
+            {credential_proxy.TOKEN_REVIEW_POD_NAME_EXTRA: [POD], credential_proxy.TOKEN_REVIEW_POD_UID_EXTRA: [POD_UID]},
+        ))
+        self.assertEqual(credential_proxy.CALLER_ROLE_PROFILE, principal.role)
+        self.assertEqual(POD, principal.pod)
+        self.assertEqual(POD_UID, principal.pod_uid)
+
+    def test_a_profile_caller_presenting_another_audience_is_refused(self):
+        with self.assertRaisesRegex(credential_proxy.AuthenticationError, "only the profile audience"):
+            self._authenticator()._principal_from(self._review(PROFILE_SA, self.SHELL))
+
+    def test_another_caller_presenting_the_profile_audience_is_refused(self):
+        with self.assertRaisesRegex(credential_proxy.AuthenticationError, "only for profile callers"):
+            self._authenticator()._principal_from(self._review(self.AGENT, self.PROFILE))
+
+    def test_an_empty_identity_map_confers_the_role_on_nobody(self):
+        with self.assertRaisesRegex(credential_proxy.AuthenticationError, "only for profile callers"):
+            self._authenticator(identities={})._principal_from(self._review(PROFILE_SA, self.PROFILE))
+
+
+class ProfileEnvironmentTest(unittest.TestCase):
+    """build_authenticator and build_profile_gate read the operator's rendering."""
+
+    BASE = {
+        "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+        "CREDENTIAL_PROXY_ALLOWED_CALLERS": f"system:serviceaccount:ns:agent,{PROFILE_SA}",
+        "CREDENTIAL_PROXY_AUDIENCE": "aud-shell",
+        "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+        "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+    }
+
+    def build(self, **env):
+        with mock.patch.dict(os.environ, {**self.BASE, **env}, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+            return authenticator, credential_proxy.build_profile_gate(authenticator)
+
+    def test_the_profile_role_is_conferred_with_its_map_and_keys(self):
+        authenticator, gate = self.build(
+            CREDENTIAL_PROXY_PROFILE_AUDIENCE="aud-profile",
+            CREDENTIAL_PROXY_PROFILE_IDENTITIES=json.dumps({PROFILE_SA: {"profile": "auditor", "tier": "read"}}),
+            A2A_TASK_SIGNING_PUBLIC_KEYS=DOC["trusted"][0],
+        )
+        self.assertEqual(credential_proxy.CALLER_ROLE_PROFILE, authenticator.audience_roles["aud-profile"])
+        self.assertEqual(frozenset({PROFILE_SA}), authenticator.profile_callers)
+        self.assertEqual(tuple(DOC["trusted"]), gate.trusted)
+        self.assertEqual(task_credential.DEFAULT_MAX_LIFETIME_SECONDS, gate.max_lifetime)
+
+    def test_no_profile_audience_is_no_role_and_no_gate(self):
+        authenticator, gate = self.build()
+        self.assertNotIn(credential_proxy.CALLER_ROLE_PROFILE, authenticator.audience_roles.values())
+        self.assertIsNone(gate)
+
+    def test_a_malformed_identity_map_stops_the_broker(self):
+        with self.assertRaisesRegex(RuntimeError, "CREDENTIAL_PROXY_PROFILE_IDENTITIES"):
+            self.build(CREDENTIAL_PROXY_PROFILE_AUDIENCE="aud-profile", CREDENTIAL_PROXY_PROFILE_IDENTITIES="[]")
+
+    def test_malformed_keys_stop_the_broker(self):
+        identities = json.dumps({PROFILE_SA: {"profile": "auditor", "tier": "read"}})
+        for keys in ("not-a-key", ",".join([DOC["trusted"][0], DOC["untrusted"], DOC["trusted"][0]])):
+            with self.subTest(keys=keys[:20]):
+                with self.assertRaisesRegex(RuntimeError, "A2A_TASK_SIGNING_PUBLIC_KEYS"):
+                    self.build(
+                        CREDENTIAL_PROXY_PROFILE_AUDIENCE="aud-profile",
+                        CREDENTIAL_PROXY_PROFILE_IDENTITIES=identities,
+                        A2A_TASK_SIGNING_PUBLIC_KEYS=keys,
+                    )
+
+    def test_a_colliding_profile_audience_is_not_conferred(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            authenticator, gate = self.build(CREDENTIAL_PROXY_PROFILE_AUDIENCE="aud-shell")
+        self.assertNotIn(credential_proxy.CALLER_ROLE_PROFILE, authenticator.audience_roles.values())
+        self.assertIsNone(gate)
+
+
+class IsolatedExecutionTest(unittest.TestCase):
+    """An isolated command runs against an empty kubeconfig, never the host's."""
+
+    def test_isolated_kubectl_reads_no_kubeconfig(self):
+        executor = credential_proxy.CommandExecutor.__new__(credential_proxy.CommandExecutor)
+        executor.executables = {"kubectl": "/bin/kubectl", "gcloud": "/bin/gcloud"}
+        executor.kubectl_timeout_seconds = 60
+        seen = {}
+
+        def fake_execute(command, **kwargs):
+            seen["command"], seen["kwargs"] = command, kwargs
+            return credential_proxy.ExecutionResult(exit_code=0, stdout="", stderr="", duration_ms=0, truncated=False, timed_out=False)
+
+        executor._execute = fake_execute
+        executor._default_kubeconfig = mock.Mock(side_effect=AssertionError("the host kubeconfig was resolved"))
+        executor._resolve_kubeconfig = mock.Mock(side_effect=AssertionError("a kubeconfig was resolved"))
+        executor.execute(["kubectl", "version", "--client"], isolated=True)
+        self.assertEqual(Path(os.devnull), seen["kwargs"]["kubeconfig_path"])
+        with self.assertRaises(ValueError):
+            executor.execute(["gcloud", "container", "clusters", "get-credentials", "c"], isolated=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

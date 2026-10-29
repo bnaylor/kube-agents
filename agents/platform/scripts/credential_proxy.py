@@ -50,6 +50,7 @@ import mcp_policy
 import providers
 import repo_ref
 import scoped_sa_pool
+import task_confinement
 import vcs_broker
 import watcher_policy
 
@@ -985,6 +986,14 @@ DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE = "kubeagents-credential-proxy-chat"
 # not known", rather than with some other role's reach.
 DEFAULT_CREDENTIAL_PROXY_MCP_AUDIENCE = "kubeagents-credential-proxy-mcp"
 
+# The profile workers' audience (#3889). An AgentProfile's worker pod runs
+# model output and reaches this broker the way a session pod does, over the
+# ClusterIP with a projected token, and gets a role of its own: the exec route,
+# kubectl and gcloud, each call confined to the cluster its task's credential
+# names (task_confinement). Same upgrade story as the session audience: unset
+# means the role is never conferred.
+DEFAULT_CREDENTIAL_PROXY_PROFILE_AUDIENCE = "kubeagents-credential-proxy-profile"
+
 # The roles a caller can hold, named by which Pod holds them.
 CALLER_ROLE_SHELL = "shell"
 CALLER_ROLE_CHAT = "chat"
@@ -1005,10 +1014,25 @@ CALLER_ROLE_WATCHER = "watcher"
 # so nothing it can be asked to do may write to a forge, clone into the broker,
 # or spend the forge credential on anything but a read of a managed repository.
 CALLER_ROLE_MCP = "mcp"
+# An AgentProfile worker pod (#3889). Exec route only, kubectl and gcloud only,
+# with the session's kubectl flag allowlist, and every call held to the target
+# cluster in the task credential the pod presents (TASK_CREDENTIAL_HEADER). The
+# credential is mandatory for anything that reaches a cluster or a project: a
+# profile caller without a valid one runs local-only commands and nothing else.
+CALLER_ROLE_PROFILE = "profile"
 
 # The TokenReview user.extra key under which the API server names the Pod a
 # projected token is bound to.
 TOKEN_REVIEW_POD_NAME_EXTRA = "authentication.kubernetes.io/pod-name"
+# And the Pod's UID, under the same binding. Read for every role; only the
+# profile role's task-credential binding compares it.
+TOKEN_REVIEW_POD_UID_EXTRA = "authentication.kubernetes.io/pod-uid"
+
+# The request header a profile worker's shim sends its task credential in
+# (credential_proxy_client.TASK_CREDENTIAL_HEADER). A header, never a body
+# field: the body is the model's argv, and the credential is not the model's to
+# compose. Never logged; a verified credential is logged by its jti.
+TASK_CREDENTIAL_HEADER = "X-Kube-Agents-Task-Credential"
 
 # Every role that exists, for the table check below. Note that two of them
 # nest: "chat" is a substring of "a2a-chat". Nothing here may compare roles in
@@ -1020,6 +1044,7 @@ CALLER_ROLES = (
     CALLER_ROLE_SESSION,
     CALLER_ROLE_WATCHER,
     CALLER_ROLE_MCP,
+    CALLER_ROLE_PROFILE,
 )
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
@@ -1029,6 +1054,7 @@ CALLER_ROLES = (
 # refusal: widening the route never widens a session.
 ROLE_EXECUTABLES: dict[str, frozenset[str]] = {
     CALLER_ROLE_SESSION: frozenset({"kubectl", "gcloud"}),
+    CALLER_ROLE_PROFILE: frozenset({"kubectl", "gcloud"}),
 }
 
 
@@ -1163,12 +1189,12 @@ def _session_output_permitted(value: str) -> bool:
 def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
     """The first kubectl flag a session caller may not pass, or None.
 
-    Only the session role's kubectl is narrowed; every other role and every
-    other executable keeps the executor's behaviour. Returns the flag as a
-    name (`-f`, `--output`), never the value beside it, for the refusal
-    message and the audit line.
+    Only the session and profile roles' kubectl is narrowed, both to this one
+    allowlist; every other role and every other executable keeps the
+    executor's behaviour. Returns the flag as a name (`-f`, `--output`), never
+    the value beside it, for the refusal message and the audit line.
     """
-    if role != CALLER_ROLE_SESSION or not argv or argv[0] != "kubectl":
+    if role not in (CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE) or not argv or argv[0] != "kubectl":
         return None
     tokens = argv[1:]
     index = 0
@@ -1248,7 +1274,9 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # 404s anything else under it, so the prefix admits nothing extra today.
     ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
     ("/v1/chat/", (CALLER_ROLE_CHAT,)),
-    ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION)),
+    # The profile role reaches this route and no other: the Cloud API relay,
+    # the MCP relay, the watcher and Pub/Sub routes all stay closed to it.
+    ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE)),
     # The feedback form verb: the sandbox's one way to file a report about
     # kube-agents itself (feedback_broker.py). The shell alone: a session pod
     # files nothing on anyone's behalf.
@@ -2155,10 +2183,14 @@ class Principal:
     layer downstream reads ``principal.caller`` where it reads
     ``principal.workload`` today. Nothing about the request shape, the
     handler, or the operator's rendering has to change again.
-    ``caller`` stays None until then. What must hold in the meantime is that
-    neither field is ever derived from the request body — from ``argv``, from
-    ``cwd``, from anything a model produced. Both come from a token the API
-    server verified.
+    ``caller`` stays None until then for every role but one: a profile
+    caller's verified task credential (#3889) fills it with the task and the
+    credential's jti, and ``task`` and ``task_target`` with its claims. That
+    credential arrives in a request header (TASK_CREDENTIAL_HEADER), never the
+    body, and is bound to the pod the TokenReview attested before anything
+    reads it (ProfileTaskGate). What must hold is that none of these fields is
+    ever derived from the request body — from ``argv``, from ``cwd``, from
+    anything a model produced. Each comes from a token a verifier checked.
 
     ``role`` is the coarse version of that idea which does hold today, and it
     comes from the same place: the audience the API server validated the token
@@ -2173,7 +2205,8 @@ class Principal:
     TokenReview's ``user.extra``. It is for the audit line, not for policy: a
     session Pod is one conversation, so it is what traces a brokered command
     back to the conversation that asked for it. "" when the token is not
-    Pod-bound.
+    Pod-bound. ``pod_uid`` is that Pod's UID from the same ``user.extra``,
+    which the profile role's task-credential binding compares.
     """
 
     workload: str
@@ -2182,6 +2215,11 @@ class Principal:
     caller: str | None = None
     role: str = ""
     pod: str = ""
+    pod_uid: str = ""
+    # A profile caller's verified task credential (task_credential.TaskClaims)
+    # and its target as a cluster triple; None without one.
+    task: Any = None
+    task_target: ClusterTarget | None = None
 
     def describe(self) -> str:
         # The pod is deliberately NOT here. This string is the `principal`
@@ -2246,6 +2284,13 @@ class ServiceAccountAuthenticator:
     leave the audience deciding: the mcp role postdates its binding, so no
     operator renders the audience without the callers, and an empty set
     confers the mcp role to nobody.
+
+    ``profile_identities`` binds the profile role the way ``mcp_callers``
+    binds the mcp one, empty meaning nobody: its keys are the profile workers'
+    ServiceAccounts, each held to the profile audience and the only callers
+    that may present it. The values, each ServiceAccount's (profile, tier),
+    are what ProfileTaskGate binds a task credential to; a profile worker is
+    named here or refused.
     """
 
     authenticates = True
@@ -2262,6 +2307,7 @@ class ServiceAccountAuthenticator:
         cache_seconds: float = 60.0,
         session_callers: frozenset[str] = frozenset(),
         mcp_callers: frozenset[str] = frozenset(),
+        profile_identities: Mapping[str, Any] | None = None,
     ) -> None:
         if not audience_roles or not all(audience_roles):
             raise ValueError("an audience is required to authenticate callers")
@@ -2273,6 +2319,8 @@ class ServiceAccountAuthenticator:
         self.allowed_callers = allowed_callers
         self.session_callers = session_callers
         self.mcp_callers = mcp_callers
+        self.profile_identities = dict(profile_identities or {})
+        self.profile_callers = frozenset(self.profile_identities)
         self.api_host = api_host
         self.api_port = api_port
         self.ca_file = ca_file
@@ -2410,17 +2458,153 @@ class ServiceAccountAuthenticator:
         # callers named the mcp audience confers nothing.
         if role == CALLER_ROLE_MCP and username not in self.mcp_callers:
             raise AuthenticationError("the mcp audience is only for mcp callers")
+        # The profile binding, as the mcp one: empty names nobody.
+        if username in self.profile_callers and role != CALLER_ROLE_PROFILE:
+            raise AuthenticationError("a profile caller may present only the profile audience")
+        if role == CALLER_ROLE_PROFILE and username not in self.profile_callers:
+            raise AuthenticationError("the profile audience is only for profile callers")
         groups = user.get("groups") or []
         extra = user.get("extra") or {}
         pod_names = (extra.get(TOKEN_REVIEW_POD_NAME_EXTRA) or []) if isinstance(extra, dict) else []
         pod = pod_names[0] if isinstance(pod_names, list) and pod_names else ""
+        pod_uids = (extra.get(TOKEN_REVIEW_POD_UID_EXTRA) or []) if isinstance(extra, dict) else []
+        pod_uid = pod_uids[0] if isinstance(pod_uids, list) and pod_uids else ""
         return Principal(
             workload=username,
             uid=str(user.get("uid") or ""),
             groups=tuple(str(group) for group in groups if isinstance(group, str)),
             role=role,
             pod=pod if isinstance(pod, str) else "",
+            pod_uid=pod_uid if isinstance(pod_uid, str) else "",
         )
+
+
+# The profile role's configuration (#3889). All four are rendered by the
+# operator and reserved against spec.deployment.env (mergeCredentialProxyEnv).
+PROFILE_AUDIENCE_ENV = "CREDENTIAL_PROXY_PROFILE_AUDIENCE"
+# JSON: {"system:serviceaccount:<ns>:<sa>": {"profile": ..., "tier": ...}}.
+PROFILE_IDENTITIES_ENV = "CREDENTIAL_PROXY_PROFILE_IDENTITIES"
+# The task-signing public keys (C..., comma separated, one or two) and the
+# lifetime ceiling, the same two variables, read the same way, as the auth
+# callout's (authcallout.ParseTaskSigningKeys, ParseTaskCredentialMaxLifetime).
+TASK_SIGNING_KEYS_ENV = "A2A_TASK_SIGNING_PUBLIC_KEYS"
+TASK_CREDENTIAL_MAX_LIFETIME_ENV = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
+# The audit rule a refused task credential is recorded under. Confinement
+# refusals are task_confinement.RULE_TASK_TARGET.
+RULE_TASK_CREDENTIAL = "caller.task-credential"
+
+
+class TaskCredentialRefused(Exception):
+    """A profile caller presented a task credential that did not verify or bind.
+
+    The message is the verifier's or the binder's, which never quotes the
+    token. A missing credential is not this: it leaves the caller with
+    local-only commands (task_confinement), where a presented-and-refused one
+    refuses the request outright.
+    """
+
+
+class ProfileTaskGate:
+    """Verify a profile caller's task credential and bind it to the caller.
+
+    Built once at startup (build_profile_gate). ``admit`` runs per request, and
+    is not cached with the TokenReview: the credential changes per task on a
+    warm pod while its ServiceAccount token does not.
+    """
+
+    def __init__(
+        self,
+        trusted: tuple[str, ...],
+        identities: Mapping[str, Any],
+        max_lifetime_raw: str | None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        import task_credential
+
+        self._verifier = task_credential
+        self.trusted = trusted
+        self.identities = dict(identities)
+        self.clock = clock
+        # As the callout does: an unusable ceiling refuses every credential,
+        # naming it, rather than falling back to the default.
+        self.max_lifetime: float | None = None
+        self.lifetime_problem: str | None = None
+        try:
+            self.max_lifetime = task_credential.max_lifetime_from_env(max_lifetime_raw)
+        except task_credential.TaskCredentialError as exc:
+            self.lifetime_problem = str(exc)
+
+    def admit(self, principal: Principal, token: str | None) -> Principal:
+        """``principal`` with its task, or unchanged when no credential came.
+
+        Raises TaskCredentialRefused for a credential that is present and
+        fails: one that doesn't verify, is bound to another pod, UID, profile
+        or tier, or names a target that isn't a GKE cluster.
+        """
+        if token is None or not token.strip():
+            return principal
+        verifier = self._verifier
+        if self.lifetime_problem is not None:
+            raise TaskCredentialRefused(self.lifetime_problem)
+        try:
+            claims = verifier.verify(token.strip(), self.trusted, self.clock(), self.max_lifetime)
+        except verifier.TaskCredentialError as exc:
+            raise TaskCredentialRefused(str(exc)) from exc
+        try:
+            verifier.bind(
+                claims,
+                workload=principal.workload,
+                pod=principal.pod,
+                pod_uid=principal.pod_uid,
+                identities=self.identities,
+            )
+        except verifier.TaskCredentialError as exc:
+            raise TaskCredentialRefused(f"{exc} (jti {claims.jti})") from exc
+        target = task_confinement.target_from_claims(
+            claims.target.project, claims.target.location, claims.target.cluster
+        )
+        if target is None:
+            raise TaskCredentialRefused(f"the task credential's target is not a GKE cluster name (jti {claims.jti})")
+        return replace(
+            principal,
+            caller=f"task {claims.task} jti {claims.jti}",
+            task=claims,
+            task_target=target,
+        )
+
+
+def build_profile_gate(
+    authenticator: NullAuthenticator | ServiceAccountAuthenticator,
+) -> ProfileTaskGate | None:
+    """The task-credential gate, when the authenticator confers the profile role.
+
+    The trusted keys are validated here, at startup: an operator-rendered
+    value that isn't one or two task-signing public keys stops the broker
+    rather than leaving every profile call to fail. No keys at all is a broker
+    whose profile callers get local-only commands, said once in the log.
+    """
+    if CALLER_ROLE_PROFILE not in getattr(authenticator, "audience_roles", {}).values():
+        return None
+    import task_credential
+
+    try:
+        trusted = task_credential.parse_trusted_keys(os.getenv(TASK_SIGNING_KEYS_ENV, ""))
+    except task_credential.TaskCredentialError as exc:
+        raise RuntimeError(f"{TASK_SIGNING_KEYS_ENV} is malformed: {exc}") from exc
+    if not trusted:
+        LOGGER.warning(
+            "the profile role is conferred but %s names no task-signing key; every profile "
+            "task credential is refused, and profile callers run local-only commands only",
+            TASK_SIGNING_KEYS_ENV,
+        )
+    gate = ProfileTaskGate(
+        trusted=trusted,
+        identities=authenticator.profile_identities,
+        max_lifetime_raw=os.getenv(TASK_CREDENTIAL_MAX_LIFETIME_ENV),
+    )
+    if gate.lifetime_problem is not None:
+        LOGGER.error("%s; every profile task credential is refused", gate.lifetime_problem)
+    return gate
 
 
 def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
@@ -2478,6 +2662,9 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         for caller in os.getenv("CREDENTIAL_PROXY_MCP_CALLERS", "").split(",")
         if caller.strip()
     )
+    # The profile workers' identities, read only once the profile audience is
+    # conferred below; an empty map confers the role on nobody.
+    profile_identities: dict[str, Any] = {}
     if chat_audience and chat_audience != shell_audience:
         audience_roles = {
             shell_audience: CALLER_ROLE_SHELL,
@@ -2542,6 +2729,41 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                     "is not; the mcp role is bound to the callers named there, so every "
                     "caller presenting the mcp audience is refused"
                 )
+        # The profile workers' audience (#3889), read raw for the same reason,
+        # and refused on a collision for the mcp one's. Its callers come from
+        # the identity map rather than a list of their own: one rendering
+        # names each worker ServiceAccount and its (profile, tier), so the
+        # binding and the map can't disagree.
+        profile_audience = os.getenv(PROFILE_AUDIENCE_ENV, "").strip()
+        if profile_audience and profile_audience in audience_roles:
+            LOGGER.warning(
+                "%s equals the %s audience; the profile role needs an audience of its own, "
+                "so it is not conferred",
+                PROFILE_AUDIENCE_ENV,
+                audience_roles[profile_audience] or CALLER_ROLE_SHELL,
+            )
+        elif profile_audience:
+            # Imported here: task_credential needs `cryptography`, which only a
+            # broker that confers the profile role does.
+            import task_credential
+
+            try:
+                profile_identities = dict(
+                    task_credential.parse_identity_map(os.getenv(PROFILE_IDENTITIES_ENV, ""))
+                )
+            except task_credential.TaskCredentialError as exc:
+                # Operator-rendered and reserved against spec.deployment.env,
+                # so a malformed map is a broken install, and a broker that
+                # guessed at it would be guessing who may run as a profile.
+                raise RuntimeError(f"{PROFILE_IDENTITIES_ENV} is malformed: {exc}") from exc
+            audience_roles[profile_audience] = CALLER_ROLE_PROFILE
+            if not profile_identities:
+                LOGGER.warning(
+                    "%s is set but %s names no ServiceAccount; the profile role is bound to the "
+                    "callers named there, so every caller presenting the profile audience is refused",
+                    PROFILE_AUDIENCE_ENV,
+                    PROFILE_IDENTITIES_ENV,
+                )
     else:
         audience_roles = {shell_audience: ""}
         if os.getenv("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", "").strip():
@@ -2564,11 +2786,18 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                 "is not; the mcp role only exists once the chat audience split does, "
                 "so the mcp audience is ignored"
             )
+        if os.getenv(PROFILE_AUDIENCE_ENV, "").strip():
+            LOGGER.warning(
+                "%s is set but CREDENTIAL_PROXY_CHAT_AUDIENCE is not; the profile role only "
+                "exists once the chat audience split does, so the profile audience is ignored",
+                PROFILE_AUDIENCE_ENV,
+            )
     return ServiceAccountAuthenticator(
         audience_roles=audience_roles,
         allowed_callers=allowed,
         session_callers=session_callers,
         mcp_callers=mcp_callers,
+        profile_identities=profile_identities,
         api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
         api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
         ca_file=os.getenv(
@@ -6525,8 +6754,13 @@ class CommandExecutor:
         kubeconfig_context: str | None = None,
         wants_kubeconfig: bool = False,
         caller: socket.socket | None = None,
+        isolated: bool = False,
     ) -> ExecutionResult:
         """Run an agent-selected command.
+
+        `isolated` runs the command against no kubeconfig at all: a profile
+        caller with no task (task_confinement), whose local-only commands
+        must not resolve, select or mint for any cluster, the host's included.
 
         `caller` is the connection the command is being run for. While the
         command runs the connection is watched, and its closing ends the
@@ -6549,6 +6783,22 @@ class CommandExecutor:
         if not executable_path:
             raise RuntimeError(f"supported executable is unavailable: {executable}")
         command = [executable_path, *argv[1:]]
+
+        if isolated:
+            # No get-credentials (it authors a kubeconfig for a cluster), no
+            # --kubeconfig reroute (confinement refused any), and no ambient
+            # fallback: KUBECONFIG names an empty file, so kubectl has no
+            # cluster to reach and the pool is never asked for a token.
+            if _is_get_credentials(argv):
+                raise ValueError("get-credentials names a cluster, and an isolated command reaches none")
+            return self._execute(
+                command,
+                stdin=stdin,
+                cwd=cwd,
+                kubeconfig_path=Path(os.devnull),
+                timeout_seconds=self.kubectl_timeout_seconds if executable == "kubectl" else None,
+                caller=caller,
+            )
 
         # `get-credentials` is the one command that legitimately authors a
         # kubeconfig, so it is handled separately: it writes, everything else
@@ -9184,6 +9434,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # Unix socket is the access control, behaving as it did before there was an
     # authenticator at all.
     authenticator: NullAuthenticator | ServiceAccountAuthenticator = NullAuthenticator()
+    # The profile role's task-credential gate (build_profile_gate), set by
+    # serve() when the authenticator confers that role. None leaves a profile
+    # caller with no task, so local-only commands only.
+    profile_gate: ProfileTaskGate | None = None
     # Set per request once the caller is identified; read by the policy layer.
     principal: Principal | None = None
     # What the metrics listener serves. One registry per process; a test that
@@ -9219,7 +9473,50 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return None
         if not self._role_permits(self.principal):
             return None
+        if self.principal.role == CALLER_ROLE_PROFILE and not self._admit_task(self.principal):
+            return None
         return self.principal
+
+    def _admit_task(self, principal: Principal) -> bool:
+        """Bind a profile caller's task credential, or answer 403 and return False.
+
+        Per request rather than with the cached TokenReview: a warm pod's
+        ServiceAccount token outlives its tasks. A request with no credential
+        is admitted with no task, and task_confinement gives it local-only
+        commands; one with a credential that fails is refused whole, so a
+        stale or foreign credential is loud rather than quietly downgraded.
+        The token is never logged; a bound one is, by jti, in ``caller``.
+        """
+        values = self.headers.get_all(TASK_CREDENTIAL_HEADER) or []
+        try:
+            if len(values) > 1:
+                raise TaskCredentialRefused("more than one task credential header")
+            gate = self.profile_gate
+            token = values[0] if values else None
+            if gate is None:
+                if token is not None:
+                    raise TaskCredentialRefused("this broker verifies no task credentials")
+                return True
+            self.principal = gate.admit(principal, token)
+        except TaskCredentialRefused as exc:
+            LOGGER.warning(
+                "refused a task credential path=%s principal=%s pod=%s reason=%s",
+                _sanitize_for_logging(self.path),
+                _sanitize_for_logging(principal.describe(), max_length=PRINCIPAL_LOG_LENGTH),
+                _sanitize_for_logging(principal.pod),
+                _sanitize_for_logging(str(exc), max_length=256),
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": RULE_TASK_CREDENTIAL,
+                    "message": f"The task credential was refused: {exc}.",
+                },
+            )
+            return False
+        return True
 
     def _role_permits(self, principal: Principal) -> bool:
         """Answer 403 and return False if this caller's side may not use this route.
@@ -9596,6 +9893,33 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        # A profile caller's argv is held to its task's target before any
+        # policy reads it, so every check below judges the command that will
+        # run: the injected --project, the target's context.
+        isolated = False
+        if principal.role == CALLER_ROLE_PROFILE:
+            try:
+                confined = task_confinement.confine(argv, kubeconfig_context, principal.task_target)
+            except task_confinement.ConfinementRefusal as exc:
+                LOGGER.warning(
+                    "command outside the task's target request_id=%s principal=%s reason=%s",
+                    request_id,
+                    principal_label,
+                    _sanitize_for_logging(str(exc), max_length=256),
+                    extra=audit(AUDIT_STATUS_BLOCKED, rule=task_confinement.RULE_TASK_TARGET),
+                )
+                self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                self._json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "status": "blocked",
+                        "code": "SECURITY_POLICY_BLOCKED",
+                        "rule": task_confinement.RULE_TASK_TARGET,
+                        "message": f"{exc}.",
+                    },
+                )
+                return
+            argv, kubeconfig_context, isolated = confined.argv, confined.kubeconfig_context, confined.isolated
         rule = self.policy.blocked_by(argv)
         if rule is not None:
             LOGGER.warning(
@@ -9730,6 +10054,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     # The connection this command answers. Its closing
                     # mid-command kills the command; see CommandExecutor.execute.
                     caller=self.connection,
+                    # Only a profile caller with no task runs isolated, and
+                    # only then is the keyword passed, so every other call
+                    # reaches the executor exactly as before.
+                    **({"isolated": True} if isolated else {}),
                 )
                 if result.abandoned:
                     # The connection is gone, so there is no response to write;
@@ -11716,6 +12044,7 @@ def serve(args: argparse.Namespace) -> None:
     # Decided before anything credentialed starts, so a misconfigured
     # deployment fails at boot rather than on the first request.
     CredentialProxyHandler.authenticator = build_authenticator()
+    CredentialProxyHandler.profile_gate = build_profile_gate(CredentialProxyHandler.authenticator)
     if reachable_off_pod(args) and not CredentialProxyHandler.authenticator.authenticates:
         # A listener the cluster can reach, with no authentication, hands the
         # credentials to whoever reaches the port. The sidecar deployment gets

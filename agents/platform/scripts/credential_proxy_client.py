@@ -206,6 +206,94 @@ def authorization_headers() -> dict[str, str]:
         raise TokenUnavailable(f"{token_file} is empty")
     return {"Authorization": f"Bearer {token}"}
 
+# A profile worker's task credential (#3889): the dispatcher's proxyToken, which
+# the worker adapter writes to a tmpfs file on the task's confirm and removes at
+# the task's end. Sent in this header on every exec, re-read on every call, so a
+# warm pod's next task presents its own. The broker confines the call to the
+# cluster the credential names (credential_proxy.TASK_CREDENTIAL_HEADER).
+TASK_TOKEN_FILE_ENV = "CREDENTIAL_PROXY_TASK_TOKEN_FILE"
+TASK_CREDENTIAL_HEADER = "X-Kube-Agents-Task-Credential"
+# The broker's own ceiling on the value (task_credential.MAX_TOKEN_BYTES).
+MAX_TASK_CREDENTIAL_BYTES = 8192
+_TASK_CREDENTIAL_SHAPE = re.compile(r"\A[A-Za-z0-9_.-]+\Z")
+# gcloud settings that would choose the project, account, identity, endpoint,
+# location or configuration of a call if gcloud ran here. It doesn't: the shim
+# forwards no environment, and the broker's gcloud reads the broker's. In task
+# mode the shim names any that are set rather than leaving the model to believe
+# one took. Named rather than matched on the CLOUDSDK_ prefix: images and
+# workstations set plenty of CLOUDSDK_* that redirect nothing (CLOUDSDK_PYTHON,
+# the context-aware access settings), and a notice on every call that lists
+# them would be noise the model learns to skip.
+CLOUDSDK_REDIRECTING_ENV = frozenset({
+    "CLOUDSDK_CORE_PROJECT",
+    "CLOUDSDK_CORE_ACCOUNT",
+    "CLOUDSDK_CORE_BILLING_QUOTA_PROJECT",
+    "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT",
+    "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE",
+    "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+    "CLOUDSDK_ACTIVE_CONFIG_NAME",
+    "CLOUDSDK_CONFIG",
+    "CLOUDSDK_CONTAINER_CLUSTER",
+    "CLOUDSDK_COMPUTE_ZONE",
+    "CLOUDSDK_COMPUTE_REGION",
+})
+CLOUDSDK_ENDPOINT_OVERRIDE_PREFIX = "CLOUDSDK_API_ENDPOINT_OVERRIDES_"
+
+
+def task_mode() -> bool:
+    """Whether this shim runs for a profile task (CREDENTIAL_PROXY_TASK_TOKEN_FILE set)."""
+    return bool(os.environ.get(TASK_TOKEN_FILE_ENV, "").strip())
+
+
+def task_credential_headers() -> dict[str, str]:
+    """The task credential header, or nothing when there is no task.
+
+    Read per call. A missing file is no task, not an error: the adapter
+    removes it when the task ends, and the broker then runs local-only
+    commands and nothing else, which is the answer to give. Any other read
+    failure, or a value that isn't one compact JWT, is TokenUnavailable, for
+    authorization_headers' reason: a request sent without it would earn a
+    refusal that hides the fault.
+    """
+    token_file = os.environ.get(TASK_TOKEN_FILE_ENV, "").strip()
+    if not token_file:
+        return {}
+    try:
+        token = Path(token_file).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise TokenUnavailable(f"{token_file}: {getattr(exc, 'strerror', None) or exc}") from exc
+    if not token:
+        return {}
+    if len(token) > MAX_TASK_CREDENTIAL_BYTES or not _TASK_CREDENTIAL_SHAPE.match(token):
+        raise TokenUnavailable(f"{token_file} does not hold a task credential")
+    return {TASK_CREDENTIAL_HEADER: token}
+
+
+def ignored_task_environment() -> list[str]:
+    """The environment a profile task's shim does not honour, by name.
+
+    KUBECONFIG (and with it the shell's own get-credentials pin) would choose
+    the cluster; the CLOUDSDK_* settings in CLOUDSDK_REDIRECTING_ENV would
+    choose a project, account or endpoint if gcloud ran here. In task mode the cluster and project are the
+    task credential's, which the broker enforces whatever is sent, so none of
+    these is read, and naming them keeps the model from believing one took.
+    """
+    names = []
+    if os.environ.get("KUBECONFIG", "").strip():
+        names.append("KUBECONFIG")
+    names.extend(
+        sorted(
+            name
+            for name, value in os.environ.items()
+            if (name in CLOUDSDK_REDIRECTING_ENV or name.startswith(CLOUDSDK_ENDPOINT_OVERRIDE_PREFIX))
+            and value.strip()
+        )
+    )
+    return names
+
+
 # Only these read KUBECONFIG: kubectl to pick a context, gcloud to write one in
 # `container clusters get-credentials`. Today that is every executable this
 # client runs; it stays a separate list because an unreadable kubeconfig is a
@@ -714,7 +802,8 @@ def get_credentials_destination(argv: list[str]) -> tuple[list[str], Path | None
     writes it here.
 
     Falls back to `$KUBECONFIG`, which is where a Cluster Agent profile's pin
-    lives when the caller did not name one.
+    lives when the caller did not name one; not in task mode, where KUBECONFIG
+    is not honoured (`ignored_task_environment`).
     """
     stripped: list[str] = []
     destination: str | None = None
@@ -731,7 +820,7 @@ def get_credentials_destination(argv: list[str]) -> tuple[list[str], Path | None
             continue
         stripped.append(argument)
         index += 1
-    if destination is None:
+    if destination is None and not task_mode():
         destination = os.environ.get("KUBECONFIG", "").strip() or None
     return stripped, Path(destination) if destination else None
 
@@ -757,8 +846,22 @@ def execute(
     # kubectl may still name a cluster: see `land_implicit_kubeconfig` and
     # `implicit_kubectl_context` for why, and for what keeps #1852's host
     # default for everything that names nothing.
+    #
+    # A profile task (`task_mode`) honours none of that environment: the
+    # cluster and project are the task credential's, and the broker holds the
+    # call to them. Only an explicit `--kubeconfig` in argv is still resolved,
+    # and the broker refuses it unless it names the task's cluster.
     destination: Path | None = None
     implicit_destination = False
+    in_task = task_mode()
+    if in_task:
+        ignored = ignored_task_environment()
+        if ignored:
+            print(
+                f"credential proxy: {', '.join(ignored)} not honoured for a profile task; "
+                "the task's cluster and project are used",
+                file=sys.stderr,
+            )
     try:
         context = ""
         if is_get_credentials(argv):
@@ -767,10 +870,10 @@ def execute(
         elif argv and argv[0] in KUBECONFIG_AWARE:
             flag_pinned = names_kubeconfig_flag(argv)
             argv = resolve_kubeconfig_flags(argv)
-            kubeconfig = os.environ.get("KUBECONFIG", "").strip()
+            kubeconfig = "" if in_task else os.environ.get("KUBECONFIG", "").strip()
             if kubeconfig:
                 context = kubeconfig_context(kubeconfig)
-            elif argv[0] == "kubectl" and not flag_pinned:
+            elif argv[0] == "kubectl" and not flag_pinned and not in_task:
                 context = implicit_kubectl_context(argv)
     except KubeconfigUnreadable as exc:
         print(f"credential proxy: {exc}", file=sys.stderr)
@@ -793,6 +896,7 @@ def execute(
     headers = {"Content-Type": "application/json"}
     try:
         headers.update(authorization_headers())
+        headers.update(task_credential_headers())
     except TokenUnavailable as exc:
         # Sending the request anyway would earn an undifferentiated 401 and
         # hide the real fault, which is a broken token projection.
