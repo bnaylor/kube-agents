@@ -389,7 +389,7 @@ func TestTheMintedJWTExpiresWithItsTaskCredential(t *testing.T) {
 func (h *harness) connectForTask(t *testing.T, user, saToken, task string, extra ...nats.Option) (*nats.Conn, chan error, error) {
 	t.Helper()
 	violations := make(chan error, 16)
-	nc, err := nats.Connect(h.url, append([]nats.Option{h.tls,
+	nc, err := nats.Connect(h.url, append([]nats.Option{h.dial,
 		nats.Token(saToken),
 		nats.UserInfo("", task),
 		nats.CustomInboxPrefix("_INBOX." + user),
