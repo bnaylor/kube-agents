@@ -3962,9 +3962,12 @@ def _is_get_credentials(argv: list[str]) -> bool:
     leading release track (`beta container ...`) is looked past.
 
     An argv the walk cannot read (a flag of unknown arity) is routed here
-    whenever it carries the verb at all: the get-credentials path runs gcloud
-    against a scratch kubeconfig, so routing a command here by mistake costs
-    nothing, while missing one runs it as a plain gcloud command.
+    whenever it carries the verb at all. Read-only enforcement refuses every
+    such argv first, so this only matters with enforcement off. There, a
+    command routed here by mistake still runs gcloud against a scratch
+    kubeconfig, but it costs an endpoint lookup and may get an endpoint flag
+    added that it doesn't take. Missing a real get-credentials instead runs it
+    as a plain gcloud command.
     """
     if not argv or argv[0] != "gcloud":
         return False
