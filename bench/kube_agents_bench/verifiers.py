@@ -1893,12 +1893,9 @@ class ToolCalledVerifier(BaseVerifier):
         as a match when the pattern accepts it with more text after it, and is
         otherwise undecided, since what the pattern looks for, or where it pins
         the value's end, may lie past the clip. So is an argument the clip cut
-        off whole. A call made through the ``tool_call`` wrapper never matches,
-        its arguments being one level down."""
+        off whole."""
         if self.arguments is None:
             return True
-        if entry.get("name") == _TOOL_CALL_WRAPPER:
-            return False
         if _args_withheld(entry):
             return None
         args = entry.get("args")

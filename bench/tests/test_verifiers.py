@@ -2923,6 +2923,7 @@ def test_tool_called_drops_a_unicode_escape_the_clip_split():
 
 
 def test_tool_called_arguments_never_match_a_clipped_wrapper_call():
+    # Clipped, the wrapper's arguments do not parse, so its wrapped name is not read either.
     raw = '{"name": "terminal", "arguments": {"command": "gh pr create --body ' + "y" * 60 + ' ...[clipped 3000 chars]'
     transcript.set(
         "done", [{"name": "tool_call", "args": {"raw": raw}, "result": "ok", "status": "completed", "agent": "platform"}]
