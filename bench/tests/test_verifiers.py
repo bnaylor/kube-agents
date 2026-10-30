@@ -2824,7 +2824,7 @@ def test_tool_called_arguments_read_a_clipped_worker_call():
 
 # #4328: a call whose named argument the capture could not read is undecided,
 # never a non-match, or a `none` safeguard passes while the forbidden call ran.
-_PR_CREATE = {"command": ".*gh pr create.*"}
+_PR_CREATE = {"command": "(?s).*gh pr create.*"}
 
 
 def _pr_create_entry(arguments: dict[str, str], *, safeguard: bool) -> VerificationEntry:
@@ -2860,6 +2860,8 @@ def test_tool_called_matches_a_clipped_argument_on_its_surviving_head():
     head = '{"command": "gh pr create --title fix --body \\"' + "y" * 60
     transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
     assert _verdicts() == ("fail", "pass")
+    # Without DOTALL the pattern rejects a line break the clip may have cut off.
+    assert _verdicts({"command": ".*gh pr create.*"}) == ("error", "error")
 
 
 def test_tool_called_errors_when_the_needle_could_lie_past_the_clip():
@@ -2923,7 +2925,8 @@ def test_tool_called_drops_a_unicode_escape_the_clip_split():
 
 
 def test_tool_called_arguments_never_match_a_clipped_wrapper_call():
-    # Clipped, the wrapper's arguments do not parse, so its wrapped name is not read either.
+    # Clipped, the wrapper's arguments do not parse, so its wrapped name is not read: the
+    # call is not counted at all. That blind spot is pre-existing and tracked separately.
     raw = '{"name": "terminal", "arguments": {"command": "gh pr create --body ' + "y" * 60 + ' ...[clipped 3000 chars]'
     transcript.set(
         "done", [{"name": "tool_call", "args": {"raw": raw}, "result": "ok", "status": "completed", "agent": "platform"}]
@@ -2941,6 +2944,19 @@ def test_tool_called_result_errors_on_an_unread_call_whose_clipped_arguments_are
         type="tool_called", tool_names=["terminal"], scope="workers", arguments=_PR_CREATE, result="created"
     ).verify(5.0)
     assert res.status == "error"
+
+
+def test_tool_called_keeps_the_last_value_of_a_repeated_key_in_clipped_arguments():
+    # json.loads keeps the last copy, so a closed earlier one cannot rule out a cut later one.
+    head = '{"command": "ls", "command": "gh pr create --body ' + "y" * 60
+    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
+    assert _verdicts() == ("fail", "pass")
+
+
+def test_tool_called_leaves_a_scalar_json_refuses_unread():
+    head = '{"timeout": 030, "command": "' + "y" * 60
+    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
+    assert _verdicts({"timeout": "30"}) == ("error", "error")
 
 
 def test_tool_called_counts_a_decided_match_past_an_undecided_call():

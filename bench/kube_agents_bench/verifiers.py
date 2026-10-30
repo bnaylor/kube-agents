@@ -1691,11 +1691,14 @@ def _cut_string_head(body: str) -> str:
 def _read_clipped_args(text: str) -> tuple[dict[str, Any], tuple[str, str | None] | None]:
     """The top-level arguments in JSON arguments the pod's clip cut, clip marker taken off.
 
-    Returns the top-level keys whose value closed before the clip, each with its
-    last scalar value as ``json.loads`` would keep it, and the key whose value
-    the clip fell inside, with the string head that survived (None for a cut
-    number). A key nested in an object value is not an argument and is skipped,
-    so a decoy ``{"env": {"command": "true"}, "command": ...}`` reads the outer one."""
+    Returns the top-level keys whose last value is a scalar that closed before
+    the clip, and the key whose value the clip fell inside, with the string head
+    that survived (None for a cut number, ``true``, ``false`` or ``null``). A
+    repeated key keeps only its last value, as ``json.loads`` does, so an earlier
+    closed copy cannot stand in for a later one the clip cut or that holds an
+    object. A key nested in an object value is not an argument and is skipped,
+    so a decoy ``{"env": {"command": "true"}, "command": ...}`` reads the outer
+    one. A scalar ``json.loads`` refuses (``030``) is left unread."""
     values: dict[str, Any] = {}
     depth = 0
     key: str | None = None
@@ -1710,6 +1713,8 @@ def _read_clipped_args(text: str) -> tuple[dict[str, Any], tuple[str, str | None
             colon = _JSON_KEY_COLON.match(text, literal.end())
             if colon is not None:
                 key = string if depth == 1 else None
+                if key is not None:
+                    values.pop(key, None)
                 i = colon.end()
                 continue
             if key is not None:
@@ -1730,7 +1735,10 @@ def _read_clipped_args(text: str) -> tuple[dict[str, Any], tuple[str, str | None
             if scalar is not None:
                 if scalar.end() == len(text):
                     return values, (key, None)
-                values[key] = json.loads(scalar.group())
+                try:
+                    values[key] = json.loads(scalar.group())
+                except ValueError:
+                    pass
                 key = None
                 i = scalar.end()
                 continue
@@ -1738,10 +1746,13 @@ def _read_clipped_args(text: str) -> tuple[dict[str, Any], tuple[str, str | None
     return values, None
 
 
-# What a clipped head must still match with more text after it to count: a
+# What a clipped head must still match with this tail after it to count: a
 # pattern that pins the value's end, such as ``gh pr list`` or ``[^;]*``, cannot
-# be decided from the part of the value the clip kept.
-_CLIP_TAIL_PROBE = " ;|&\x00"
+# be decided from the part of the value the clip kept. One probe tail is a
+# heuristic, not a proof that every tail matches: a lookahead past the head
+# (``(?!.*--draft)``) is not caught. The separators and line break are what a
+# command or path most often continues with past a clip.
+_CLIP_TAIL_PROBE = " ;|&\n'\"\t\x00"
 
 
 def _args_withheld(entry: dict[str, Any]) -> bool:
@@ -1806,14 +1817,15 @@ class ToolCalledVerifier(BaseVerifier):
     When set, a call counts only if each named argument is present and its
     value, as a string, matches its pattern under ``re.fullmatch``: the shape of what was
     called rather than only that it was, such as the title of each card a
-    worker filed. Read from the entry's own ``args``, so a call made through
-    the ``tool_call`` wrapper, whose arguments sit one level down, never
-    matches. A worker call's arguments are clipped in the pod before they
+    worker filed. Read from the entry's own ``args``, so for a call made
+    through the ``tool_call`` wrapper the wrapped call's arguments, one level
+    down, are not read. A worker call's arguments are clipped in the pod before they
     parse, which leaves them as a ``raw`` string; a string-valued argument is
     then read out of that text, so a long card body does not hide its title.
     Only top-level keys are read from that text. A named argument the clip
     cut is matched on the head that survived, and counts when the pattern
-    accepts that head with more text after it; when it does not, or the clip
+    accepts that head with a tail of separators and a line break after it; when
+    it does not, or the clip
     cut the argument off whole, or the pod withheld the arguments, the call is
     undecided rather than ruled out, and undecided calls that could reach
     ``minimum_calls`` make the check ``status="error"``: read as non-matches,
@@ -1890,7 +1902,7 @@ class ToolCalledVerifier(BaseVerifier):
         so a same-named key inside an object value cannot stand in for the
         argument. An argument whose value the clip cut is read from the head that
         survived, as ``worker_commands`` reads a clipped command: the head counts
-        as a match when the pattern accepts it with more text after it, and is
+        as a match when the pattern accepts it followed by ``_CLIP_TAIL_PROBE``, and is
         otherwise undecided, since what the pattern looks for, or where it pins
         the value's end, may lie past the clip. So is an argument the clip cut
         off whole."""
