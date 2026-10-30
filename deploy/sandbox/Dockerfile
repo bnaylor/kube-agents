@@ -584,6 +584,12 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          gcloud read goes through the same wrapper. Here for the
 #                          reason stall_report.py is, and copied from the Platform
 #                          Agent's synced skill so both agents run one file
+#   audit_storage.py       single-pass storage collector (PVCs, PVs, StorageClasses,
+#                          VolumeAttachments) for Cluster Agent domain audits (#3285)
+#   audit_networking.py    single-pass ingress, Gateway API, and LoadBalancer collector
+#                          for Cluster Agent domain audits (#3285)
+#   audit_certificates.py  single-pass cert-manager CRD, Certificate, Issuer, and GKE
+#                          ManagedCertificate collector (#3285)
 #   inventory_findings.py  the onboarding ranking card's bridge from
 #                          INVENTORY.raw.md to the findings queue
 #                          (governance/inventory_prioritize_sop.md). `extract`
@@ -622,12 +628,16 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/credential_shapes.py \
      agents/platform/scripts/feedback_broker.py \
      agents/platform/scripts/fleet_scope_args.py \
+     agents/platform/scripts/collector_run.py \
      agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/workspace_paths.py \
      agents/platform/scripts/gke_endpoint.py \
      agents/platform/scripts/cluster_preflight.sh \
      agents/platform/scripts/stall_report.py \
      agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh \
+     agents/platform/scripts/audit_storage.py \
+     agents/platform/scripts/audit_networking.py \
+     agents/platform/scripts/audit_certificates.py \
      agents/platform/scripts/inventory_findings.py \
      agents/platform/scripts/findings_queue.py \
      agents/platform/scripts/untrusted_text.py \
