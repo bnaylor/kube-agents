@@ -1,7 +1,10 @@
 package dispatch
 
 import (
+	"encoding/json"
+	"errors"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -9,6 +12,7 @@ import (
 	"github.com/nats-io/nkeys"
 
 	"github.com/gke-labs/kube-agents/a2a/authcallout"
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/taskcred"
 )
@@ -76,10 +80,23 @@ func signingKey(t *testing.T) (nkeys.KeyPair, string) {
 // runKeyed runs a dispatcher holding kp (nil for none), its mints logged.
 func (b *bus) runKeyed(ti *testInstall, kp nkeys.KeyPair, maxLifetime time.Duration) (*Dispatcher, *mintLog, func()) {
 	b.t.Helper()
+	return b.runKeyedWith(ti, kp, maxLifetime, &fakeVerifier{}, nil)
+}
+
+// runKeyedWith is runKeyed with verifier v, and prepare (nil for none)
+// called on the dispatcher before its mints are logged: a test can replace
+// d.mint there and still see what was asked of it.
+func (b *bus) runKeyedWith(ti *testInstall, kp nkeys.KeyPair, maxLifetime time.Duration, v Verifier, prepare func(*Dispatcher)) (*Dispatcher, *mintLog, func()) {
+	b.t.Helper()
 	cfg := testConfig()
 	cfg.TaskSigningKey, cfg.TaskCredentialMaxLifetime = kp, maxLifetime
 	ml := &mintLog{}
-	d, stop := b.runPrepared(b.connect("dispatcher"), cfg, ti, &fakeVerifier{}, ml.wrap)
+	d, stop := b.runPrepared(b.connect("dispatcher"), cfg, ti, v, func(d *Dispatcher) {
+		if prepare != nil {
+			prepare(d)
+		}
+		ml.wrap(d)
+	})
 	return d, ml, stop
 }
 
@@ -468,4 +485,177 @@ func TestAPodsUIDMustBeTheOneItHadAtTheOffer(t *testing.T) {
 			t.Errorf("%d confirms, %d mints; want none", w.confirmCount(), ml.count())
 		}
 	})
+}
+
+// The verifier's permit is reused across a waiting submission's retries
+// only for what it was given for. The stream keeps one submission per
+// subject, so a newer one under the same task id replaces the one waiting
+// over a cap: one naming another cluster, or carrying another capability, is
+// checked again before anything is minted for it. Refused, it is refused
+// (no confirm, no credential for the unchecked target, nor for the checked
+// one); permitted, its proxy token carries the cluster just checked.
+func TestARetryNamingAnotherTargetOrCapabilityIsCheckedAgain(t *testing.T) {
+	const targetA = "project/proj-1/location/us-central1/cluster/prod-1"
+	clusterB := map[string]string{"project": "proj-1", "location": "us-central1", "cluster": "other-9"}
+	clusterC := map[string]string{"project": "proj-2", "location": "europe-west1", "cluster": "ok-3"}
+	const targetB = "project/proj-1/location/us-central1/cluster/other-9"
+	const targetC = "project/proj-2/location/europe-west1/cluster/ok-3"
+	for name, tc := range map[string]struct {
+		capKey   string
+		params   map[string]string
+		wantCall string
+		refused  bool
+		cluster  taskcred.Target
+	}{
+		"another cluster, refused":    {"cap-ok", clusterB, "cap-ok|tse|read|" + targetB, true, taskcred.Target{}},
+		"another capability, refused": {"cap-bad", clusterParams, "cap-bad|tse|read|" + targetA, true, taskcred.Target{}},
+		"another cluster, permitted":  {"cap-ok", clusterC, "cap-ok|tse|read|" + targetC, false, taskcred.Target{Project: "proj-2", Location: "europe-west1", Cluster: "ok-3"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := newBus(t, "tse-0")
+			b.ensure("tse", 2, 0, "read")
+			w := b.worker("tse", "read", "tse-0", answerAccept, 3*time.Second)
+			ti := oneProfile("tse", 1, "tse-0")
+			ti.pool.SetUID("tse", "read", "tse-0", "uid-0")
+			kp, pub := signingKey(t)
+			v := &fakeVerifier{refuse: map[string]bool{"cap-bad": true}, refuseTarget: map[capability.Scope]bool{targetB: true}}
+			_, ml, _ := b.runKeyedWith(ti, kp, 0, v, nil)
+
+			b.submitWith("tse", "read", lib.SubmitKindTop, "task-1", "cap-ok", clusterParams)
+			waitFor(t, 10*time.Second, "task-1 confirmed", func() bool { return w.confirmCount() == 1 })
+			// task-2 is admitted for cluster A and waits over the profile's
+			// concurrency of 1 while task-1 runs.
+			b.submitWith("tse", "read", lib.SubmitKindTop, "task-2", "cap-ok", clusterParams)
+			waitFor(t, 10*time.Second, "task-2 admitted for cluster A", func() bool { return len(v.callList()) == 2 })
+			b.submitWith("tse", "read", lib.SubmitKindTop, "task-2", tc.capKey, tc.params) // replaces it
+
+			ts := b.waitTerminal("task-2", 15*time.Second)
+			if !slices.Contains(v.callList(), tc.wantCall) {
+				t.Errorf("verifier calls %v, want the replacement checked: %s", v.callList(), tc.wantCall)
+			}
+			if tc.refused {
+				if ts.state != lib.StateRejected || !hasReason(ts, ReasonVerifierRefused) {
+					t.Errorf("task-2 terminal %+v, want rejected %s", ts, ReasonVerifierRefused)
+				}
+				time.Sleep(500 * time.Millisecond)
+				if n := w.confirmCount(); n != 1 {
+					t.Errorf("%d confirms, want task-1's only", n)
+				}
+				if n := ml.count(); n != 2 {
+					t.Errorf("%d mints, want task-1's two only", n)
+				}
+				b.waitTerminal("task-1", 10*time.Second) // its worker done before the bus goes
+				return
+			}
+			if ts.state != lib.StateCompleted {
+				t.Fatalf("task-2 terminal %+v, want completed", ts)
+			}
+			confirms := confirmsOf(w)
+			if len(confirms) != 2 {
+				t.Fatalf("%d confirms, want two", len(confirms))
+			}
+			c := verifyAs(t, confirms[1].ProxyToken, pub, taskcred.AudienceCredentialProxy)
+			if c.Task != "task-2" || c.Target == nil || *c.Target != tc.cluster {
+				t.Errorf("task-2's proxy token: task %s, target %+v; want the re-checked cluster %+v", c.Task, c.Target, tc.cluster)
+			}
+		})
+	}
+}
+
+// A cluster target no credential could carry (a field with whitespace, a
+// control byte, or over taskcred's length bound) is refused at admission as
+// invalid parameters, before the verifier, an offer, a lease or a mint: the
+// dispatcher's own read of the task parameters (lib.TaskParametersOf, a
+// stricter rule than taskcred's target fields) refuses it, whatever the
+// publisher checked, so the mint never meets it after a lease is written.
+func TestATargetNoCredentialCouldCarryIsRefusedAtAdmission(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, time.Second)
+	ti := oneProfile("tse", 2, "tse-0")
+	ti.pool.SetUID("tse", "read", "tse-0", "uid-0")
+	kp, _ := signingKey(t)
+	v := &fakeVerifier{}
+	_, ml, _ := b.runKeyedWith(ti, kp, 0, v, nil)
+
+	bad := map[string]map[string]string{
+		"task-space": {"project": "proj 1", "location": "us-central1", "cluster": "prod-1"},
+		"task-long":  {"project": "proj-1", "location": "us-central1", "cluster": strings.Repeat("c", 129)},
+		"task-ctl":   {"project": "proj-1", "location": "us-central1\x7f", "cluster": "prod-1"},
+		"task-empty": {"project": "proj-1", "location": "", "cluster": "prod-1"},
+	}
+	for id, params := range bad {
+		b.submitRawParams("tse", "read", lib.SubmitKindTop, id, "cap-ok", params)
+	}
+	for id := range bad {
+		if ts := b.waitTerminal(id, 10*time.Second); ts.state != lib.StateRejected || !hasReason(ts, ReasonParametersInvalid) {
+			t.Errorf("%s: terminal %+v, want rejected %s", id, ts, ReasonParametersInvalid)
+		}
+	}
+	if calls := v.callList(); len(calls) != 0 {
+		t.Errorf("the verifier was asked about a malformed target: %v", calls)
+	}
+	if w.offerCount() != 0 || ml.count() != 0 || len(b.leases()) != 0 {
+		t.Errorf("%d offers, %d mints, %d leases for malformed targets; want none", w.offerCount(), ml.count(), len(b.leases()))
+	}
+}
+
+// submitRawParams submits a task whose taskParameters part is written as
+// is, unchecked by the publisher-side lib.TaskParametersPart.
+func (b *bus) submitRawParams(profile, tier, kind, taskID, capKey string, params map[string]string) {
+	b.t.Helper()
+	env := submissionEnv(b.t, profile, taskID, capKey, nil)
+	var msg lib.Message
+	if err := json.Unmarshal(env.Payload, &msg); err != nil {
+		b.t.Fatal(err)
+	}
+	data, err := json.Marshal(map[string]any{"taskParameters": map[string]any{"parameters": params}})
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	msg.Parts = append(msg.Parts, lib.Part{Kind: "data", Data: data})
+	env.Payload, err = json.Marshal(msg)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	if err := b.gateway.Publish(b.ctx, lib.TaskSubmitSubject(profile, tier, kind, taskID), env); err != nil {
+		b.t.Fatalf("submit %s: %v", taskID, err)
+	}
+}
+
+// With a key, a confirm never goes out without credentials that verify:
+// a mint that fails, and a credential that does not read back with the
+// configured key's public half (signed by another key), each leave the
+// recorded lease with no confirm, so the task fails lease-expired and the
+// pod never starts it.
+func TestACredentialThatCannotBeMintedOrReadBackSendsNoConfirm(t *testing.T) {
+	other, _ := signingKey(t)
+	for name, mint := range map[string]func(taskcred.Claims) (string, error){
+		"the mint fails":        func(taskcred.Claims) (string, error) { return "", errors.New("signer unavailable") },
+		"signed by another key": func(c taskcred.Claims) (string, error) { return taskcred.Mint(other, c) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := newBus(t, "tse-0")
+			b.ensure("tse", 2, 0, "read")
+			w := b.worker("tse", "read", "tse-0", answerAccept, time.Second)
+			ti := oneProfile("tse", 2, "tse-0")
+			ti.pool.SetUID("tse", "read", "tse-0", "uid-0")
+			kp, _ := signingKey(t)
+			_, ml, _ := b.runKeyedWith(ti, kp, 0, &fakeVerifier{}, func(d *Dispatcher) { d.mint = mint })
+
+			b.submitWith("tse", "read", lib.SubmitKindTop, "task-1", "cap-ok", clusterParams)
+			waitFor(t, 10*time.Second, "the offer", func() bool { return w.offerCount() == 1 })
+			ts := b.waitTerminal("task-1", 15*time.Second)
+			if ts.state != lib.StateFailed || !hasReason(ts, ReasonLeaseExpired) {
+				t.Errorf("terminal %+v, want failed lease-expired", ts)
+			}
+			if w.confirmCount() != 0 {
+				t.Errorf("%d confirms, want none", w.confirmCount())
+			}
+			if ml.count() == 0 {
+				t.Error("the mint was never asked: the test did not reach the confirm")
+			}
+			noCredentials(t, w)
+		})
+	}
 }

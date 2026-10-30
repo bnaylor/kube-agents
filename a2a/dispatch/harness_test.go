@@ -372,14 +372,16 @@ func (b *bus) pending(durable string) (ackPending int, numPending uint64) {
 type fakeVerifier struct {
 	mu     sync.Mutex
 	refuse map[string]bool
-	calls  []string
+	// refuseTarget refuses any ref asked about one of these targets.
+	refuseTarget map[capability.Scope]bool
+	calls        []string
 }
 
 func (v *fakeVerifier) CheckProfileRun(_ context.Context, ref capability.Ref, profile string, tier capability.Tier, target capability.Scope) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.calls = append(v.calls, fmt.Sprintf("%s|%s|%s|%s", ref.Key, profile, tier, target))
-	if v.refuse[ref.Key] {
+	if v.refuse[ref.Key] || v.refuseTarget[target] {
 		return &capability.Refusal{Rule: "the grant does not reach that target"}
 	}
 	return nil

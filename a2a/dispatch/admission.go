@@ -49,7 +49,8 @@ type refusal struct {
 // task credential for the credential proxy confines it to (#3889). The
 // verifier's permit is reused for verifiedFor across the same submission's
 // retries over a cap, so a queue waiting on a cap doesn't call the verifier
-// once per retry delay; the cheap checks run every time.
+// once per retry delay, but only while the retry asks for the same ref and
+// target the permit was given for; the cheap checks run every time.
 func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile, hk holdKey, now time.Time) (cluster *taskcred.Target, _ *refusal, _ error) {
 	env := del.Envelope()
 	tier := hk.tier
@@ -74,10 +75,16 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	case d.verifier == nil:
 		return nil, &refusal{ReasonVerifierRefused, "no verifier is configured"}, nil
 	}
+	// The permit is for what the verifier was asked: this ref, this target.
+	// The stream keeps one submission per subject and a newer one replaces
+	// it, so a retry can carry another capability or another cluster under
+	// the same key: that is a cache miss, checked afresh, never the old
+	// permit stretched over an unchecked target.
+	asked := permit{ref: ref, target: target, cluster: cluster}
 	d.mu.Lock()
-	at, cached := d.verified[hk]
+	p, cached := d.verified[hk]
 	d.mu.Unlock()
-	if cached && now.Sub(at) <= verifiedFor {
+	if cached && now.Sub(p.at) <= verifiedFor && p.covers(asked) {
 		return cluster, nil, nil
 	}
 	if err := d.verifier.CheckProfileRun(ctx, ref, prof.Name, capability.Tier(tier), target); err != nil {
@@ -86,10 +93,29 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 		}
 		return nil, &refusal{ReasonVerifierRefused, capability.Reason(err)}, nil
 	}
+	asked.at = now
 	d.mu.Lock()
-	d.verified[hk] = now
+	d.verified[hk] = asked
 	d.mu.Unlock()
 	return cluster, nil, nil
+}
+
+// permit is a verifier permit admission reuses: when it was given, and the
+// ref, target and cluster it was given for.
+type permit struct {
+	at      time.Time
+	ref     capability.Ref
+	target  capability.Scope
+	cluster *taskcred.Target
+}
+
+// covers says p was given for exactly what q asks: the same ref, the same
+// verifier target and the same cluster fields.
+func (p permit) covers(q permit) bool {
+	if p.ref != q.ref || p.target != q.target || (p.cluster == nil) != (q.cluster == nil) {
+		return false
+	}
+	return p.cluster == nil || *p.cluster == *q.cluster
 }
 
 // taskTarget reads the submission's task parameters, checks them against

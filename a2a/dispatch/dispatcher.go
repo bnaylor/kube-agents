@@ -171,8 +171,9 @@ type Dispatcher struct {
 	// hold here had them, by when: settled, not failed, when the
 	// submission comes back.
 	released map[string]time.Time
-	// verified is when the verifier last permitted a waiting submission.
-	verified map[holdKey]time.Time
+	// verified is the verifier's last permit for a waiting submission:
+	// when, and for which ref and target.
+	verified map[holdKey]permit
 	// answers is each pod's budget of answers for tasks it doesn't hold,
 	// by <profile>.<tier>.<pod>.
 	answers map[string]*answerBudget
@@ -242,7 +243,7 @@ func New(cfg Config, bus *lib.Client, src Source, pool Pool, verifier Verifier, 
 		waiting:    map[string]waiting{},
 		lastAdmit:  map[string]time.Time{},
 		released:   map[string]time.Time{},
-		verified:   map[holdKey]time.Time{},
+		verified:   map[holdKey]permit{},
 		answers:    map[string]*answerBudget{},
 		orphanBusy: map[string]bool{},
 		orphanSem:  make(chan struct{}, orphanLookups),
@@ -1458,8 +1459,8 @@ func (d *Dispatcher) prune() {
 			delete(d.released, key)
 		}
 	}
-	for hk, at := range d.verified {
-		if now.Sub(at) > verifiedFor {
+	for hk, p := range d.verified {
+		if now.Sub(p.at) > verifiedFor {
 			delete(d.verified, hk)
 		}
 	}

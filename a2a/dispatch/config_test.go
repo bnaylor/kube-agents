@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nkeys"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -196,4 +197,47 @@ func TestPodPoolReadsAPodsUIDFromTheWatchedPod(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, "a deleting pod has no UID", func() bool { return p.PodUID("tse", "read", "tse-read-b") == "" })
+}
+
+// The task-signing settings (#3889): a key must be a cluster key (the
+// callout trusts only those, so any other would mint credentials nothing
+// accepts) and the lifetime cap must not be negative; zero is the callout's
+// default, and no key at all is valid.
+func TestConfigValidateChecksTheTaskSigningSettings(t *testing.T) {
+	cluster, err := nkeys.CreateCluster()
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, _ := nkeys.CreateAccount()
+	user, _ := nkeys.CreateUser()
+	operator, _ := nkeys.CreateOperator()
+	for name, edit := range map[string]func(*Config){
+		"no key":                  func(c *Config) {},
+		"a cluster key":           func(c *Config) { c.TaskSigningKey = cluster },
+		"a cluster key, zero cap": func(c *Config) { c.TaskSigningKey, c.TaskCredentialMaxLifetime = cluster, 0 },
+		"a cluster key, a 2h cap": func(c *Config) { c.TaskSigningKey, c.TaskCredentialMaxLifetime = cluster, 2*time.Hour },
+		"no key, a positive cap":  func(c *Config) { c.TaskCredentialMaxLifetime = time.Minute },
+	} {
+		c := DefaultConfig()
+		edit(&c)
+		if err := c.Validate(); err != nil {
+			t.Errorf("%s: refused: %v", name, err)
+		}
+	}
+	for name, edit := range map[string]func(*Config){
+		"an account key":         func(c *Config) { c.TaskSigningKey = account },
+		"a user key":             func(c *Config) { c.TaskSigningKey = user },
+		"an operator key":        func(c *Config) { c.TaskSigningKey = operator },
+		"a negative cap":         func(c *Config) { c.TaskSigningKey, c.TaskCredentialMaxLifetime = cluster, -time.Second },
+		"a negative cap, no key": func(c *Config) { c.TaskCredentialMaxLifetime = -time.Hour },
+	} {
+		c := DefaultConfig()
+		edit(&c)
+		if err := c.Validate(); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+		if _, err := New(c, nil, nil, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "dispatch config") {
+			t.Errorf("%s: New = %v, want the config refusal", name, err)
+		}
+	}
 }

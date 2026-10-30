@@ -10,7 +10,7 @@ import (
 
 func bareDispatcher() *Dispatcher {
 	return &Dispatcher{cfg: testConfig(), now: time.Now, active: map[holdKey]*holding{}, waiting: map[string]waiting{},
-		lastAdmit: map[string]time.Time{}, released: map[string]time.Time{}, verified: map[holdKey]time.Time{}}
+		lastAdmit: map[string]time.Time{}, released: map[string]time.Time{}, verified: map[holdKey]permit{}}
 }
 
 func capsSnapshot(ceiling int) lib.DispatchConfig {

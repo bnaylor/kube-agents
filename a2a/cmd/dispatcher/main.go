@@ -167,6 +167,9 @@ func taskSigning(getenv func(string) string, log *slog.Logger) (nkeys.KeyPair, t
 	if err != nil {
 		return nil, 0, fmt.Errorf("%s: read the task-signing seed: %w", envTaskSigningSeedFile, err)
 	}
+	// The key pair keeps its own copy: the bytes read are zeroed on every
+	// way out, so the seed doesn't linger in this buffer.
+	defer clear(seed)
 	kp, err := taskcred.ParseSigningKey(bytes.TrimSpace(seed))
 	if err != nil {
 		return nil, 0, fmt.Errorf("%s=%s: %w", envTaskSigningSeedFile, path, err)
