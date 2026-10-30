@@ -107,7 +107,10 @@ from credential_proxy_client import (
     parse_gke_context,
 )
 
-# The refusal rule id the broker reports for every confinement refusal.
+# The refusal rule id the broker reports for a confinement refusal. A
+# local-only-shaped command the read-only policy refuses (_is_local_only)
+# carries the policy's rule instead, and the broker answers it with the
+# credential denylist's rule when one matches.
 RULE_TASK_TARGET = "caller.task-target"
 
 # kubectl flags that redirect the credential (to another server or cluster
@@ -307,7 +310,8 @@ class ConfinementRefusal(Exception):
     local-only-shaped command the read-only policy refuses (_is_local_only):
     then it is the policy's rule, the message is the policy's, and
     ``policy_argv`` is the canonical argv the policy judged, so the broker can
-    answer with the policy gate's own refusal.
+    answer as its gates would: the credential denylist's rule where one
+    matches, the read-only policy gate's own refusal otherwise.
     """
 
     def __init__(self, message: str, rule: str = RULE_TASK_TARGET, policy_argv: list[str] | None = None):
@@ -535,8 +539,8 @@ def _confine_kubectl(argv: list[str], kubeconfig_context: str | None, target: Cl
         if not local:
             raise ConfinementRefusal(
                 "this profile task has no target cluster (no valid task credential), so only local-only "
-                "commands run: kubectl version --client, --help on a command, and kubectl config "
-                "get-contexts and current-context"
+                "commands run, the ones the read-only policy admits: kubectl version --client, kubectl "
+                "config get-contexts and current-context, and --help on a command it admits"
             )
         if contexts or kubeconfigs or kubeconfig_context:
             raise ConfinementRefusal("this profile task has no target cluster, so a command may not name one")
@@ -700,6 +704,12 @@ def _confine_gcloud(argv: list[str], kubeconfig_context: str | None, target: Clu
             f"gcloud {surface[0]} shows the broker's own account and configuration, so it is refused for a "
             "profile task; the task's project is the one its calls carry"
         )
+    # A local-only command is run canonical like the rest, and a `--` would
+    # put a word where the reordering can't keep it, so it is refused. Before
+    # the policy is asked: the policy would judge that reordered argv, in
+    # which a word after `--` has become a flag.
+    if END_OF_FLAGS in argv and _gcloud_is_local(flags, words):
+        raise ConfinementRefusal("a local-only gcloud command for a profile task takes no --")
     isolated_argv = [argv[0], *words, *(_gcloud_flag_token(name, value) for name, value in flags)]
     local = _is_local_only("gcloud", flags, words, isolated_argv)
     get_credentials = _is_get_credentials_command(words)
@@ -707,7 +717,8 @@ def _confine_gcloud(argv: list[str], kubeconfig_context: str | None, target: Clu
         if not local:
             raise ConfinementRefusal(
                 "this profile task has no target project (no valid task credential), so only local-only "
-                "commands run: gcloud version, --help on a command"
+                "commands run, the ones the read-only policy admits: gcloud version, and --help on a "
+                "command it admits"
             )
         if kubeconfig_context:
             raise ConfinementRefusal("this profile task has no target cluster, so a command may not name one")
@@ -721,11 +732,8 @@ def _confine_gcloud(argv: list[str], kubeconfig_context: str | None, target: Clu
         # get-credentials handling, which would describe whatever cluster
         # the argv names. So `get-credentials <cluster> --help` is an
         # isolated help read, get_credentials cleared: the executor refuses
-        # a structure that is isolated and get-credentials both.
-        # Canonical like the rest; a `--` would put a word where the
-        # reordering can't keep it, so it is refused.
-        if END_OF_FLAGS in argv:
-            raise ConfinementRefusal("a local-only gcloud command for a profile task takes no --")
+        # a structure that is isolated and get-credentials both. A `--` was
+        # refused above.
         return Confined(
             argv=isolated_argv, kubeconfig_context=None, isolated=True, executable="gcloud", words=tuple(words),
             flags=tuple(flags), target=target, get_credentials=False,

@@ -16,6 +16,7 @@ import http.client
 import json
 import logging
 import os
+import re
 import threading
 import unittest
 import urllib.error
@@ -499,6 +500,28 @@ class LocalOnlyTest(unittest.TestCase):
                 with self.assertRaisesRegex(ConfinementRefusal, "no target|may not name"):
                     confine(argv, context, None)
 
+    def test_the_no_target_refusal_promises_only_what_the_policy_admits(self):
+        # `kubectl apply --help` is refused by the policy (#4298), so the
+        # message may not promise "--help on a command" runs.
+        for argv in (["kubectl", "get", "pods"], ["gcloud", "container", "clusters", "list"]):
+            with self.subTest(argv=argv):
+                with self.assertRaises(ConfinementRefusal) as caught:
+                    confine(argv, None, None)
+                self.assertNotRegex(str(caught.exception), r"--help on a command(?! it admits)")
+                self.assertIn("the read-only policy admits", str(caught.exception))
+
+    def test_a_local_shaped_gcloud_argv_with_a_separator_is_refused_for_the_separator(self):
+        # The `--` refusal precedes the policy call: the policy would judge a
+        # reordered argv in which the post-`--` word has become a flag.
+        argv = ["gcloud", "container", "clusters", "list", "--help", "--", "--flags-file=/tmp/x"]
+        for target in (None, TARGET):
+            with self.subTest(target=target):
+                with self.assertRaises(ConfinementRefusal) as caught:
+                    confine(argv, None, target)
+                self.assertEqual(task_confinement.RULE_TASK_TARGET, caught.exception.rule)
+                self.assertIsNone(caught.exception.policy_argv)
+                self.assertIn("takes no --", str(caught.exception))
+
     def test_a_target_that_is_not_a_gke_name_is_no_target(self):
         self.assertIsNone(task_confinement.target_from_claims("proj_a", "us-central1", "c"))
         self.assertEqual(TARGET, task_confinement.target_from_claims("proj-a", "us-central1", "cluster-a"))
@@ -825,6 +848,74 @@ class ProfileRouteTest(unittest.TestCase):
         with mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", routed):
             status, body = self.post({"argv": ["git", "status"]})
         self.assert_refused(status, body, credential_proxy.RULE_CALLER_EXECUTABLE)
+
+
+class ProfileRouteDenylistTest(ProfileRouteTest):
+    """ProfileRouteTest with the shipped credential denylist installed.
+
+    The two rules and the blocked message are copied from the shipped policy
+    (k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml);
+    neither rule carries a message of its own there. Every inherited test runs
+    again with them in place.
+    """
+
+    BLOCKED_MESSAGE = "Command blocked for security reasons."
+    RULES = (
+        (
+            "kubernetes.token-disclosure",
+            r"\bkubectl\b(?:\s+\S+)*?\s+create\b(?:\s+\S+)*?\s+token\b"
+            r"|\bkubectl\b(?:\s+\S+)*?\s+config\b(?:\s+\S+)*?\s+view\b(?:\s+\S+)*?\s+--raw\b",
+        ),
+        (
+            "tool.self-modification",
+            r"\bgcloud\b(?:\s+\S+)*?\s+components\b(?:\s+\S+)*?\s+(?:install|update|remove)\b"
+            r"|\bgh\b(?:\s+\S+)*?\s+extension\b(?:\s+\S+)*?\s+(?:install|upgrade|remove)\b"
+            r"|\bgh\b(?:\s+\S+)*?\s+(?:alias|config)\b(?:\s+\S+)*?\s+(?:set|import|delete)\b",
+        ),
+    )
+
+    def setUp(self):
+        super().setUp()
+        CredentialProxyHandler.policy = Policy(
+            rules=[
+                credential_proxy.Rule(rule_id=rule_id, pattern=re.compile(pattern, re.IGNORECASE | re.MULTILINE),
+                                      message=self.BLOCKED_MESSAGE)
+                for rule_id, pattern in self.RULES
+            ],
+            blocked_message=self.BLOCKED_MESSAGE,
+        )
+
+    def test_help_on_a_denylisted_command_keeps_the_denylist_rule(self):
+        # The help-shaped argv the read-only policy refuses is asked of the
+        # denylist first, as the normal path asks it before the read-only
+        # gate: its specific rule and message, not kubernetes.read-only.
+        for argv, rule_id in (
+            (["kubectl", "create", "token", "sa", "--help"], "kubernetes.token-disclosure"),
+            (["gcloud", "components", "install", "--help"], "tool.self-modification"),
+        ):
+            self.assertFalse(command_policy.evaluate(argv).allowed, argv)
+            for token in (VALID["token"], None):
+                with self.subTest(argv=argv, task=token is not None):
+                    self.records.clear()
+                    status, body = self.post({"argv": argv}, token=token)
+                    self.assert_refused(status, body, rule_id)
+                    self.assertEqual(
+                        {"status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "rule": rule_id,
+                         "message": self.BLOCKED_MESSAGE},
+                        body,
+                    )
+                    blocked = [record for record in self.records if '"status": "blocked"' in record]
+                    self.assertTrue(blocked, self.records)
+                    for record in blocked:
+                        self.assertIn(f'"rule": "{rule_id}"', record)
+
+    def test_a_separator_beside_help_is_refused_for_the_separator(self):
+        argv = ["gcloud", "container", "clusters", "list", "--help", "--", "--flags-file=/tmp/x"]
+        for token in (VALID["token"], None):
+            with self.subTest(task=token is not None):
+                status, body = self.post({"argv": argv}, token=token)
+                self.assert_refused(status, body, task_confinement.RULE_TASK_TARGET)
+                self.assertIn("takes no --", body["message"])
 
 
 class ChangedDefaultTest(unittest.TestCase):

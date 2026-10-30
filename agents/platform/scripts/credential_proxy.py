@@ -2561,7 +2561,8 @@ PROFILE_IDENTITIES_ENV = "CREDENTIAL_PROXY_PROFILE_IDENTITIES"
 TASK_SIGNING_KEYS_ENV = "A2A_TASK_SIGNING_PUBLIC_KEYS"
 TASK_CREDENTIAL_MAX_LIFETIME_ENV = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
 # The audit rule a refused task credential is recorded under. Confinement
-# refusals are task_confinement.RULE_TASK_TARGET.
+# refusals are task_confinement.RULE_TASK_TARGET, except a local-only-shaped
+# command the read-only policy refuses, which carries a denylist or policy rule.
 RULE_TASK_CREDENTIAL = "caller.task-credential"
 
 
@@ -10384,6 +10385,28 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             try:
                 confined = task_confinement.confine(argv, kubeconfig_context, principal.task_target)
             except task_confinement.ConfinementRefusal as exc:
+                # A local-only-shaped command the read-only policy refused is
+                # asked of the credential denylist first, as every other
+                # command is asked before the read-only gate below, so
+                # `kubectl create token sa --help` keeps
+                # kubernetes.token-disclosure rather than kubernetes.read-only.
+                denied = self.policy.blocked_by(exc.policy_argv) if exc.policy_argv is not None else None
+                if denied is not None:
+                    LOGGER.warning(
+                        "command blocked request_id=%s rule=%s", request_id, denied.rule_id,
+                        extra=audit(AUDIT_STATUS_BLOCKED, rule=denied.rule_id),
+                    )
+                    self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                    self._json(
+                        HTTPStatus.FORBIDDEN,
+                        {
+                            "status": "blocked",
+                            "code": "SECURITY_POLICY_BLOCKED",
+                            "rule": denied.rule_id,
+                            "message": denied.message,
+                        },
+                    )
+                    return
                 LOGGER.warning(
                     "command outside the task's target request_id=%s principal=%s rule=%s reason=%s",
                     request_id,
