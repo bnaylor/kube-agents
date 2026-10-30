@@ -801,6 +801,7 @@ _GET_CREDENTIALS_WORDS = ("container", "clusters", "get-credentials")
 # `command_policy._GCLOUD_FLAGS_WITH_VALUE`, which the shim can't import. A
 # test holds the two equal, so a short valued flag added there fails it.
 _GCLOUD_SHORT_FLAGS_WITH_VALUE = frozenset({"-z"})
+_GCLOUD_RELEASE_TRACKS = frozenset({"alpha", "beta"})
 
 
 def is_get_credentials(argv: list[str]) -> bool:
@@ -843,7 +844,7 @@ def is_get_credentials(argv: list[str]) -> bool:
             continue
         words.append(token)
         index += 1
-    if words[:1] and words[0] in ("alpha", "beta"):
+    if words[:1] and words[0] in _GCLOUD_RELEASE_TRACKS:
         words = words[1:]
     return words[:3] == list(_GET_CREDENTIALS_WORDS)
 

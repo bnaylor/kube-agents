@@ -486,7 +486,16 @@ class TestTheShimAndTheBrokerAgreeOnGetCredentials(unittest.TestCase):
     # for a file the broker doesn't send, and nothing lands. (argv, shim, broker)
     KNOWN_DISAGREEMENTS = [
         (GC + ["--format", "get-credentials", "list"], True, False),
+        # Malformed argv the read-only policy refuses before routing: the broker
+        # can't read them and falls back to "carries the verb", the shim reads
+        # them its own way. Pinned so any other disagreement fails.
+        (["gcloud", "--", "container", "clusters", "get-credentials", "c"], False, True),
+        (GC + ["-qz", "l", "get-credentials", "c"], False, True),
+        (GC + ["--format", "-z", "get-credentials", "c"], False, True),
     ]
+
+    def test_the_release_tracks_are_the_policys(self):
+        self.assertEqual(command_policy._GCLOUD_RELEASE_TRACKS, credential_proxy_client._GCLOUD_RELEASE_TRACKS)
 
     def test_both_read_every_spelling_the_same(self):
         for argv, want in self.AGREED:
