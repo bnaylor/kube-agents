@@ -494,7 +494,7 @@ func TestAPodsUIDMustBeTheOneItHadAtTheOffer(t *testing.T) {
 // checked again before anything is minted for it. Refused, it is refused
 // (no confirm, no credential for the unchecked target, nor for the checked
 // one); permitted, its proxy token carries the cluster just checked.
-func TestARetryNamingAnotherTargetOrCapabilityIsCheckedAgain(t *testing.T) {
+func TestARetryNamingAnotherClusterIsCheckedAgainBeforeAMint(t *testing.T) {
 	const targetA = "project/proj-1/location/us-central1/cluster/prod-1"
 	clusterB := map[string]string{"project": "proj-1", "location": "us-central1", "cluster": "other-9"}
 	clusterC := map[string]string{"project": "proj-2", "location": "europe-west1", "cluster": "ok-3"}
