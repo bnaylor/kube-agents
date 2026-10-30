@@ -10,6 +10,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/taskcred"
 )
 
 // Verifier is the one verifier call the dispatcher makes: may the grant at
@@ -42,64 +43,68 @@ type refusal struct {
 }
 
 // admit runs the admission checks in order, cheapest first: the tier, the
-// queue age, the parameters, then the verifier. A nil refusal admits. The
+// queue age, the parameters, then the verifier. A nil refusal admits, and
+// then cluster is the cluster the verifier permitted the task on (nil when
+// the task names none and was checked against the namespace): the target a
+// task credential for the credential proxy confines it to (#3889). The
 // verifier's permit is reused for verifiedFor across the same submission's
 // retries over a cap, so a queue waiting on a cap doesn't call the verifier
 // once per retry delay; the cheap checks run every time.
-func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile, hk holdKey, now time.Time) (*refusal, error) {
+func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile, hk holdKey, now time.Time) (cluster *taskcred.Target, _ *refusal, _ error) {
 	env := del.Envelope()
 	tier := hk.tier
 	if !allowsTier(prof, tier) {
-		return &refusal{ReasonTierNotAllowed, fmt.Sprintf("profile %s does not allow tier %s", prof.Name, tier)}, nil
+		return nil, &refusal{ReasonTierNotAllowed, fmt.Sprintf("profile %s does not allow tier %s", prof.Name, tier)}, nil
 	}
 	if rec := del.Received(); !rec.IsZero() {
 		if age, limit := now.Sub(rec), queueTimeout(prof); age > limit {
-			return &refusal{ReasonQueueTimeout, fmt.Sprintf("queued %s, over the profile's %s", age.Round(time.Second), limit)}, nil
+			return nil, &refusal{ReasonQueueTimeout, fmt.Sprintf("queued %s, over the profile's %s", age.Round(time.Second), limit)}, nil
 		}
 	}
-	target, bad := taskTarget(env, prof, snap.Namespace)
+	target, cluster, bad := taskTarget(env, prof, snap.Namespace)
 	if bad != "" {
-		return &refusal{ReasonParametersInvalid, bad}, nil
+		return nil, &refusal{ReasonParametersInvalid, bad}, nil
 	}
 	ref, present, err := capability.RefFromAuthority(env.Authority)
 	switch {
 	case err != nil:
-		return &refusal{ReasonVerifierRefused, "the authority block is not well-formed"}, nil
+		return nil, &refusal{ReasonVerifierRefused, "the authority block is not well-formed"}, nil
 	case !present:
-		return &refusal{ReasonVerifierRefused, "the submission carries no capability"}, nil
+		return nil, &refusal{ReasonVerifierRefused, "the submission carries no capability"}, nil
 	case d.verifier == nil:
-		return &refusal{ReasonVerifierRefused, "no verifier is configured"}, nil
+		return nil, &refusal{ReasonVerifierRefused, "no verifier is configured"}, nil
 	}
 	d.mu.Lock()
 	at, cached := d.verified[hk]
 	d.mu.Unlock()
 	if cached && now.Sub(at) <= verifiedFor {
-		return nil, nil
+		return cluster, nil, nil
 	}
 	if err := d.verifier.CheckProfileRun(ctx, ref, prof.Name, capability.Tier(tier), target); err != nil {
 		if ctx.Err() != nil {
-			return nil, errStopping
+			return nil, nil, errStopping
 		}
-		return &refusal{ReasonVerifierRefused, capability.Reason(err)}, nil
+		return nil, &refusal{ReasonVerifierRefused, capability.Reason(err)}, nil
 	}
 	d.mu.Lock()
 	d.verified[hk] = now
 	d.mu.Unlock()
-	return nil, nil
+	return cluster, nil, nil
 }
 
 // taskTarget reads the submission's task parameters, checks them against
 // the profile's declared ones, and builds the verifier's target: the cluster
-// path when the task names a cluster, the install's namespace otherwise. A
+// path when the task names a cluster, the install's namespace otherwise.
+// cluster is the same cluster as fields, nil for a namespace target. A
 // non-empty bad is the parameters-invalid detail.
-func taskTarget(env *lib.Envelope, prof lib.DispatchProfile, namespace string) (target capability.Scope, bad string) {
+func taskTarget(env *lib.Envelope, prof lib.DispatchProfile, namespace string) (target capability.Scope, cluster *taskcred.Target, bad string) {
 	var msg lib.Message
 	if err := json.Unmarshal(env.Payload, &msg); err != nil {
-		return "", "the submission's message does not parse"
+		return "", nil, "the submission's message does not parse"
 	}
 	tp, _, err := lib.TaskParametersOf(msg.Parts)
 	if err != nil {
-		return "", err.Error()
+		return "", nil, err.Error()
 	}
 	params := tp.Parameters
 	var missing []string
@@ -109,18 +114,19 @@ func taskTarget(env *lib.Envelope, prof lib.DispatchProfile, namespace string) (
 		}
 	}
 	if len(missing) > 0 {
-		return "", "missing required parameters: " + strings.Join(missing, ", ")
+		return "", nil, "missing required parameters: " + strings.Join(missing, ", ")
 	}
 	project, hasProject := params[paramProject]
 	location, hasLocation := params[paramLocation]
-	cluster, hasCluster := params[paramCluster]
+	clusterName, hasCluster := params[paramCluster]
 	switch {
 	case hasProject && hasLocation && hasCluster:
-		return capability.Scope(fmt.Sprintf(clusterTargetForm, project, location, cluster)), ""
+		return capability.Scope(fmt.Sprintf(clusterTargetForm, project, location, clusterName)),
+			&taskcred.Target{Project: project, Location: location, Cluster: clusterName}, ""
 	case hasProject || hasLocation || hasCluster:
-		return "", "a cluster target needs all of project, location and cluster"
+		return "", nil, "a cluster target needs all of project, location and cluster"
 	case namespace == "":
-		return "", "the task names no cluster and the dispatcher has no namespace to scope it to"
+		return "", nil, "the task names no cluster and the dispatcher has no namespace to scope it to"
 	}
-	return capability.Scope(namespaceTarget + namespace), ""
+	return capability.Scope(namespaceTarget + namespace), nil, ""
 }

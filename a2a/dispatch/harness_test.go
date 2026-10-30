@@ -402,9 +402,19 @@ func (b *bus) runDispatcher(cfg Config, ti *testInstall, v Verifier) (*Dispatche
 // test can kill it.
 func (b *bus) runDispatcherOn(c *lib.Client, cfg Config, ti *testInstall, v Verifier) (*Dispatcher, func()) {
 	b.t.Helper()
+	return b.runPrepared(c, cfg, ti, v, nil)
+}
+
+// runPrepared is runDispatcherOn with prepare called on the dispatcher
+// before it runs (nil for none), so a test can wrap its internals.
+func (b *bus) runPrepared(c *lib.Client, cfg Config, ti *testInstall, v Verifier, prepare func(*Dispatcher)) (*Dispatcher, func()) {
+	b.t.Helper()
 	d, err := New(cfg, c, ti.src, ti.pool, v, quietLog())
 	if err != nil {
 		b.t.Fatal(err)
+	}
+	if prepare != nil {
+		prepare(d)
 	}
 	ctx, cancel := context.WithCancel(b.ctx)
 	done := make(chan struct{})
