@@ -2904,6 +2904,7 @@ def test_tool_called_leaves_a_head_undecided_when_the_pattern_pins_the_end():
         "(?s)[^#]*",  # a negated class past the clip: the tail may hold `## Findings`
         "(?s).{0,3000}",  # a length bound the tail may break
         "(?s).*gh pr create(?!.*--draft).*",  # a lookahead that reads past the head
+        "(?s).*(?:gh pr create(?!.*--draft)).*",  # the same lookahead inside a group
         r"(?s).*gh pr create\b.*",  # a word boundary the head's end cannot settle
         "(?s)(?:gh pr list|.*gh pr create.*)",  # an alternation, not a trailing `.*`
     ],
