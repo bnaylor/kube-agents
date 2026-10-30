@@ -36,8 +36,9 @@ to it before the broker runs anything:
     --client``, and the ``kubectl config`` reads ``get-contexts`` and
     ``current-context`` (``config view`` is refused: ``--flatten`` prints
     credentials). The policy is asked, not mirrored: a local-only-shaped
-    command it refuses (``--help`` on a write such as ``kubectl apply`` or
-    ``gcloud init``) is refused with its own rule and message. They run
+    command it refuses (``--help`` on a write such as ``kubectl apply``, or
+    on a surface its help escape doesn't cover such as ``gcloud init``) is
+    refused with its own rule and message. They run
     isolated, against no kubeconfig and with no get-credentials handling,
     with or without a target (``get-credentials <cluster> --help`` is an
     isolated help read). ``gcloud config``
