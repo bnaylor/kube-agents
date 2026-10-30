@@ -45,7 +45,8 @@ type refusal struct {
 // queue age, the parameters, then the verifier. A nil refusal admits. The
 // verifier's permit is reused for verifiedFor across the same submission's
 // retries over a cap, so a queue waiting on a cap doesn't call the verifier
-// once per retry delay; the cheap checks run every time.
+// once per retry delay, but only while the retry asks for the same ref and
+// target the permit was given for; the cheap checks run every time.
 func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile, hk holdKey, now time.Time) (*refusal, error) {
 	env := del.Envelope()
 	tier := hk.tier
@@ -70,10 +71,16 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	case d.verifier == nil:
 		return &refusal{ReasonVerifierRefused, "no verifier is configured"}, nil
 	}
+	// The permit is for what the verifier was asked: this ref, this target.
+	// The stream keeps one submission per subject and a newer one replaces
+	// it, so a retry can carry another capability or another target under
+	// the same key: that is a cache miss, checked afresh, never the old
+	// permit stretched over an unchecked target.
+	asked := permit{ref: ref, target: target}
 	d.mu.Lock()
-	at, cached := d.verified[hk]
+	p, cached := d.verified[hk]
 	d.mu.Unlock()
-	if cached && now.Sub(at) <= verifiedFor {
+	if cached && now.Sub(p.at) <= verifiedFor && p.ref == asked.ref && p.target == asked.target {
 		return nil, nil
 	}
 	if err := d.verifier.CheckProfileRun(ctx, ref, prof.Name, capability.Tier(tier), target); err != nil {
@@ -82,10 +89,19 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 		}
 		return &refusal{ReasonVerifierRefused, capability.Reason(err)}, nil
 	}
+	asked.at = now
 	d.mu.Lock()
-	d.verified[hk] = now
+	d.verified[hk] = asked
 	d.mu.Unlock()
 	return nil, nil
+}
+
+// permit is a verifier permit admission reuses: when it was given, and the
+// capability ref and target it was given for.
+type permit struct {
+	at     time.Time
+	ref    capability.Ref
+	target capability.Scope
 }
 
 // taskTarget reads the submission's task parameters, checks them against

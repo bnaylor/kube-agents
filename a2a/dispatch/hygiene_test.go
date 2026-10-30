@@ -276,3 +276,44 @@ func TestARegrantDoesNotHoldUpTheRunLoop(t *testing.T) {
 		t.Errorf("%d reconnects: the regrant finished first, so this proves nothing", n)
 	}
 }
+
+// envDelivery is a stub delivery carrying a given envelope.
+type envDelivery struct {
+	stubDelivery
+	env *lib.Envelope
+}
+
+func (e *envDelivery) Envelope() *lib.Envelope { return e.env }
+
+// The verifier's permit covers only the capability and target it was given
+// for. PROFILE_SUBMITS keeps one submission per subject and a newer one
+// replaces it, so a retry under the same task id can name another capability
+// or another cluster: that is checked afresh, never the cached permit
+// stretched over it.
+func TestARetryNamingAnotherTargetOrCapabilityIsCheckedAgain(t *testing.T) {
+	v := &fakeVerifier{}
+	d := &Dispatcher{verifier: v, verified: map[holdKey]permit{}}
+	prof := testProfile("tse", 1)
+	snap := lib.DispatchConfig{Namespace: "kubeagents-system", Profiles: []lib.DispatchProfile{prof}}
+	hk := holdKey{"tse", "read", lib.SubmitKindTop, "task-1"}
+	now := time.Now()
+	clusterA := map[string]string{paramProject: "p", paramLocation: "us-central1", paramCluster: "a"}
+	clusterB := map[string]string{paramProject: "p", paramLocation: "us-central1", paramCluster: "b"}
+	admit := func(capKey string, params map[string]string) {
+		t.Helper()
+		del := &envDelivery{env: submissionEnv(t, "tse", "task-1", capKey, params)}
+		if ref, err := d.admit(context.Background(), del, snap, prof, hk, now); err != nil || ref != nil {
+			t.Fatalf("admit: refusal %+v, err %v", ref, err)
+		}
+	}
+	admit("cap-a", clusterA)
+	admit("cap-a", clusterA) // the same ref and target: the permit is reused
+	if n := len(v.callList()); n != 1 {
+		t.Fatalf("%d verifier calls for one submission retried unchanged; want 1", n)
+	}
+	admit("cap-a", clusterB) // another cluster under the same task id
+	admit("cap-b", clusterB) // another capability
+	if calls := v.callList(); len(calls) != 3 {
+		t.Fatalf("verifier calls %v; want each new target and capability checked", calls)
+	}
+}
