@@ -10385,20 +10385,25 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 confined = task_confinement.confine(argv, kubeconfig_context, principal.task_target)
             except task_confinement.ConfinementRefusal as exc:
                 LOGGER.warning(
-                    "command outside the task's target request_id=%s principal=%s reason=%s",
+                    "command outside the task's target request_id=%s principal=%s rule=%s reason=%s",
                     request_id,
                     principal_label,
+                    exc.rule,
                     _sanitize_for_logging(str(exc), max_length=256),
-                    extra=audit(AUDIT_STATUS_BLOCKED, rule=task_confinement.RULE_TASK_TARGET),
+                    extra=audit(AUDIT_STATUS_BLOCKED, rule=exc.rule),
                 )
                 self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                # A local-only-shaped command the read-only policy refuses
+                # (#4298) gets the policy gate's own body: its rule, message,
+                # verb and local_render, as if it had reached that gate.
+                policy_refusal = read_only_refusal(exc.policy_argv) if exc.policy_argv is not None else None
                 self._json(
                     HTTPStatus.FORBIDDEN,
-                    {
+                    policy_refusal[0] if policy_refusal is not None else {
                         "status": "blocked",
                         "code": "SECURITY_POLICY_BLOCKED",
-                        "rule": task_confinement.RULE_TASK_TARGET,
-                        "message": f"{exc}.",
+                        "rule": exc.rule,
+                        "message": str(exc) if exc.policy_argv is not None else f"{exc}.",
                     },
                 )
                 return
