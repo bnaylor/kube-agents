@@ -2884,7 +2884,7 @@ def test_tool_called_rules_out_a_clipped_call_on_a_readable_argument():
 
 def test_tool_called_reads_only_top_level_keys_from_clipped_arguments():
     # A nested key of the same name is a decoy; the argument is the outer one.
-    head = '{"env": {"command": "gh pr create"}, "command": "ls", "description": "' + "y" * 60
+    head = '{"command": "ls", "env": {"command": "gh pr create"}, "description": "' + "y" * 60
     transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
     assert _verdicts() == ("pass", "fail")
     head = '{"env": {"command": "true"}, "command": "gh pr create --body ' + "y" * 60
