@@ -2888,6 +2888,60 @@ def test_tool_called_rules_out_a_clipped_call_on_a_readable_argument():
     assert _verdicts(arguments) == ("pass", "fail")
 
 
+def test_tool_called_leaves_a_head_undecided_when_the_pattern_pins_the_end():
+    # `gh pr list` alone is read-only, but the clip could have cut `; gh pr create` off it.
+    head = '{"command": "gh pr list'
+    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
+    assert _verdicts({"command": "gh pr list"}) == ("error", "error")
+
+
+def test_tool_called_reads_only_top_level_keys_from_clipped_arguments():
+    # A nested key of the same name is a decoy; the argument is the outer one.
+    head = '{"env": {"command": "true"}, "command": "gh pr create --body ' + "y" * 60
+    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
+    assert _verdicts() == ("fail", "pass")
+    head = '{"env": {"command": "gh pr create"}, "command": "ls ' + "y" * 60
+    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
+    assert _verdicts() == ("error", "error")
+
+
+def test_tool_called_reads_a_closed_number_out_of_clipped_arguments():
+    arguments = {"timeout": "30", "command": "(?s).*"}
+    head = '{"timeout": 30, "command": "' + "y" * 60
+    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
+    assert _verdicts(arguments) == ("fail", "pass")
+    transcript.set("done", _terminal_call({"raw": '{"command": "ls", "timeout": 3 ...[clipped 3000 chars]'}))
+    assert _verdicts(arguments) == ("error", "error")
+
+
+def test_tool_called_drops_a_unicode_escape_the_clip_split():
+    # The cut fell inside `é`; the head must not keep `\u00` as text.
+    head = '{"command": "gh pr create --title caf\\u00'
+    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
+    assert _verdicts({"command": "gh pr create --title caf"}) == ("error", "error")
+    assert _verdicts({"command": r"gh pr create --title caf[^\\]*"}) == ("fail", "pass")
+
+
+def test_tool_called_arguments_never_match_a_clipped_wrapper_call():
+    raw = '{"name": "terminal", "arguments": {"command": "gh pr create --body ' + "y" * 60 + ' ...[clipped 3000 chars]'
+    transcript.set(
+        "done", [{"name": "tool_call", "args": {"raw": raw}, "result": "ok", "status": "completed", "agent": "platform"}]
+    )
+    assert _verdicts() == ("pass", "fail")
+
+
+def test_tool_called_result_errors_on_an_unread_call_whose_clipped_arguments_are_undecided():
+    head = '{"command": "cat > body.md <<EOF\\n' + "y" * 60
+    transcript.set(
+        "done",
+        [{"name": "terminal", "args": {"raw": head + " ...[clipped 3000 chars]"}, "status": "called", "agent": "platform"}],
+    )
+    res = ToolCalledVerifier(
+        type="tool_called", tool_names=["terminal"], scope="workers", arguments=_PR_CREATE, result="created"
+    ).verify(5.0)
+    assert res.status == "error"
+
+
 def test_tool_called_counts_a_decided_match_past_an_undecided_call():
     from kube_agents_bench import worker_trajectory
 

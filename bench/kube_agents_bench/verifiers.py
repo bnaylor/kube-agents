@@ -1666,19 +1666,82 @@ def _clipped_string_args(text: str, names: dict[str, str]) -> dict[str, str]:
     return found
 
 
-def _clipped_string_head(text: str, name: str) -> str | None:
-    """The head of string argument ``name`` when the pod's clip cut inside its value.
+_JSON_STRING = re.compile(r'"((?:[^"\\]|\\.)*)"')
+_JSON_KEY_COLON = re.compile(r"\s*:")
+_JSON_SCALAR = re.compile(r"-?\d[\d.eE+-]*|true|false|null")
 
-    ``text`` is the clipped arguments with the clip marker taken off, so a value
-    the clip cut runs to its end with no closing quote. An escape the cut split
-    in two is dropped rather than read."""
-    head = re.search(rf'"{re.escape(name)}"\s*:\s*"((?:[^"\\]|\\.)*)\\?$', text)
-    if head is None:
-        return None
+
+def _json_string_body(body: str) -> str:
     try:
-        return json.loads('"' + head.group(1) + '"')
+        return json.loads('"' + body + '"')
     except ValueError:
-        return head.group(1)
+        return body
+
+
+def _cut_string_head(body: str) -> str:
+    """A string value's body up to the clip, with an escape the cut split dropped."""
+    split = re.search(r"(\\+)(u[0-9a-fA-F]{0,3})?$", body)
+    if split is not None and len(split.group(1)) % 2 == 1:
+        # The last backslash of an odd run starts an escape: a lone `\`, or a
+        # `\u` short of its four hex digits. An even run is escaped backslashes.
+        body = body[: split.end(1) - 1]
+    return _json_string_body(body)
+
+
+def _read_clipped_args(text: str) -> tuple[dict[str, Any], tuple[str, str | None] | None]:
+    """The top-level arguments in JSON arguments the pod's clip cut, clip marker taken off.
+
+    Returns the top-level keys whose value closed before the clip, each with its
+    last scalar value as ``json.loads`` would keep it, and the key whose value
+    the clip fell inside, with the string head that survived (None for a cut
+    number). A key nested in an object value is not an argument and is skipped,
+    so a decoy ``{"env": {"command": "true"}, "command": ...}`` reads the outer one."""
+    values: dict[str, Any] = {}
+    depth = 0
+    key: str | None = None
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char == '"':
+            literal = _JSON_STRING.match(text, i)
+            if literal is None:
+                return values, ((key, _cut_string_head(text[i + 1:])) if key is not None else None)
+            string = _json_string_body(literal.group(1))
+            colon = _JSON_KEY_COLON.match(text, literal.end())
+            if colon is not None:
+                key = string if depth == 1 else None
+                i = colon.end()
+                continue
+            if key is not None:
+                values[key] = string
+            key = None
+            i = literal.end()
+            continue
+        if char in "{[":
+            depth += 1
+            key = None
+        elif char in "}]":
+            depth -= 1
+            key = None
+        elif char == ",":
+            key = None
+        elif key is not None and not char.isspace():
+            scalar = _JSON_SCALAR.match(text, i)
+            if scalar is not None:
+                if scalar.end() == len(text):
+                    return values, (key, None)
+                values[key] = json.loads(scalar.group())
+                key = None
+                i = scalar.end()
+                continue
+        i += 1
+    return values, None
+
+
+# What a clipped head must still match with more text after it to count: a
+# pattern that pins the value's end, such as ``gh pr list`` or ``[^;]*``, cannot
+# be decided from the part of the value the clip kept.
+_CLIP_TAIL_PROBE = " ;|&\x00"
 
 
 def _args_withheld(entry: dict[str, Any]) -> bool:
@@ -1748,12 +1811,13 @@ class ToolCalledVerifier(BaseVerifier):
     matches. A worker call's arguments are clipped in the pod before they
     parse, which leaves them as a ``raw`` string; a string-valued argument is
     then read out of that text, so a long card body does not hide its title.
-    A named argument the clip cut is matched on the head that survived; when
-    that head does not match, or the clip cut the argument off whole, or the
-    pod withheld the arguments, the call is undecided rather than ruled out,
-    and undecided calls that could reach ``minimum_calls`` make the check
-    ``status="error"``: read as non-matches, they would pass a ``none``
-    safeguard while the call it forbids may have run.
+    Only top-level keys are read from that text. A named argument the clip
+    cut is matched on the head that survived, and counts when the pattern
+    accepts that head with more text after it; when it does not, or the clip
+    cut the argument off whole, or the pod withheld the arguments, the call is
+    undecided rather than ruled out, and undecided calls that could reach
+    ``minimum_calls`` make the check ``status="error"``: read as non-matches,
+    they would pass a ``none`` safeguard while the call it forbids may have run.
 
     ``result``: optional Python regular expression. When set, a call counts
     only if its recorded result, as a string, matches under ``re.search``: what
@@ -1763,8 +1827,9 @@ class ToolCalledVerifier(BaseVerifier):
     the start of it. A call whose result the capture could not read (none
     recorded, or withheld because the pod's redactor did not load) makes the
     check ``status="error"``, since a pattern over it would read as no match --
-    but only when its arguments are withheld too or still match ``arguments``;
-    an unread call whose readable arguments rule it out is left out instead.
+    but only when its arguments are withheld too, cut where the clip left them
+    undecided, or still match ``arguments``; an unread call whose readable
+    arguments rule it out is left out instead.
     A call that read a credential has its result recorded as
     ``worker_trajectory.WITHHELD_READ_RESULT``: a recorded call whose output is
     redacted, matched against the pattern like any other.
@@ -1821,35 +1886,49 @@ class ToolCalledVerifier(BaseVerifier):
         withheld or cut an argument the check names, so the call may match or not.
 
         A readable argument that fails its pattern rules the call out whatever
-        the rest hold. An argument whose value the clip cut is read from the head
-        that survived, as ``worker_commands`` reads a clipped command: a head the
-        pattern matches counts as a match, and any other head is undecided, since
-        what the pattern looks for may lie past the clip. So is an argument the
-        clip cut off whole."""
+        the rest hold. In arguments the clip cut, only top-level keys are read,
+        so a same-named key inside an object value cannot stand in for the
+        argument. An argument whose value the clip cut is read from the head that
+        survived, as ``worker_commands`` reads a clipped command: the head counts
+        as a match when the pattern accepts it with more text after it, and is
+        otherwise undecided, since what the pattern looks for, or where it pins
+        the value's end, may lie past the clip. So is an argument the clip cut
+        off whole. A call made through the ``tool_call`` wrapper never matches,
+        its arguments being one level down."""
         if self.arguments is None:
             return True
+        if entry.get("name") == _TOOL_CALL_WRAPPER:
+            return False
         if _args_withheld(entry):
             return None
         args = entry.get("args")
         if not isinstance(args, dict):
             return False
-        text = None
+        cut = None
+        clipped = False
         if set(args) == {"raw"} and isinstance(args["raw"], str):
             # worker_trajectory's clip() ends a cut argument string with the
             # same marker it ends a cut result with.
             clip = _CLIPPED_RESULT.search(args["raw"])
-            text = args["raw"][: clip.start()] if clip is not None else None
-            args = _clipped_string_args(args["raw"] if text is None else text, self.arguments)
+            if clip is None:
+                args = _clipped_string_args(args["raw"], self.arguments)
+            else:
+                clipped = True
+                args, cut = _read_clipped_args(args["raw"][: clip.start()])
         undecided = False
         for name, pattern in self.arguments.items():
             if name in args:
                 if re.fullmatch(pattern, str(args[name])) is None:
                     return False
                 continue
-            if text is None:
+            if not clipped:
                 return False
-            head = _clipped_string_head(text, name)
-            if head is None or re.fullmatch(pattern, head) is None:
+            head = cut[1] if cut is not None and cut[0] == name else None
+            if (
+                head is None
+                or re.fullmatch(pattern, head) is None
+                or re.fullmatch(pattern, head + _CLIP_TAIL_PROBE) is None
+            ):
                 undecided = True
         return None if undecided else True
 
