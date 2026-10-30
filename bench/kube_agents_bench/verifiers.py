@@ -1824,8 +1824,9 @@ class ToolCalledVerifier(BaseVerifier):
     then read out of that text, so a long card body does not hide its title.
     Only top-level keys are read from that text. A named argument the clip
     cut is matched on the head that survived, and counts when the pattern
-    accepts that head with a tail of separators and a line break after it; when
-    it does not, or the clip
+    accepts that head with a tail of separators and a line break after it (a
+    heuristic: a lookahead past the clip is not caught); when it does not, or
+    the clip
     cut the argument off whole, or the pod withheld the arguments, the call is
     undecided rather than ruled out, and undecided calls that could reach
     ``minimum_calls`` make the check ``status="error"``: read as non-matches,
@@ -1902,10 +1903,11 @@ class ToolCalledVerifier(BaseVerifier):
         so a same-named key inside an object value cannot stand in for the
         argument. An argument whose value the clip cut is read from the head that
         survived, as ``worker_commands`` reads a clipped command: the head counts
-        as a match when the pattern accepts it followed by ``_CLIP_TAIL_PROBE``, and is
-        otherwise undecided, since what the pattern looks for, or where it pins
-        the value's end, may lie past the clip. So is an argument the clip cut
-        off whole."""
+        as a match when the pattern accepts it followed by ``_CLIP_TAIL_PROBE``,
+        and is otherwise undecided, since what the pattern looks for, or where
+        it pins the value's end, may lie past the clip. One probe tail is a
+        heuristic, not proof that every tail matches: a lookahead past the clip
+        is not caught. An argument the clip cut off whole is undecided too."""
         if self.arguments is None:
             return True
         if _args_withheld(entry):
