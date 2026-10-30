@@ -54,6 +54,7 @@ for the harness), so devops-bench discovers them without a fork.
 from __future__ import annotations
 
 import fnmatch
+import functools
 import http.client
 import json
 import os
@@ -1746,13 +1747,53 @@ def _read_clipped_args(text: str) -> tuple[dict[str, Any], tuple[str, str | None
     return values, None
 
 
-# What a clipped head must still match with this tail after it to count: a
-# pattern that pins the value's end, such as ``gh pr list`` or ``[^;]*``, cannot
-# be decided from the part of the value the clip kept. One probe tail is a
-# heuristic, not a proof that every tail matches: a lookahead past the head
-# (``(?!.*--draft)``) is not caught. The separators and line break are what a
-# command or path most often continues with past a clip.
-_CLIP_TAIL_PROBE = " ;|&\n'\"\t\x00"
+@functools.lru_cache(maxsize=None)
+def _accepts_any_tail(pattern: str) -> bool:
+    """Whether a value the pattern fullmatches still matches with any text appended.
+
+    True when the pattern ends, at its top level, in an unbounded repeat of
+    ``.`` under DOTALL (``(?s)...X.*``): whatever the rest matched in the
+    value, that repeat takes the appended text too. A clipped head the pattern
+    matches then matches the whole value, whatever the clip cut. Any other end
+    (a negated class, a length bound, a literal, a group, an alternation) can
+    reject text past the clip, so a head cannot decide it. Neither can a
+    pattern that looks ahead anywhere, or tests a position other than the
+    start (a word boundary, ``$``): at the head's end it would see the cut
+    instead of the text that followed."""
+    parsed = re._parser.parse(pattern)
+    if not parsed.state.flags & re.DOTALL or not parsed.data or not _looks_only_back(parsed.data):
+        return False
+    op, av = parsed.data[-1]
+    if op not in _UNBOUNDED_REPEATS:
+        return False
+    _minimum, maximum, item = av
+    return maximum == re._constants.MAXREPEAT and list(item) == [(re._constants.ANY, None)]
+
+
+_UNBOUNDED_REPEATS = {
+    op
+    for op in (
+        re._constants.MAX_REPEAT,
+        re._constants.MIN_REPEAT,
+        getattr(re._constants, "POSSESSIVE_REPEAT", None),
+    )
+    if op is not None
+}
+_START_ANCHORS = {re._constants.AT_BEGINNING, re._constants.AT_BEGINNING_STRING}
+
+
+def _looks_only_back(items: Any) -> bool:
+    """Whether parsed regex ``items`` hold no lookahead and no position test but a start anchor."""
+    for op, av in items:
+        if op in (re._constants.ASSERT, re._constants.ASSERT_NOT) and av[0] > 0:
+            return False
+        if op == re._constants.AT and av not in _START_ANCHORS:
+            return False
+        for part in av if isinstance(av, (tuple, list)) else (av,):
+            nested = part if isinstance(part, list) else [part]
+            if any(isinstance(sub, re._parser.SubPattern) and not _looks_only_back(sub.data) for sub in nested):
+                return False
+    return True
 
 
 def _args_withheld(entry: dict[str, Any]) -> bool:
@@ -1824,10 +1865,9 @@ class ToolCalledVerifier(BaseVerifier):
     then read out of that text, so a long card body does not hide its title.
     Only top-level keys are read from that text. A named argument the clip
     cut is matched on the head that survived, and counts when the pattern
-    accepts that head with a tail of separators and a line break after it (a
-    heuristic: a lookahead past the clip is not caught); when it does not, or
-    the clip
-    cut the argument off whole, or the pod withheld the arguments, the call is
+    matches that head and ends in ``.*`` under DOTALL (``(?s).*title.*``), so
+    that no text past the clip could undo the match; when it does not, or the
+    clip cut the argument off whole, or the pod withheld the arguments, the call is
     undecided rather than ruled out, and undecided calls that could reach
     ``minimum_calls`` make the check ``status="error"``: read as non-matches,
     they would pass a ``none`` safeguard while the call it forbids may have run.
@@ -1903,11 +1943,11 @@ class ToolCalledVerifier(BaseVerifier):
         so a same-named key inside an object value cannot stand in for the
         argument. An argument whose value the clip cut is read from the head that
         survived, as ``worker_commands`` reads a clipped command: the head counts
-        as a match when the pattern accepts it followed by ``_CLIP_TAIL_PROBE``,
-        and is otherwise undecided, since what the pattern looks for, or where
-        it pins the value's end, may lie past the clip. One probe tail is a
-        heuristic, not proof that every tail matches: a lookahead past the clip
-        is not caught. An argument the clip cut off whole is undecided too."""
+        as a match when the pattern matches it and ``_accepts_any_tail`` holds,
+        so the match cannot depend on what the clip cut, and is otherwise
+        undecided, since what the pattern looks for, or where it pins the
+        value's end, may lie past the clip. An argument the clip cut off whole
+        is undecided too."""
         if self.arguments is None:
             return True
         if _args_withheld(entry):
@@ -1935,11 +1975,7 @@ class ToolCalledVerifier(BaseVerifier):
             if not clipped:
                 return False
             head = cut[1] if cut is not None and cut[0] == name else None
-            if (
-                head is None
-                or re.fullmatch(pattern, head) is None
-                or re.fullmatch(pattern, head + _CLIP_TAIL_PROBE) is None
-            ):
+            if head is None or not _accepts_any_tail(pattern) or re.fullmatch(pattern, head) is None:
                 undecided = True
         return None if undecided else True
 

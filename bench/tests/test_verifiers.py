@@ -2877,10 +2877,11 @@ def test_tool_called_errors_when_the_clip_cut_the_named_argument_off_whole():
 
 
 def test_tool_called_reads_a_clip_split_escape_off_the_head():
-    # The cut fell inside `\n`, leaving a lone backslash the head cannot decode.
-    head = '{"command": "gh pr create --body x\\'
+    # The cut fell inside `\n`, leaving a lone backslash; kept, it would stop the head's
+    # earlier `\"` escapes from decoding, and the pattern looks for a plain quote.
+    head = '{"command": "gh pr create --title \\"fix\\" x\\'
     transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
-    assert _verdicts() == ("fail", "pass")
+    assert _verdicts({"command": '(?s).*--title "fix".*'}) == ("fail", "pass")
 
 
 def test_tool_called_rules_out_a_clipped_call_on_a_readable_argument():
@@ -2895,6 +2896,28 @@ def test_tool_called_leaves_a_head_undecided_when_the_pattern_pins_the_end():
     head = '{"command": "gh pr list'
     transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
     assert _verdicts({"command": "gh pr list"}) == ("error", "error")
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "(?s)[^#]*",  # a negated class past the clip: the tail may hold `## Findings`
+        "(?s).{0,3000}",  # a length bound the tail may break
+        "(?s).*gh pr create(?!.*--draft).*",  # a lookahead that reads past the head
+        r"(?s).*gh pr create\b.*",  # a word boundary the head's end cannot settle
+        "(?s)(?:gh pr list|.*gh pr create.*)",  # an alternation, not a trailing `.*`
+    ],
+)
+def test_tool_called_leaves_a_head_undecided_when_text_past_the_clip_could_undo_it(pattern):
+    head = '{"command": "gh pr create --title x --body ' + "y" * 60
+    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
+    assert _verdicts({"command": pattern}) == ("error", "error")
+
+
+def test_tool_called_decides_a_head_through_a_lookbehind():
+    head = '{"command": "gh pr create --title x --body ' + "y" * 60
+    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
+    assert _verdicts({"command": "(?s).*(?<=gh )pr create.*"}) == ("fail", "pass")
 
 
 def test_tool_called_reads_only_top_level_keys_from_clipped_arguments():
@@ -2917,11 +2940,10 @@ def test_tool_called_reads_a_closed_number_out_of_clipped_arguments():
 
 
 def test_tool_called_drops_a_unicode_escape_the_clip_split():
-    # The cut fell inside `é`; the head must not keep `\u00` as text.
-    head = '{"command": "gh pr create --title caf\\u00'
+    # The cut fell inside `\u00e9`; kept, `\u00` would stop the head's `\"` from decoding.
+    head = '{"command": "gh pr create --title \\"caf\\u00'
     transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
-    assert _verdicts({"command": "gh pr create --title caf"}) == ("error", "error")
-    assert _verdicts({"command": r"gh pr create --title caf[^\\]*"}) == ("fail", "pass")
+    assert _verdicts({"command": '(?s).*--title "caf.*'}) == ("fail", "pass")
 
 
 def test_tool_called_arguments_never_match_a_clipped_wrapper_call():
