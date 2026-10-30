@@ -1699,7 +1699,9 @@ def _read_clipped_args(text: str) -> tuple[dict[str, Any], tuple[str, str | None
     closed copy cannot stand in for a later one the clip cut or that holds an
     object. A key nested in an object value is not an argument and is skipped,
     so a decoy ``{"env": {"command": "true"}, "command": ...}`` reads the outer
-    one. A scalar ``json.loads`` refuses (``030``) is left unread."""
+    one. A clip inside a top-level key's name, or between the name and its
+    colon, drops every read key that name could complete, since the cut key may
+    repeat one of them. A scalar ``json.loads`` refuses (``030``) is left unread."""
     values: dict[str, Any] = {}
     depth = 0
     key: str | None = None
@@ -1709,9 +1711,18 @@ def _read_clipped_args(text: str) -> tuple[dict[str, Any], tuple[str, str | None
         if char == '"':
             literal = _JSON_STRING.match(text, i)
             if literal is None:
-                return values, ((key, _cut_string_head(text[i + 1:])) if key is not None else None)
+                if key is not None:
+                    return values, (key, _cut_string_head(text[i + 1:]))
+                if depth == 1:
+                    name = _cut_string_head(text[i + 1:])
+                    for read in [read for read in values if "\\" in name or read.startswith(name)]:
+                        del values[read]
+                return values, None
             string = _json_string_body(literal.group(1))
             colon = _JSON_KEY_COLON.match(text, literal.end())
+            if colon is None and key is None and depth == 1:
+                # A top-level key whose colon the clip cut.
+                values.pop(string, None)
             if colon is not None:
                 key = string if depth == 1 else None
                 if key is not None:
@@ -1759,7 +1770,10 @@ def _accepts_any_tail(pattern: str) -> bool:
     reject text past the clip, so a head cannot decide it. Neither can a
     pattern that looks ahead anywhere, or tests a position other than the
     start (a word boundary, ``$``): at the head's end it would see the cut
-    instead of the text that followed."""
+    instead of the text that followed. Nor can an atomic group or a possessive
+    repeat: either keeps the split it found first, which text past the clip
+    can change, where the trailing ``.*`` needs the engine free to keep the
+    head's split."""
     parsed = re._parser.parse(pattern)
     if not parsed.state.flags & re.DOTALL or not parsed.data or not _looks_only_back(parsed.data):
         return False
@@ -1775,16 +1789,18 @@ _UNBOUNDED_REPEATS = {
     for op in (
         re._constants.MAX_REPEAT,
         re._constants.MIN_REPEAT,
-        getattr(re._constants, "POSSESSIVE_REPEAT", None),
     )
-    if op is not None
 }
+_COMMITTING = {re._constants.ATOMIC_GROUP, re._constants.POSSESSIVE_REPEAT}
 _START_ANCHORS = {re._constants.AT_BEGINNING, re._constants.AT_BEGINNING_STRING}
 
 
 def _looks_only_back(items: Any) -> bool:
-    """Whether parsed regex ``items`` hold no lookahead and no position test but a start anchor."""
+    """Whether parsed regex ``items`` hold no lookahead, no position test but a start anchor,
+    and no atomic group or possessive repeat."""
     for op, av in items:
+        if op in _COMMITTING:
+            return False
         if op in (re._constants.ASSERT, re._constants.ASSERT_NOT) and av[0] > 0:
             return False
         if op == re._constants.AT and av not in _START_ANCHORS:
@@ -1865,8 +1881,11 @@ class ToolCalledVerifier(BaseVerifier):
     then read out of that text, so a long card body does not hide its title.
     Only top-level keys are read from that text. A named argument the clip
     cut is matched on the head that survived, and counts when the pattern
-    matches that head and ends in ``.*`` under DOTALL (``(?s).*title.*``), so
-    that no text past the clip could undo the match; when it does not, or the
+    matches that head and no text past the clip could undo the match: the
+    pattern ends at its top level in ``.*`` under DOTALL (``(?s).*title.*``)
+    and holds no lookahead, no position test but a start anchor (no ``\\b`` or
+    ``$``), and no atomic group or possessive repeat (``_accepts_any_tail``);
+    when it does not, or the
     clip cut the argument off whole, or the pod withheld the arguments, the call is
     undecided rather than ruled out, and undecided calls that could reach
     ``minimum_calls`` make the check ``status="error"``: read as non-matches,
@@ -2085,7 +2104,9 @@ class ToolCalledVerifier(BaseVerifier):
                 reason=(
                     f"{count} call(s) to {sorted(wanted)} match {self.arguments!r} and {undecided} more "
                     "could not be decided (arguments withheld in the pod, or cut by its clip before "
-                    f"the named argument could be read), so the minimum of {self.minimum_calls} "
+                    "the named argument could be read, or cut to a head the pattern cannot decide: "
+                    "see _accepts_any_tail), so the minimum of "
+                    f"{self.minimum_calls} "
                     "could not be evaluated"
                 ),
                 raw={"matching_calls": count, "undecided_calls": undecided},

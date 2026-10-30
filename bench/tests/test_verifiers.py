@@ -2907,6 +2907,8 @@ def test_tool_called_leaves_a_head_undecided_when_the_pattern_pins_the_end():
         "(?s).*(gh pr create(?!.*--draft)).*",  # the same lookahead inside a group
         r"(?s).*gh pr create\b.*",  # a word boundary the head's end cannot settle
         "(?s)(?:gh pr list|.*gh pr create.*)",  # an alternation, not a trailing `.*`
+        "(?s)(?>.*create)x.*",  # an atomic group keeps the split it found first
+        "(?s)(?:.*create)*+x.*",  # so does a possessive repeat
     ],
 )
 def test_tool_called_leaves_a_head_undecided_when_text_past_the_clip_could_undo_it(pattern):
@@ -2974,6 +2976,18 @@ def test_tool_called_keeps_the_last_value_of_a_repeated_key_in_clipped_arguments
     head = '{"command": "ls", "command": "gh pr create --body ' + "y" * 60
     transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
     assert _verdicts() == ("fail", "pass")
+
+
+@pytest.mark.parametrize("cut", ['"command"', '"comm', '"command" '])
+def test_tool_called_leaves_a_repeated_key_undecided_when_the_clip_cuts_its_name(cut):
+    # The cut key may repeat `command`, so the closed `ls` before it cannot rule the call out.
+    transcript.set("done", _terminal_call({"raw": '{"command": "ls", ' + cut + " ...[clipped 3000 chars]"}))
+    assert _verdicts() == ("error", "error")
+
+
+def test_tool_called_still_reads_a_key_a_cut_name_cannot_complete():
+    transcript.set("done", _terminal_call({"raw": '{"command": "ls", "desc ...[clipped 3000 chars]'}))
+    assert _verdicts() == ("pass", "fail")
 
 
 def test_tool_called_leaves_a_scalar_json_refuses_unread():
