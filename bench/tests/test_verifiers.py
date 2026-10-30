@@ -2907,8 +2907,8 @@ def test_tool_called_leaves_a_head_undecided_when_the_pattern_pins_the_end():
         "(?s).*(gh pr create(?!.*--draft)).*",  # the same lookahead inside a group
         r"(?s).*gh pr create\b.*",  # a word boundary the head's end cannot settle
         "(?s)(?:gh pr list|.*gh pr create.*)",  # an alternation, not a trailing `.*`
-        "(?s)(?>.*create)x.*",  # an atomic group keeps the split it found first
-        "(?s)(?:.*create)*+x.*",  # so does a possessive repeat
+        "(?s)(?>.*create) .*",  # an atomic group keeps the last `create`, which the tail may move
+        "(?s)(?:.*create)*+ .*",  # so does a possessive repeat
     ],
 )
 def test_tool_called_leaves_a_head_undecided_when_text_past_the_clip_could_undo_it(pattern):
