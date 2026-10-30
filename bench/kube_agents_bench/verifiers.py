@@ -1683,13 +1683,16 @@ def _read_clipped_args(text: str) -> dict[str, Any]:
 
     Returns the top-level keys whose last value is a scalar that closed before
     the clip; the key whose value the clip fell inside is left out. A
-    repeated key keeps only its last value, as ``json.loads`` does, so an earlier
-    closed copy cannot stand in for a later one the clip cut or that holds an
-    object. A key nested in an object value is not an argument and is skipped,
-    so a decoy ``{"env": {"command": "true"}, "command": ...}`` reads the outer
-    one. A clip inside a top-level key's name, or between the name and its
-    colon, drops every read key that name could complete, since the cut key may
-    repeat one of them. A scalar ``json.loads`` refuses (``030``) is left unread."""
+    repeated key the text shows keeps only its last value, as ``json.loads``
+    does: a later copy the clip cut, or one that holds an object, drops the
+    earlier closed one. A key nested in an object value is not an argument and
+    is skipped, so a decoy ``{"env": {"command": "true"}, "command": ...}``
+    reads the outer one. A clip inside a top-level key's name, or between the
+    name and its colon, drops every read key that name could complete, since
+    the cut key may repeat one of them. A repeat wholly past the clip, or one
+    the clip cut just after its comma, is not seen: the earlier copy is read as
+    the argument, as before this reader. Clipping each value in the pod would
+    settle it (#4418). A scalar ``json.loads`` refuses (``030``) is left unread."""
     values: dict[str, Any] = {}
     depth = 0
     key: str | None = None
