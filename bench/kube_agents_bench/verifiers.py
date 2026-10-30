@@ -2025,7 +2025,8 @@ class ToolCalledVerifier(BaseVerifier):
                 reason=(
                     f"{count} call(s) to {sorted(wanted)} match {self.arguments!r} and {undecided} more "
                     "could not be decided (arguments withheld in the pod, or a named argument cut "
-                    f"by its clip), so the minimum of {self.minimum_calls} "
+                    "by its clip or holding an object or array, which clipped arguments do not "
+                    f"read), so the minimum of {self.minimum_calls} "
                     "could not be evaluated"
                 ),
                 raw={"matching_calls": count, "undecided_calls": undecided},
