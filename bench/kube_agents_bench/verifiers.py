@@ -54,7 +54,6 @@ for the harness), so devops-bench discovers them without a fork.
 from __future__ import annotations
 
 import fnmatch
-import functools
 import http.client
 import json
 import os
@@ -1679,22 +1678,11 @@ def _json_string_body(body: str) -> str:
         return body
 
 
-def _cut_string_head(body: str) -> str:
-    """A string value's body up to the clip, with an escape the cut split dropped."""
-    split = re.search(r"(\\+)(u[0-9a-fA-F]{0,3})?$", body)
-    if split is not None and len(split.group(1)) % 2 == 1:
-        # The last backslash of an odd run starts an escape: a lone `\`, or a
-        # `\u` short of its four hex digits. An even run is escaped backslashes.
-        body = body[: split.end(1) - 1]
-    return _json_string_body(body)
-
-
-def _read_clipped_args(text: str) -> tuple[dict[str, Any], tuple[str, str | None] | None]:
+def _read_clipped_args(text: str) -> dict[str, Any]:
     """The top-level arguments in JSON arguments the pod's clip cut, clip marker taken off.
 
     Returns the top-level keys whose last value is a scalar that closed before
-    the clip, and the key whose value the clip fell inside, with the string head
-    that survived (None for a cut number, ``true``, ``false`` or ``null``). A
+    the clip; the key whose value the clip fell inside is left out. A
     repeated key keeps only its last value, as ``json.loads`` does, so an earlier
     closed copy cannot stand in for a later one the clip cut or that holds an
     object. A key nested in an object value is not an argument and is skipped,
@@ -1711,13 +1699,13 @@ def _read_clipped_args(text: str) -> tuple[dict[str, Any], tuple[str, str | None
         if char == '"':
             literal = _JSON_STRING.match(text, i)
             if literal is None:
-                if key is not None:
-                    return values, (key, _cut_string_head(text[i + 1:]))
-                if depth == 1:
-                    name = _cut_string_head(text[i + 1:])
+                if key is None and depth == 1:
+                    # A top-level key the clip cut inside its name. An escape
+                    # in the cut name could spell any key, so it drops them all.
+                    name = text[i + 1:]
                     for read in [read for read in values if "\\" in name or read.startswith(name)]:
                         del values[read]
-                return values, None
+                return values
             string = _json_string_body(literal.group(1))
             colon = _JSON_KEY_COLON.match(text, literal.end())
             if colon is None and key is None and depth == 1:
@@ -1746,7 +1734,7 @@ def _read_clipped_args(text: str) -> tuple[dict[str, Any], tuple[str, str | None
             scalar = _JSON_SCALAR.match(text, i)
             if scalar is not None:
                 if scalar.end() == len(text):
-                    return values, (key, None)
+                    return values
                 try:
                     values[key] = json.loads(scalar.group())
                 except ValueError:
@@ -1755,61 +1743,7 @@ def _read_clipped_args(text: str) -> tuple[dict[str, Any], tuple[str, str | None
                 i = scalar.end()
                 continue
         i += 1
-    return values, None
-
-
-@functools.lru_cache(maxsize=None)
-def _accepts_any_tail(pattern: str) -> bool:
-    """Whether a value the pattern fullmatches still matches with any text appended.
-
-    True when the pattern ends, at its top level, in an unbounded repeat of
-    ``.`` under DOTALL (``(?s)...X.*``): whatever the rest matched in the
-    value, that repeat takes the appended text too. A clipped head the pattern
-    matches then matches the whole value, whatever the clip cut. Any other end
-    (a negated class, a length bound, a literal, a group, an alternation) can
-    reject text past the clip, so a head cannot decide it. Neither can a
-    pattern that looks ahead anywhere, or tests a position other than the
-    start (a word boundary, ``$``): at the head's end it would see the cut
-    instead of the text that followed. Nor can an atomic group or a possessive
-    repeat: either keeps the split it found first, which text past the clip
-    can change, where the trailing ``.*`` needs the engine free to keep the
-    head's split."""
-    parsed = re._parser.parse(pattern)
-    if not parsed.state.flags & re.DOTALL or not parsed.data or not _looks_only_back(parsed.data):
-        return False
-    op, av = parsed.data[-1]
-    if op not in _UNBOUNDED_REPEATS:
-        return False
-    _minimum, maximum, item = av
-    return maximum == re._constants.MAXREPEAT and list(item) == [(re._constants.ANY, None)]
-
-
-_UNBOUNDED_REPEATS = {
-    op
-    for op in (
-        re._constants.MAX_REPEAT,
-        re._constants.MIN_REPEAT,
-    )
-}
-_COMMITTING = {re._constants.ATOMIC_GROUP, re._constants.POSSESSIVE_REPEAT}
-_START_ANCHORS = {re._constants.AT_BEGINNING, re._constants.AT_BEGINNING_STRING}
-
-
-def _looks_only_back(items: Any) -> bool:
-    """Whether parsed regex ``items`` hold no lookahead, no position test but a start anchor,
-    and no atomic group or possessive repeat."""
-    for op, av in items:
-        if op in _COMMITTING:
-            return False
-        if op in (re._constants.ASSERT, re._constants.ASSERT_NOT) and av[0] > 0:
-            return False
-        if op == re._constants.AT and av not in _START_ANCHORS:
-            return False
-        for part in av if isinstance(av, (tuple, list)) else (av,):
-            nested = part if isinstance(part, list) else [part]
-            if any(isinstance(sub, re._parser.SubPattern) and not _looks_only_back(sub.data) for sub in nested):
-                return False
-    return True
+    return values
 
 
 def _args_withheld(entry: dict[str, Any]) -> bool:
@@ -1879,14 +1813,8 @@ class ToolCalledVerifier(BaseVerifier):
     down, are not read. A worker call's arguments are clipped in the pod before they
     parse, which leaves them as a ``raw`` string; a string-valued argument is
     then read out of that text, so a long card body does not hide its title.
-    Only top-level keys are read from that text. A named argument the clip
-    cut is matched on the head that survived, and counts when the pattern
-    matches that head and no text past the clip could undo the match: the
-    pattern ends at its top level in ``.*`` under DOTALL (``(?s).*title.*``)
-    and holds no lookahead, no position test but a start anchor (no ``\\b`` or
-    ``$``), and no atomic group or possessive repeat (``_accepts_any_tail``);
-    when it does not, or the
-    clip cut the argument off whole, or the pod withheld the arguments, the call is
+    Only top-level keys are read from that text. When the clip cut a named
+    argument, or the pod withheld the arguments, the call is
     undecided rather than ruled out, and undecided calls that could reach
     ``minimum_calls`` make the check ``status="error"``: read as non-matches,
     they would pass a ``none`` safeguard while the call it forbids may have run.
@@ -1960,13 +1888,9 @@ class ToolCalledVerifier(BaseVerifier):
         A readable argument that fails its pattern rules the call out whatever
         the rest hold. In arguments the clip cut, only top-level keys are read,
         so a same-named key inside an object value cannot stand in for the
-        argument. An argument whose value the clip cut is read from the head that
-        survived, as ``worker_commands`` reads a clipped command: the head counts
-        as a match when the pattern matches it and ``_accepts_any_tail`` holds,
-        so the match cannot depend on what the clip cut, and is otherwise
-        undecided, since what the pattern looks for, or where it pins the
-        value's end, may lie past the clip. An argument the clip cut off whole
-        is undecided too."""
+        argument. An argument the clip cut, partway or whole, is undecided: the
+        head that survived cannot settle a pattern, since what it looks for, or
+        where it pins the value's end, may lie past the clip."""
         if self.arguments is None:
             return True
         if _args_withheld(entry):
@@ -1974,7 +1898,6 @@ class ToolCalledVerifier(BaseVerifier):
         args = entry.get("args")
         if not isinstance(args, dict):
             return False
-        cut = None
         clipped = False
         if set(args) == {"raw"} and isinstance(args["raw"], str):
             # worker_trajectory's clip() ends a cut argument string with the
@@ -1984,7 +1907,7 @@ class ToolCalledVerifier(BaseVerifier):
                 args = _clipped_string_args(args["raw"], self.arguments)
             else:
                 clipped = True
-                args, cut = _read_clipped_args(args["raw"][: clip.start()])
+                args = _read_clipped_args(args["raw"][: clip.start()])
         undecided = False
         for name, pattern in self.arguments.items():
             if name in args:
@@ -1993,9 +1916,7 @@ class ToolCalledVerifier(BaseVerifier):
                 continue
             if not clipped:
                 return False
-            head = cut[1] if cut is not None and cut[0] == name else None
-            if head is None or not _accepts_any_tail(pattern) or re.fullmatch(pattern, head) is None:
-                undecided = True
+            undecided = True
         return None if undecided else True
 
     @field_validator("result")
@@ -2103,10 +2024,8 @@ class ToolCalledVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason=(
                     f"{count} call(s) to {sorted(wanted)} match {self.arguments!r} and {undecided} more "
-                    "could not be decided (arguments withheld in the pod, or cut by its clip before "
-                    "the named argument could be read, or cut to a head the pattern cannot decide: "
-                    "see _accepts_any_tail), so the minimum of "
-                    f"{self.minimum_calls} "
+                    "could not be decided (arguments withheld in the pod, or a named argument cut "
+                    f"by its clip), so the minimum of {self.minimum_calls} "
                     "could not be evaluated"
                 ),
                 raw={"matching_calls": count, "undecided_calls": undecided},

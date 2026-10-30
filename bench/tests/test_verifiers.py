@@ -2856,12 +2856,11 @@ def test_tool_called_errors_on_withheld_arguments_under_none_and_at_least_one():
     assert _verdicts() == ("error", "error")
 
 
-def test_tool_called_matches_a_clipped_argument_on_its_surviving_head():
+def test_tool_called_errors_on_a_clipped_argument_even_when_its_head_matches():
+    # The head cannot settle the pattern: text past the clip may undo the match.
     head = '{"command": "gh pr create --title fix --body \\"' + "y" * 60
     transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
-    assert _verdicts() == ("fail", "pass")
-    # Without DOTALL the pattern rejects a line break the clip may have cut off.
-    assert _verdicts({"command": ".*gh pr create.*"}) == ("error", "error")
+    assert _verdicts() == ("error", "error")
 
 
 def test_tool_called_errors_when_the_needle_could_lie_past_the_clip():
@@ -2876,14 +2875,6 @@ def test_tool_called_errors_when_the_clip_cut_the_named_argument_off_whole():
     assert _verdicts() == ("error", "error")
 
 
-def test_tool_called_reads_a_clip_split_escape_off_the_head():
-    # The cut fell inside `\n`, leaving a lone backslash; kept, it would stop the head's
-    # earlier `\"` escapes from decoding, and the pattern looks for a plain quote.
-    head = '{"command": "gh pr create --title \\"fix\\" x\\'
-    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
-    assert _verdicts({"command": '(?s).*--title "fix".*'}) == ("fail", "pass")
-
-
 def test_tool_called_rules_out_a_clipped_call_on_a_readable_argument():
     arguments = {"kind": "capability", "reason": "(?is).*seeded-z.*"}
     head = '{"kind": "dependency", "reason": "' + "y" * 60
@@ -2891,62 +2882,23 @@ def test_tool_called_rules_out_a_clipped_call_on_a_readable_argument():
     assert _verdicts(arguments) == ("pass", "fail")
 
 
-def test_tool_called_leaves_a_head_undecided_when_the_pattern_pins_the_end():
-    # `gh pr list` alone is read-only, but the clip could have cut `; gh pr create` off it.
-    head = '{"command": "gh pr list'
-    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
-    assert _verdicts({"command": "gh pr list"}) == ("error", "error")
-
-
-@pytest.mark.parametrize(
-    "pattern",
-    [
-        "(?s)[^#]*",  # a negated class past the clip: the tail may hold `## Findings`
-        "(?s).{0,3000}",  # a length bound the tail may break
-        "(?s).*gh pr create(?!.*--draft).*",  # a lookahead that reads past the head
-        "(?s).*(gh pr create(?!.*--draft)).*",  # the same lookahead inside a group
-        r"(?s).*gh pr create\b.*",  # a word boundary the head's end cannot settle
-        "(?s)(?:gh pr list|.*gh pr create.*)",  # an alternation, not a trailing `.*`
-        "(?s)(?>.*create) .*",  # an atomic group keeps the last `create`, which the tail may move
-        "(?s)(?:.*create)*+ .*",  # so does a possessive repeat
-    ],
-)
-def test_tool_called_leaves_a_head_undecided_when_text_past_the_clip_could_undo_it(pattern):
-    head = '{"command": "gh pr create --title x --body ' + "y" * 60
-    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
-    assert _verdicts({"command": pattern}) == ("error", "error")
-
-
-def test_tool_called_decides_a_head_through_a_lookbehind():
-    head = '{"command": "gh pr create --title x --body ' + "y" * 60
-    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
-    assert _verdicts({"command": "(?s).*(?<=gh )pr create.*"}) == ("fail", "pass")
-
-
 def test_tool_called_reads_only_top_level_keys_from_clipped_arguments():
     # A nested key of the same name is a decoy; the argument is the outer one.
-    head = '{"env": {"command": "true"}, "command": "gh pr create --body ' + "y" * 60
+    head = '{"env": {"command": "gh pr create"}, "command": "ls", "description": "' + "y" * 60
     transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
-    assert _verdicts() == ("fail", "pass")
-    head = '{"env": {"command": "gh pr create"}, "command": "ls ' + "y" * 60
+    assert _verdicts() == ("pass", "fail")
+    head = '{"env": {"command": "true"}, "command": "gh pr create --body ' + "y" * 60
     transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
     assert _verdicts() == ("error", "error")
 
 
 def test_tool_called_reads_a_closed_number_out_of_clipped_arguments():
-    arguments = {"timeout": "30", "command": "(?s).*"}
+    arguments = {"timeout": "30"}
     head = '{"timeout": 30, "command": "' + "y" * 60
     transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
     assert _verdicts(arguments) == ("fail", "pass")
     transcript.set("done", _terminal_call({"raw": '{"command": "ls", "timeout": 3 ...[clipped 3000 chars]'}))
     assert _verdicts(arguments) == ("error", "error")
-
-
-def test_tool_called_drops_a_unicode_escape_the_clip_split():
-    # The cut fell inside `\u00e9`; kept, `\u00` would stop the head's `\"` from decoding.
-    head = '{"command": "gh pr create --title \\"caf\\u00'
-    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
-    assert _verdicts({"command": '(?s).*--title "caf.*'}) == ("fail", "pass")
 
 
 def test_tool_called_arguments_never_match_a_clipped_wrapper_call():
@@ -2975,6 +2927,8 @@ def test_tool_called_keeps_the_last_value_of_a_repeated_key_in_clipped_arguments
     # json.loads keeps the last copy, so a closed earlier one cannot rule out a cut later one.
     head = '{"command": "ls", "command": "gh pr create --body ' + "y" * 60
     transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
+    assert _verdicts() == ("error", "error")
+    transcript.set("done", _terminal_call({"raw": '{"command": "ls", "command": "gh pr create", "x": "y ...[clipped 3000 chars]'}))
     assert _verdicts() == ("fail", "pass")
 
 
