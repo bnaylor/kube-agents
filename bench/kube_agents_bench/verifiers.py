@@ -1666,6 +1666,21 @@ def _clipped_string_args(text: str, names: dict[str, str]) -> dict[str, str]:
     return found
 
 
+def _clipped_string_head(text: str, name: str) -> str | None:
+    """The head of string argument ``name`` when the pod's clip cut inside its value.
+
+    ``text`` is the clipped arguments with the clip marker taken off, so a value
+    the clip cut runs to its end with no closing quote. An escape the cut split
+    in two is dropped rather than read."""
+    head = re.search(rf'"{re.escape(name)}"\s*:\s*"((?:[^"\\]|\\.)*)\\?$', text)
+    if head is None:
+        return None
+    try:
+        return json.loads('"' + head.group(1) + '"')
+    except ValueError:
+        return head.group(1)
+
+
 def _args_withheld(entry: dict[str, Any]) -> bool:
     """Whether the pod withheld this call's arguments, so a filter on them cannot decide it."""
     args = entry.get("args")
@@ -1733,6 +1748,12 @@ class ToolCalledVerifier(BaseVerifier):
     matches. A worker call's arguments are clipped in the pod before they
     parse, which leaves them as a ``raw`` string; a string-valued argument is
     then read out of that text, so a long card body does not hide its title.
+    A named argument the clip cut is matched on the head that survived; when
+    that head does not match, or the clip cut the argument off whole, or the
+    pod withheld the arguments, the call is undecided rather than ruled out,
+    and undecided calls that could reach ``minimum_calls`` make the check
+    ``status="error"``: read as non-matches, they would pass a ``none``
+    safeguard while the call it forbids may have run.
 
     ``result``: optional Python regular expression. When set, a call counts
     only if its recorded result, as a string, matches under ``re.search``: what
@@ -1795,18 +1816,42 @@ class ToolCalledVerifier(BaseVerifier):
                 re.compile(pattern)
         return patterns
 
-    def _arguments_match(self, entry: dict[str, Any]) -> bool:
+    def _arguments_match(self, entry: dict[str, Any]) -> bool | None:
+        """Whether the call's arguments match ``arguments``: None when the capture
+        withheld or cut an argument the check names, so the call may match or not.
+
+        A readable argument that fails its pattern rules the call out whatever
+        the rest hold. An argument whose value the clip cut is read from the head
+        that survived, as ``worker_commands`` reads a clipped command: a head the
+        pattern matches counts as a match, and any other head is undecided, since
+        what the pattern looks for may lie past the clip. So is an argument the
+        clip cut off whole."""
         if self.arguments is None:
             return True
+        if _args_withheld(entry):
+            return None
         args = entry.get("args")
         if not isinstance(args, dict):
             return False
+        text = None
         if set(args) == {"raw"} and isinstance(args["raw"], str):
-            args = _clipped_string_args(args["raw"], self.arguments)
-        return all(
-            name in args and re.fullmatch(pattern, str(args[name])) is not None
-            for name, pattern in self.arguments.items()
-        )
+            # worker_trajectory's clip() ends a cut argument string with the
+            # same marker it ends a cut result with.
+            clip = _CLIPPED_RESULT.search(args["raw"])
+            text = args["raw"][: clip.start()] if clip is not None else None
+            args = _clipped_string_args(args["raw"] if text is None else text, self.arguments)
+        undecided = False
+        for name, pattern in self.arguments.items():
+            if name in args:
+                if re.fullmatch(pattern, str(args[name])) is None:
+                    return False
+                continue
+            if text is None:
+                return False
+            head = _clipped_string_head(text, name)
+            if head is None or re.fullmatch(pattern, head) is None:
+                undecided = True
+        return None if undecided else True
 
     @field_validator("result")
     @classmethod
@@ -1887,7 +1932,7 @@ class ToolCalledVerifier(BaseVerifier):
             unread = [
                 entry for entry in named
                 if (entry.get("result") is None or entry.get("result") == worker_trajectory.WITHHELD)
-                and (_args_withheld(entry) or self._arguments_match(entry))
+                and self._arguments_match(entry) is not False
             ]
             if unread:
                 return VerificationResult(
@@ -1900,9 +1945,25 @@ class ToolCalledVerifier(BaseVerifier):
                         f"{self.result!r} could not be evaluated"
                     ),
                 )
-        calls = [entry for entry in named if self._arguments_match(entry) and self._result_matches(entry)]
-        count = len(calls)
+        matched = [(entry, self._arguments_match(entry)) for entry in named if self._result_matches(entry)]
+        count = sum(1 for _, match in matched if match is True)
+        undecided = sum(1 for _, match in matched if match is None)
         ok = count >= self.minimum_calls
+        if not ok and count + undecided >= self.minimum_calls:
+            # Reading the undecided calls as non-matches would pass a `none`
+            # safeguard while the call it forbids may have run.
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=(
+                    f"{count} call(s) to {sorted(wanted)} match {self.arguments!r} and {undecided} more "
+                    "could not be decided (arguments withheld in the pod, or cut by its clip before "
+                    f"the named argument could be read), so the minimum of {self.minimum_calls} "
+                    "could not be evaluated"
+                ),
+                raw={"matching_calls": count, "undecided_calls": undecided},
+            )
         agent_str = f" for agent {self.agent!r}" if self.agent is not None else ""
         if self.arguments is not None:
             agent_str += f" with arguments matching {self.arguments!r}"
