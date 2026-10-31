@@ -944,9 +944,14 @@ def _gcloud_asks_for_help(argv: list[str]) -> bool:
         if not token.startswith("-"):
             index += 1
             continue
-        name, separator, _ = token.partition("=")
+        name, separator, value = token.partition("=")
         if name in _GCLOUD_HELP_FLAGS:
-            return True
+            # Only a bare --help/-h, or one valued true, asks for help, the way
+            # the kubectl path reads it. Any other value is not a help request.
+            if not separator or value.lower() in _BOOLEAN_TRUE_SPELLINGS:
+                return True
+            index += 1
+            continue
         if name in _GCLOUD_BOOLEAN_FLAGS:
             index += 1
             continue
